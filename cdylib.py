@@ -130,8 +130,10 @@ if __name__ == "__main__":
         cargo_toml_path = crate_dir / "Cargo.toml"
         with open(cargo_toml_path, "r") as f:
             cargo_toml = toml.load(f)
-        del cargo_toml["bin"]
-        del cargo_toml["workspace"]
+        if "bin" in cargo_toml:
+            del cargo_toml["bin"]
+        if "workspace" in cargo_toml:
+            del cargo_toml["workspace"]
         cargo_toml["lib"]["crate-type"] = ["cdylib", "lib"]
         cargo_toml["lib"]["name"] = name
         cargo_toml["package"]["name"] = name
