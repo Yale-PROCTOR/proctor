@@ -1,0 +1,131 @@
+Bootstrap: docker
+From: ubuntu:latest
+
+%environment
+export SHELL=/bin/bash
+export CLIPPY_CONF_DIR="/usr/clippy"
+export CARGO_HOME=/usr/local/cargo
+export RUSTUP_HOME=/usr/local/rustup
+export PATH="${CARGO_HOME}/bin:${PATH}"
+
+%setup -c /bin/bash
+
+TRANSLATE_DIR="${APPTAINER_ROOTFS}/usr/translate"
+MEASUREMENTS_DIR="${APPTAINER_ROOTFS}/usr/measurements"
+CLIPPY_CONF_DIR="${APPTAINER_ROOTFS}/usr/clippy"
+
+mkdir -p "${CLIPPY_CONF_DIR}"
+
+mkdir -p "${TRANSLATE_DIR}"
+cp ../../add_link_args.py \
+   ../../cdylib.py \
+   ../../find_fns.py \
+   ../../filter_files.py \
+   ../../get_target.py \
+   ../scripts/* "${TRANSLATE_DIR}"
+
+cp -r "../measurements" "${MEASUREMENTS_DIR}"
+
+cp ../../ninja "${APPTAINER_ROOTFS}/usr/local/bin"
+cp -r ../../Python-3.13.0 "${APPTAINER_ROOTFS}/Python-3.13.0"
+
+cd ../../cmake-3.31.9-linux-x86_64
+cp -r bin/* "${APPTAINER_ROOTFS}/usr/local/bin"
+cp -r doc/* "${APPTAINER_ROOTFS}/usr/local/doc"
+cp -r man/* "${APPTAINER_ROOTFS}/usr/local/share/man"
+cp -r share/* "${APPTAINER_ROOTFS}/usr/local/share"
+
+
+%post -c /bin/bash
+
+TRANSLATE_DIR="/usr/translate"
+MEASUREMENTS_DIR="/usr/measurements"
+UNSAFETY_DIR="${MEASUREMENTS_DIR}/measure_unsafety"
+IDIOMATICITY_DIR="${MEASUREMENTS_DIR}/measure_idiomaticity"
+CLIPPY_CONF_DIR="/usr/clippy"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update \
+ && apt-get install -y \
+  clang \
+  curl \
+  g++ \
+  gcc \
+  git \
+  libclang-dev \
+  libssl-dev \
+  llvm \
+  locales \
+  make \
+  pkg-config \
+  sudo \
+  zlib1g-dev \
+  parallel \
+  vim
+
+cd Python-3.13.0 \
+ && ./configure --prefix=/usr/local \
+ && make -j \
+ && make install \
+ && cd .. \
+ && rm -rf Python-3.13.0
+pip3 install requests toml tabulate beautifulsoup4 lxml
+
+curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+apt-get install -y nodejs
+
+export CARGO_HOME=/usr/local/cargo
+export RUSTUP_HOME=/usr/local/rustup
+export PATH="${CARGO_HOME}/bin:${PATH}"
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y -q --default-toolchain nightly-2025-06-23-x86_64-unknown-linux-gnu
+rustup component add clippy
+
+cd "${TRANSLATE_DIR}"
+git clone https://github.com/Medowhill/c2rust \
+ && cd c2rust \
+ && git checkout tractor-0.21.0 \
+ && cargo build --release -Z sparse-registry \
+ && ln -s "$(pwd -P)/target/release/c2rust-transpile" /usr/local/bin
+
+cd "${TRANSLATE_DIR}"
+git clone https://github.com/kaist-plrg/crat \
+ && cd crat \
+ && git checkout 7e7d744 \
+ && cd deps_crate \
+ && cargo build \
+ && cd .. \
+ && cargo build --release \
+ && ln -s "$(pwd -P)/crat" /usr/local/bin
+
+
+chmod +x "${TRANSLATE_DIR}/translate.sh"
+ln -s "${TRANSLATE_DIR}/translate.sh" /usr/local/bin/translate
+
+chmod +x "${TRANSLATE_DIR}/translate_all.sh"
+ln -s "${TRANSLATE_DIR}/translate_all.sh" /usr/local/bin/translate_all
+
+chmod +x "${TRANSLATE_DIR}/run_tests.sh"
+ln -s "${TRANSLATE_DIR}/run_tests.sh" /usr/local/bin/run_tests
+
+chmod +x "${TRANSLATE_DIR}/run_tests_all.sh"
+ln -s "${TRANSLATE_DIR}/run_tests_all.sh" /usr/local/bin/run_tests_all
+
+chmod +x "${TRANSLATE_DIR}/aggregate.py"
+ln -s "${TRANSLATE_DIR}/aggregate.py" /usr/local/bin/aggregate
+
+chmod +x "${TRANSLATE_DIR}/aggregate_all.sh"
+ln -s "${TRANSLATE_DIR}/aggregate.sh" /usr/local/bin/aggregate_all
+
+chmod +x "${TRANSLATE_DIR}/visualize.py"
+ln -s "${TRANSLATE_DIR}/visualize.py" /usr/local/bin/visualize
+
+chmod +x "${TRANSLATE_DIR}/visualize_all.sh"
+ln -s "${TRANSLATE_DIR}/visualize.sh" /usr/local/bin/visualize_all
+
+cargo install --path "${UNSAFETY_DIR}" --root "${UNSAFETY_DIR}"
+ln -s "${UNSAFETY_DIR}/bin/measure_unsafety" /usr/local/bin
+
+chmod +x "${IDIOMATICITY_DIR}/measure_idiomaticity.py"
+ln -s "${IDIOMATICITY_DIR}/measure_idiomaticity.py" /usr/local/bin/measure_idiomaticity
+ln -s "${IDIOMATICITY_DIR}/clippy.toml" "${CLIPPY_CONF_DIR}/clippy.toml"
