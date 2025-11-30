@@ -28,11 +28,15 @@ class Visualizer:
 
             for conf in confs:
                 file = f"{agg_dir}/{bundle}_{conf}.{self.extension}"
-                with open(file, "rt") as fp:
-                    dct = {"conf": conf}
-                    dct.update(self.load_as_dict(fp))
+                try:
+                    with open(file, "rt") as fp:
+                        dct = {"conf": conf}
+                        dct.update(self.load_as_dict(fp))
 
-                    self.dcts[bundle].append(dct)
+                        self.dcts[bundle].append(dct)
+
+                except Exception as e:
+                    print(f"Exception while processing {file}: {e}")
 
     def load_as_dict(self, fp) -> dict:
         """Load item from file to json"""
@@ -166,19 +170,14 @@ class IdiomaticityVisualizer(JsonVisualizer):
             for bundle_dct in bundle_dcts:
                 tab_dct.setdefault(first_header, [])
                 tab_dct[first_header].append(bundle_dct["conf"])
+                conf_idx = len(tab_dct[first_header]) - 1
 
                 ccc_dct = bundle_dct["cyclomatic_complexity_counts"]
-                for key in ccc_dct.keys():
+                for key, value in ccc_dct.items():
                     tab_dct.setdefault(key, [])
-                    tab_dct[key].append(ccc_dct[key])
-
-            # fill empty cells
-            max_col_len = len(tab_dct[first_header])
-            for col in tab_dct.values():
-                col_len = len(col)
-                assert col_len <= max_col_len
-                if col_len < max_col_len:
-                    col.extend([0] * (max_col_len - col_len))
+                    col = tab_dct[key]
+                    col.extend([0] * (conf_idx - len(col)))
+                    col.append(value)
 
             # sort based on int headers
             first_col = tab_dct.pop(first_header)
@@ -205,21 +204,16 @@ class IdiomaticityVisualizer(JsonVisualizer):
             for bundle_dct in bundle_dcts:
                 tab_dct.setdefault(first_header, [])
                 tab_dct[first_header].append(bundle_dct["conf"])
+                conf_idx = len(tab_dct[first_header]) - 1
 
                 for tool, inner_dct in bundle_dct["lints"].items():
                     for level, val_list in inner_dct.items():
                         header = f"{tool}\n{level}"
                         total_lints = val_list[0]
                         tab_dct.setdefault(header, [])
-                        tab_dct[header].append(total_lints)
-
-            # fill empty cells
-            max_col_len = len(tab_dct[first_header])
-            for col in tab_dct.values():
-                col_len = len(col)
-                assert col_len <= max_col_len
-                if col_len < max_col_len:
-                    col.extend([0] * (max_col_len - col_len))
+                        col = tab_dct[header]
+                        col.extend([0] * (conf_idx - len(col)))
+                        col.append(total_lints)
 
             # sort reverse lexicographically
             first_col = tab_dct.pop(first_header)
@@ -245,8 +239,8 @@ class IdiomaticityVisualizer(JsonVisualizer):
 
             for bundle_dct in bundle_dcts:
                 tab_dct.setdefault(first_header, [])
-                conf_idx = len(tab_dct[first_header])
                 tab_dct[first_header].append(bundle_dct["conf"])
+                conf_idx = len(tab_dct[first_header]) - 1
 
                 for tool, inner_dct in bundle_dct["lints"].items():
                     for level, val_list in inner_dct.items():
@@ -256,14 +250,6 @@ class IdiomaticityVisualizer(JsonVisualizer):
                             col = tab_dct[header]
                             col.extend([0] * (conf_idx - len(col)))
                             col.append(num)
-
-            # fill empty cells
-            max_col_len = len(tab_dct[first_header])
-            for col in tab_dct.values():
-                col_len = len(col)
-                assert col_len <= max_col_len
-                if col_len < max_col_len:
-                    col.extend([0] * (max_col_len - col_len))
 
             # sort reverse lexicographically
             first_col = tab_dct.pop(first_header)
@@ -328,18 +314,13 @@ class TestsVisualizer(XmlVisualizer):
             for bundle_dct in bundle_dcts:
                 tab_dct.setdefault(first_header, [])
                 tab_dct[first_header].append(bundle_dct["conf"])
+                conf_idx = len(tab_dct[first_header]) - 1
 
                 for attribute, value in bundle_dct["Tests"].items():
                     tab_dct.setdefault(attribute, [])
-                    tab_dct[attribute].append(value)
-
-            # fill empty cells
-            max_col_len = len(tab_dct[first_header])
-            for col in tab_dct.values():
-                col_len = len(col)
-                assert col_len <= max_col_len
-                if col_len < max_col_len:
-                    col.extend([0] * (max_col_len - col_len))
+                    col = tab_dct[attribute]
+                    col.extend([0] * (conf_idx - len(col)))
+                    col.append(value)
 
             tab_dcts.append(tab_dct)
             self.output_tabulate(tab_dct, output)
@@ -359,8 +340,8 @@ class TestsVisualizer(XmlVisualizer):
 
             for bundle_dct in bundle_dcts:
                 tab_dct.setdefault(first_header, [])
-                conf_idx = len(tab_dct[first_header])
                 tab_dct[first_header].append(bundle_dct["conf"])
+                conf_idx = len(tab_dct[first_header]) - 1
 
                 for name, inner_dct in bundle_dct.items():
                     if name in ["conf", "Tests"]:
@@ -372,14 +353,6 @@ class TestsVisualizer(XmlVisualizer):
                         col = tab_dct[header]
                         col.extend([0] * (conf_idx - len(col)))
                         col.append(value)
-
-            # fill empty cells
-            max_col_len = len(tab_dct[first_header])
-            for col in tab_dct.values():
-                col_len = len(col)
-                assert col_len <= max_col_len
-                if col_len < max_col_len:
-                    col.extend([0] * (max_col_len - col_len))
 
             tab_dcts.append(tab_dct)
             self.output_tabulate(tab_dct, output)
