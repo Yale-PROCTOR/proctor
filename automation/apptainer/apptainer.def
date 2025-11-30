@@ -69,7 +69,7 @@ cd Python-3.13.0 \
  && make install \
  && cd .. \
  && rm -rf Python-3.13.0
-pip3 install requests toml tabulate beautifulsoup4 lxml
+pip3 install toml tabulate beautifulsoup4 lxml libclang
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y nodejs
@@ -95,9 +95,12 @@ git clone https://github.com/kaist-plrg/crat \
  && cd deps_crate \
  && cargo build \
  && cd .. \
- && cargo build --release \
- && ln -s "$(pwd -P)/crat" /usr/local/bin
-
+ && cargo build --release --bin crat \
+ && git checkout master \
+ && git pull \
+ && git checkout bf03177 \
+ && cargo build --release --bin crat \
+ && ln -s "${TRANSLATE_DIR}/crat/crat" /usr/local/bin/crat
 
 chmod +x "${TRANSLATE_DIR}/translate.sh"
 ln -s "${TRANSLATE_DIR}/translate.sh" /usr/local/bin/translate

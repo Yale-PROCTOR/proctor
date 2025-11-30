@@ -44,7 +44,8 @@ RUN cd Python-3.14.0 \
  && rm -rf Python-3.14.0
 RUN pip3 install toml tabulate beautifulsoup4 lxml libclang
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --default-toolchain nightly-2025-06-23-x86_64-unknown-linux-gnu
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y -q --default-toolchain nightly-2025-06-23-x86_64-unknown-linux-gnu
 
 RUN git clone https://github.com/Medowhill/c2rust \
  && cd c2rust \
@@ -54,12 +55,18 @@ RUN git clone https://github.com/Medowhill/c2rust \
 
 RUN git clone https://github.com/kaist-plrg/crat \
  && cd crat \
- && git checkout 2d44bb2 \
+ && git checkout 7e7d744 \
  && cd deps_crate \
  && cargo build \
  && cd .. \
  && cargo build --release --bin crat \
  && ln -s ~/crat/crat ~/local/bin
+
+RUN cd crat \
+ && git checkout master \
+ && git pull \
+ && git checkout 2dcafd7 \
+ && cargo build --release --bin crat
 
 COPY --chown=ubuntu:ubuntu ./Test-Corpus Test-Corpus
 COPY --chown=ubuntu:ubuntu \
