@@ -33,17 +33,21 @@ class Aggregator:
 
         with open(self.output_txt, "wt") as ofp:
             for target_file in self.bundle_path.glob(self.file_pattern):
-                with open(target_file, "rt") as ifp:
-                    item = self.item_load(ifp)
-                    count += 1
+                try:
+                    with open(target_file, "rt") as ifp:
+                        item = self.item_load(ifp)
+                        count += 1
 
-                    ofp.write(f"File: {target_file}\n")
-                    ofp.write(self.item_dumps(item) + "\n\n")
+                        ofp.write(f"File: {target_file}\n")
+                        ofp.write(self.item_dumps(item) + "\n\n")
 
-                    if not merged_item:
-                        merged_item = item
-                    else:
-                        self.item_merge_in_place(merged_item, item)
+                        if not merged_item:
+                            merged_item = item
+                        else:
+                            self.item_merge_in_place(merged_item, item)
+
+                except Exception as e:
+                    print(f"Exception while processing {target_file}: {e}")
 
         print(f"Processed {count} files in {self.bundle_path}")
         if not merged_item:
