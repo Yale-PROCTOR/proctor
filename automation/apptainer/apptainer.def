@@ -98,7 +98,7 @@ git clone https://github.com/kaist-plrg/crat \
  && cargo build --release --bin crat \
  && git checkout master \
  && git pull \
- && git checkout bf03177 \
+ && git checkout 8d0b27e \
  && cargo build --release --bin crat \
  && ln -s "${TRANSLATE_DIR}/crat/crat" /usr/local/bin/crat
 
