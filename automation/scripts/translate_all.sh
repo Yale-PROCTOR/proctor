@@ -20,7 +20,7 @@ TRANSLATE_SH="${SCRIPT_DIR}/translate.sh"
 check_file "${TRANSLATE_SH}"
 [[ $# -eq 0 ]] && usage
 
-set -e
+# set -e
 
 bundles_dir="${1}"
 bundles=("B01_organic" "B01_synthetic" "P00_perlin_noise" "P01_sphincs_plus")

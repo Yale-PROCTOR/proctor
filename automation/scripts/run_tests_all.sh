@@ -20,7 +20,7 @@ RUN_TESTS_SH="${SCRIPT_DIR}/run_tests.sh"
 check_file "${RUN_TESTS_SH}"
 [[ $# -eq 0 ]] && usage
 
-set -e
+# set -e
 
 bundles_dir="${1}"
 bundles=("B01_organic" "B01_synthetic" "P00_perlin_noise" "P01_sphincs_plus")
