@@ -20,8 +20,8 @@ check_file() {
     fi
 }
 
-#set -euxo pipefail
-set -e
+# set -euxo pipefail
+# set -e
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 
@@ -87,10 +87,11 @@ done
 [[ $# -ne 1 ]] && usage
 
 src="$(realpath "${1}")"
-dst="${src}/${translated_dir}"
+#dst="${src}/${translated_dir}"
 
-rm -rf "${dst:?}" "${src}/build-ninja"
-mkdir -p "${dst}"
+rm -rf "${src}/build-ninja" "${src}/config.toml"
+#rm -rf "${dst:?}" "${src}/build-ninja"
+#mkdir -p "${dst}"
 
 # create compile commands
 pushd "${src}" >/dev/null
@@ -112,6 +113,11 @@ popd >/dev/null
 target_name=$("${GET_TARGET_PY}" "${src}/build-ninja" name)
 target_type=$("${GET_TARGET_PY}" "${src}/build-ninja" type)
 
+true_dst="${src}/${translated_dir}"
+dst="${src}/${translated_dir}/${target_name}"
+rm -rf "${true_dst:?}"
+mkdir -p "${dst}"
+
 target_lib_so="${src}/build-ninja/lib${target_name}.so"
 if [[ -f "${target_lib_so}" ]]; then
     rm "${target_lib_so}"
@@ -123,12 +129,17 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
     "${FILTER_FILES_PY}" "${src}/build-ninja" "${src_root}" "${src}/build-ninja/compile_commands.json"
 
     if [[ "${use_crat}" == "false" ]]; then
+        main_file="main"
+        if [[ "${src}" == *"P01_sphincs_plus"* ]]; then
+            main_file="PQCgenKAT_sign"
+        fi
+
         c2rust-transpile \
-            --binary main \
+            --binary "${main_file}" \
             -e "${src}/build-ninja/compile_commands.json" \
             -o "${dst}"
 
-        sed -i "s/name = \"main\"/name = \"${target_name}\"/" "${dst}/Cargo.toml"
+        sed -i "s/name = \"${main_file}\"/name = \"${target_name}\"/" "${dst}/Cargo.toml"
         "${ADD_LINK_ARGS_PY}" "${src}/build-ninja" "${dst}/build.rs"
 
     else
@@ -167,7 +178,6 @@ else
         -e "${src}/build-ninja/compile_commands.json" \
         -o "${dst}"
 
-    sed -i "s/name = \"${translated_dir}\"/name = \"${target_name}\"/" "${dst}/Cargo.toml"
     "${ADD_LINK_ARGS_PY}" "${src}/build-ninja" "${dst}/build.rs"
 
     if [[ "${use_crat}" == "true" ]]; then
@@ -190,9 +200,6 @@ else
     fi
 fi
 
-"${CDYLIB_PY}" "${src}/build-ninja" "${src}" "${dst}"
-cargo generate-lockfile --manifest-path "${dst}/Cargo.toml"
-
 # refine with clippy fix and cargo fmt
 if [[ "${use_cfix}" == "true" ]]; then
     while cargo clippy \
@@ -204,7 +211,9 @@ if [[ "${use_cfix}" == "true" ]]; then
     done
 fi
 
+# cargo generate-lockfile --manifest-path "${dst}/Cargo.toml"
 cargo fmt --manifest-path "${dst}/Cargo.toml"
+"${CDYLIB_PY}" "${src}/build-ninja" "${src}" "${dst}"
 
 # measure unsafety and idiomaticity and run tests
 mkdir -p "${dst}/results"
@@ -218,6 +227,11 @@ measure_idiomaticity \
     --uid "$(id -u)" \
     --gid "$(id -g)"
 
-run_tests "${dst}" "${dst}/results/tests.xml" --verbose
+mv "${dst}"/* "${dst}/.cargo" "${true_dst}"
+rm -d "${dst}"
 
-rm -r "${src}/build-ninja"
+# test_case directory needs to be the parent of the target directory
+# thus we move our directories first and then run tests
+run_tests "${true_dst}" "${true_dst}/results/tests.xml" --verbose
+
+rm -r "${src}/build-ninja" "${src}/config.toml"
