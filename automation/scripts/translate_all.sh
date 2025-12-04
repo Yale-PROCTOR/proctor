@@ -30,7 +30,7 @@ case "${2}" in
 -seq)
     echo "Translating sequentially"
     for bundle in "${bundles[@]}"; do
-        find "${bundles_dir}/${bundle}" -maxdepth 1 -type d -print0 |
+        find "${bundles_dir}/${bundle}" -mindepth 1 -maxdepth 1 -type d -print0 |
             while IFS= read -r -d $'\0' dir; do
                 for conf in "${confs[@]}"; do
                     "${TRANSLATE_SH}" "--${conf}" "${dir}"
