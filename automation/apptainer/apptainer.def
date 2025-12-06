@@ -47,19 +47,29 @@ CLIPPY_CONF_DIR="/usr/clippy"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update \
  && apt-get install -y \
-  clang \
+ build-essential \
+ clang \
+  wget \
   curl \
   g++ \
   gcc \
   git \
+  xz-utils \
+  make \
+  sudo \
+  locales \
+  llvm \
+  pkg-config \
   libclang-dev \
   libssl-dev \
-  llvm \
-  locales \
-  make \
-  pkg-config \
-  sudo \
+  libbz2-dev \
   zlib1g-dev \
+  libreadline-dev \
+  libsqlite3-dev \
+  libncurses5-dev \
+  libncursesw5-dev \
+  tk-dev \
+  liblzma-dev \
   parallel \
   vim
 
