@@ -47,8 +47,9 @@ CLIPPY_CONF_DIR="/usr/clippy"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update \
  && apt-get install -y \
- build-essential \
- clang \
+  build-essential \
+  clang \
+  netcat-openbsd \
   wget \
   curl \
   g++ \
