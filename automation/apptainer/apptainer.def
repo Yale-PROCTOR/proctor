@@ -14,8 +14,6 @@ TRANSLATE_DIR="${APPTAINER_ROOTFS}/usr/translate"
 MEASUREMENTS_DIR="${APPTAINER_ROOTFS}/usr/measurements"
 CLIPPY_CONF_DIR="${APPTAINER_ROOTFS}/usr/clippy"
 
-mkdir -p "${CLIPPY_CONF_DIR}"
-
 mkdir -p "${TRANSLATE_DIR}"
 cp ../../add_link_args.py \
    ../../cdylib.py \
@@ -23,6 +21,9 @@ cp ../../add_link_args.py \
    ../../filter_files.py \
    ../../get_target.py \
    ../scripts/* "${TRANSLATE_DIR}"
+
+mkdir -p "${CLIPPY_CONF_DIR}"
+mv "${TRANSLATE_DIR}/create_clippy_lint_map.py" "${CLIPPY_CONF_DIR}"
 
 cp -r "../measurements" "${MEASUREMENTS_DIR}"
 
@@ -37,6 +38,8 @@ cp -r share/* "${APPTAINER_ROOTFS}/usr/local/share"
 
 
 %post -c /bin/bash
+
+set -e
 
 TRANSLATE_DIR="/usr/translate"
 MEASUREMENTS_DIR="/usr/measurements"
@@ -80,7 +83,7 @@ cd Python-3.13.0 \
  && make install \
  && cd .. \
  && rm -rf Python-3.13.0
-pip3 install toml tabulate beautifulsoup4 lxml libclang
+pip3 install toml tabulate requests beautifulsoup4 lxml libclang
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y nodejs
@@ -112,6 +115,9 @@ git clone https://github.com/kaist-plrg/crat \
  && git checkout 8d0b27e \
  && cargo build --release --bin crat \
  && ln -s "${TRANSLATE_DIR}/crat/crat" /usr/local/bin/crat
+
+cd "${CLIPPY_CONF_DIR}"
+python3 create_clippy_lint_map.py
 
 chmod +x "${TRANSLATE_DIR}/translate.sh"
 ln -s "${TRANSLATE_DIR}/translate.sh" /usr/local/bin/translate
