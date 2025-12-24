@@ -1,4 +1,4 @@
-#! /bin/bash
+#!/bin/bash
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 
@@ -9,18 +9,6 @@ cd "${SCRIPT_DIR}/.."
 if [[ ! -d "Test-Corpus" ]]; then
     echo "Downloading Test-Corpus"
     git clone git@github.com:DARPA-TRACTOR-Program/Test-Corpus.git
-fi
-
-if [[ ! -d "Test-Corpus-Custom" ]]; then
-    echo "Creating Test-Corpus-Custom"
-    cp -r Test-Corpus Test-Corpus-Custom
-    pushd Test-Corpus-Custom
-    git checkout 96ce4c7
-    git apply ../fixes.patch
-    cd deployment/scripts/github-actions
-    rm run-tests.pyz
-    python3 -m zipapp . -m "runtests.__main__:main" -p "/usr/bin/env python3" -o run-tests.pyz
-    popd
 fi
 
 if [[ ! -d "Python-3.13.0" ]]; then

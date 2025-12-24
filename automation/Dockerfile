@@ -46,13 +46,13 @@ RUN pip3 install toml tabulate beautifulsoup4 lxml libclang mpire
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | sh -s -- -y -q --default-toolchain nightly-2025-06-23-x86_64-unknown-linux-gnu
 
-RUN git clone https://github.com/Medowhill/c2rust \
+RUN git clone https://github.com/Medowhill/c2rust.git \
  && cd c2rust \
  && git checkout tractor-0.21.0 \
  && cargo build --release -Z sparse-registry \
  && ln -s ~/c2rust/target/release/c2rust-transpile ~/local/bin
 
-RUN git clone https://github.com/kaist-plrg/crat \
+RUN git clone https://github.com/Yale-PROCTOR/crat.git \
  && cd crat \
  && git checkout 7e7d744 \
  && cd deps_crate \
@@ -64,7 +64,7 @@ RUN git clone https://github.com/kaist-plrg/crat \
 RUN cd crat \
  && git checkout master \
  && git pull \
- && git checkout 2dcafd7 \
+ && git checkout 3bb4355 \
  && cargo build --release --bin crat
 
 COPY --chown=ubuntu:ubuntu ./Test-Corpus Test-Corpus
@@ -77,26 +77,6 @@ COPY --chown=ubuntu:ubuntu \
      ./automation/scripts/* \
      Test-Corpus
 
-COPY --chown=ubuntu:ubuntu ./Test-Corpus Test-Corpus-Custom
-COPY --chown=ubuntu:ubuntu ./fixes.patch Test-Corpus-Custom
-
-RUN cd Test-Corpus-Custom \
- && git checkout 96ce4c7 \
- && git apply fixes.patch \
- && rm fixes.patch \
- && cd deployment/scripts/github-actions \
- && rm run-tests.pyz \
- && python3 -m zipapp . -m "runtests.__main__:main" -p "/usr/bin/env python3" -o run-tests.pyz
-
-COPY --chown=ubuntu:ubuntu \
-     ./add_link_args.py \
-     ./cdylib.py \
-     ./find_fns.py \
-     ./filter_files.py \
-     ./get_target.py \
-     ./automation/scripts/* \
-     Test-Corpus-Custom
-
 COPY --chown=ubuntu:ubuntu ./automation/measurements measurements
 RUN cargo install --path ~/measurements/measure_unsafety --root ~/measurements/measure_unsafety \
  && ln -s ~/measurements/measure_unsafety/bin/measure_unsafety ~/local/bin/measure_unsafety
@@ -107,10 +87,7 @@ RUN chmod +x ~/measurements/measure_idiomaticity/measure_idiomaticity.py \
 RUN mkdir ~/.clippy && ln -s ~/measurements/measure_idiomaticity/clippy.toml ~/.clippy/clippy.toml
 
 RUN ln -s ~/Test-Corpus/translate.sh ~/local/bin/translate \
- && ln -s ~/Test-Corpus/translate_all.sh ~/local/bin/translate_all \
  && ln -s ~/Test-Corpus/run_tests.sh ~/local/bin/run_tests \
- && ln -s ~/Test-Corpus/run_tests_all.sh ~/local/bin/run_tests_all \
  && ln -s ~/Test-Corpus/aggregate.py ~/local/bin/aggregate \
- && ln -s ~/Test-Corpus/aggregate.sh ~/local/bin/aggregate_all \
  && ln -s ~/Test-Corpus/visualize.py ~/local/bin/visualize \
- && ln -s ~/Test-Corpus/visualize.sh ~/local/bin/visualize_all
+ && ln -s ~/Test-Corpus/process_all.py ~/local/bin/process_all
