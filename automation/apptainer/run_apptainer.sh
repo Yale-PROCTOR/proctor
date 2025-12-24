@@ -27,8 +27,10 @@ translate_all)
         --bind "${TEST_CORPUS_DIR}" \
         --pwd "${TEST_CORPUS_DIR}" \
         "${APPTAINER_SIF}" \
-        translate_all \
-        "${TESTS_DIR}"
+        process_all \
+        "${TESTS_DIR}" \
+        --action translate \
+        "${@:4}"
     ;;
 
 aggregate_all)
@@ -40,18 +42,25 @@ aggregate_all)
         --bind "${TEST_CORPUS_DIR}" \
         --pwd "${TEST_CORPUS_DIR}" \
         "${APPTAINER_SIF}" \
-        aggregate_all \
-        "${TESTS_DIR}"
+        process_all \
+        "${TESTS_DIR}" \
+        --action aggregate \
+        "${@:4}"
     ;;
 
 visualize_all)
+    TESTS_DIR="$(realpath "${3}")"
+
     apptainer exec \
         --overlay "${APPTAINER_OVERLAY}" \
         --containall \
         --bind "${TEST_CORPUS_DIR}" \
         --pwd "${TEST_CORPUS_DIR}" \
         "${APPTAINER_SIF}" \
-        visualize_all
+        process_all \
+        "${TESTS_DIR}" \
+        --action visualize \
+        "${@:4}"
     ;;
 
 translate)

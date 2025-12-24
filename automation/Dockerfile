@@ -19,7 +19,6 @@ RUN apt-get update \
     pkg-config \
     sudo \
     zlib1g-dev \
-    parallel \
     vim \
  && rm -rf /var/lib/apt/lists/*
 
@@ -42,7 +41,7 @@ RUN cd Python-3.14.0 \
  && make install \
  && cd .. \
  && rm -rf Python-3.14.0
-RUN pip3 install toml tabulate beautifulsoup4 lxml libclang
+RUN pip3 install toml tabulate beautifulsoup4 lxml libclang mpire
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | sh -s -- -y -q --default-toolchain nightly-2025-06-23-x86_64-unknown-linux-gnu
