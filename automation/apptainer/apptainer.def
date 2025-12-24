@@ -95,14 +95,14 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 rustup component add clippy
 
 cd "${TRANSLATE_DIR}"
-git clone https://github.com/Medowhill/c2rust \
+git clone https://github.com/Medowhill/c2rust.git \
  && cd c2rust \
  && git checkout tractor-0.21.0 \
  && cargo build --release -Z sparse-registry \
  && ln -s "$(pwd -P)/target/release/c2rust-transpile" /usr/local/bin
 
 cd "${TRANSLATE_DIR}"
-git clone https://github.com/kaist-plrg/crat \
+git clone https://github.com/Yale-PROCTOR/crat.git \
  && cd crat \
  && git checkout 7e7d744 \
  && cd deps_crate \
@@ -111,7 +111,7 @@ git clone https://github.com/kaist-plrg/crat \
  && cargo build --release --bin crat \
  && git checkout master \
  && git pull \
- && git checkout 8d0b27e \
+ && git checkout 3bb4355 \
  && cargo build --release --bin crat \
  && ln -s "${TRANSLATE_DIR}/crat/crat" /usr/local/bin/crat
 
