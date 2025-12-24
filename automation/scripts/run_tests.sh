@@ -34,7 +34,7 @@ else
     cd "${root_dir}" || usage
 fi
 
-RUN_TESTS_SCRIPT="./deployment/scripts/github-actions/run-tests.pyz"
+RUN_TESTS_SCRIPT="./deployment/scripts/github-actions/run_rust.sh"
 check_file "${RUN_TESTS_SCRIPT}"
 
 cargo build --release --manifest-path "${translation_dir}/Cargo.toml"
@@ -47,7 +47,6 @@ if [[ -f "${lib_so}" ]]; then
 fi
 
 ${RUN_TESTS_SCRIPT} \
-    --rust \
     --keep-going \
     --subset "${translation_dir_dir}" \
     --junit-xml "${output_xml}" \

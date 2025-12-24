@@ -86,6 +86,7 @@ done
 
 [[ $# -ne 1 ]] && usage
 
+echo "Translation Start"
 src="$(realpath "${1}")"
 #dst="${src}/${translated_dir}"
 
@@ -235,4 +236,4 @@ rm -d "${dst}"
 run_tests "${true_dst}" "${true_dst}/results/tests.xml" --verbose
 
 rm -r "${src}/build-ninja" "${src}/config.toml"
-echo Success
+echo "Translation End"
