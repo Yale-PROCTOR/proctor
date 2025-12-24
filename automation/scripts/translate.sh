@@ -235,3 +235,4 @@ rm -d "${dst}"
 run_tests "${true_dst}" "${true_dst}/results/tests.xml" --verbose
 
 rm -r "${src}/build-ninja" "${src}/config.toml"
+echo Success

@@ -74,7 +74,6 @@ apt-get update \
   libncursesw5-dev \
   tk-dev \
   liblzma-dev \
-  parallel \
   vim
 
 cd Python-3.13.0 \
@@ -83,7 +82,7 @@ cd Python-3.13.0 \
  && make install \
  && cd .. \
  && rm -rf Python-3.13.0
-pip3 install toml tabulate requests beautifulsoup4 lxml libclang
+pip3 install toml tabulate requests beautifulsoup4 lxml libclang mpire
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y nodejs
@@ -122,26 +121,17 @@ python3 create_clippy_lint_map.py
 chmod +x "${TRANSLATE_DIR}/translate.sh"
 ln -s "${TRANSLATE_DIR}/translate.sh" /usr/local/bin/translate
 
-chmod +x "${TRANSLATE_DIR}/translate_all.sh"
-ln -s "${TRANSLATE_DIR}/translate_all.sh" /usr/local/bin/translate_all
-
 chmod +x "${TRANSLATE_DIR}/run_tests.sh"
 ln -s "${TRANSLATE_DIR}/run_tests.sh" /usr/local/bin/run_tests
-
-chmod +x "${TRANSLATE_DIR}/run_tests_all.sh"
-ln -s "${TRANSLATE_DIR}/run_tests_all.sh" /usr/local/bin/run_tests_all
 
 chmod +x "${TRANSLATE_DIR}/aggregate.py"
 ln -s "${TRANSLATE_DIR}/aggregate.py" /usr/local/bin/aggregate
 
-chmod +x "${TRANSLATE_DIR}/aggregate_all.sh"
-ln -s "${TRANSLATE_DIR}/aggregate.sh" /usr/local/bin/aggregate_all
-
 chmod +x "${TRANSLATE_DIR}/visualize.py"
 ln -s "${TRANSLATE_DIR}/visualize.py" /usr/local/bin/visualize
 
-chmod +x "${TRANSLATE_DIR}/visualize_all.sh"
-ln -s "${TRANSLATE_DIR}/visualize.sh" /usr/local/bin/visualize_all
+chmod +x "${TRANSLATE_DIR}/process_all.py"
+ln -s "${TRANSLATE_DIR}/process_all.py" /usr/local/bin/process_all
 
 cargo install --path "${UNSAFETY_DIR}" --root "${UNSAFETY_DIR}"
 ln -s "${UNSAFETY_DIR}/bin/measure_unsafety" /usr/local/bin
