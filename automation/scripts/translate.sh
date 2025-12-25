@@ -88,11 +88,11 @@ done
 
 echo "Translation Start"
 src="$(realpath "${1}")"
-#dst="${src}/${translated_dir}"
+# dst="${src}/${translated_dir}"
 
 rm -rf "${src}/build-ninja" "${src}/config.toml"
-#rm -rf "${dst:?}" "${src}/build-ninja"
-#mkdir -p "${dst}"
+# rm -rf "${dst:?}" "${src}/build-ninja"
+# mkdir -p "${dst}"
 
 # create compile commands
 pushd "${src}" >/dev/null
@@ -201,20 +201,29 @@ else
     fi
 fi
 
-# refine with clippy fix and cargo fmt
+pushd "${dst}" >/dev/null
+# cargo generate-lockfile
+cargo fmt
+"${CDYLIB_PY}" "${src}/build-ninja" "${src}" "${dst}"
+
+# refine with clippy fix
 if [[ "${use_cfix}" == "true" ]]; then
-    while cargo clippy \
-        --fix \
-        --allow-no-vcs \
-        --manifest-path "${dst}/Cargo.toml" 2>&1 |
+    attempt=1
+    max_attempts=10
+    while [ "${attempt}" -le "${max_attempts}" ] &&
+        cargo clippy \
+            --workspace \
+            --fix \
+            --allow-no-vcs \
+            --allow-dirty \
+            --all-targets \
+            2>&1 |
         grep -q "run \`cargo clippy --fix"; do
-        echo "Running clippy --fix"
+        echo "Running clippy --fix (attempt: ${attempt})"
+        ((attempt++))
     done
 fi
-
-# cargo generate-lockfile --manifest-path "${dst}/Cargo.toml"
-cargo fmt --manifest-path "${dst}/Cargo.toml"
-"${CDYLIB_PY}" "${src}/build-ninja" "${src}" "${dst}"
+popd >/dev/null
 
 # measure unsafety and idiomaticity and run tests
 mkdir -p "${dst}/results"
