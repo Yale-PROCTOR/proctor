@@ -91,7 +91,7 @@ def get_parser():
         type=str,
         nargs="+",
         default=["unsafety", "idiomaticity", "tests"],
-        help="which type to aggregate",
+        help="which types to aggregate",
     )
 
     parser.add_argument(
@@ -107,7 +107,7 @@ def get_parser():
         type=str,
         nargs="+",
         default=["unsafety", "idiomaticity", "tests"],
-        help="which type to visualize",
+        help="which types to visualize",
     )
 
     parser.add_argument(
@@ -127,8 +127,8 @@ def get_parser():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=600,
-        help="timeout of a translation",
+        default=3600,
+        help="timeout (sec) of a worker",
     )
 
     return parser
