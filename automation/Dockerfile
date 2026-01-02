@@ -44,28 +44,24 @@ RUN cd Python-3.14.0 \
 RUN pip3 install toml tabulate beautifulsoup4 lxml libclang mpire
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y -q --default-toolchain nightly-2025-06-23-x86_64-unknown-linux-gnu
+  | sh -s -- -y -q --default-toolchain none
 
-RUN git clone https://github.com/Medowhill/c2rust.git \
+RUN rustup toolchain install -c rust-src,rustc-dev,llvm-tools-preview nightly-2025-06-23
+
+RUN git clone https://github.com/Yale-PROCTOR/c2rust.git \
  && cd c2rust \
  && git checkout tractor-0.21.0 \
- && cargo build --release -Z sparse-registry \
+ && cargo build --release --bin c2rust-transpile -Z sparse-registry \
  && ln -s ~/c2rust/target/release/c2rust-transpile ~/local/bin
 
 RUN git clone https://github.com/Yale-PROCTOR/crat.git \
  && cd crat \
- && git checkout 7e7d744 \
+ && git checkout 3bb4355 \
  && cd deps_crate \
  && cargo build \
  && cd .. \
  && cargo build --release --bin crat \
  && ln -s ~/crat/crat ~/local/bin
-
-RUN cd crat \
- && git checkout master \
- && git pull \
- && git checkout 3bb4355 \
- && cargo build --release --bin crat
 
 COPY --chown=ubuntu:ubuntu ./Test-Corpus Test-Corpus
 COPY --chown=ubuntu:ubuntu \
