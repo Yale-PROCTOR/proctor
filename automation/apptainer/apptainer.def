@@ -91,27 +91,25 @@ export CARGO_HOME=/usr/local/cargo
 export RUSTUP_HOME=/usr/local/rustup
 export PATH="${CARGO_HOME}/bin:${PATH}"
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y -q --default-toolchain nightly-2025-06-23-x86_64-unknown-linux-gnu
+  | sh -s -- -y -q --default-toolchain none
+
+rustup toolchain install -c rust-src,rustc-dev,llvm-tools-preview nightly-2025-06-23
 rustup component add clippy
 
 cd "${TRANSLATE_DIR}"
-git clone https://github.com/Medowhill/c2rust.git \
+git clone https://github.com/Yale-PROCTOR/c2rust.git \
  && cd c2rust \
  && git checkout tractor-0.21.0 \
- && cargo build --release -Z sparse-registry \
+ && cargo build --release --bin c2rust-transpile -Z sparse-registry \
  && ln -s "$(pwd -P)/target/release/c2rust-transpile" /usr/local/bin
 
 cd "${TRANSLATE_DIR}"
 git clone https://github.com/Yale-PROCTOR/crat.git \
  && cd crat \
- && git checkout 7e7d744 \
+ && git checkout 3bb4355 \
  && cd deps_crate \
  && cargo build \
  && cd .. \
- && cargo build --release --bin crat \
- && git checkout master \
- && git pull \
- && git checkout 3bb4355 \
  && cargo build --release --bin crat \
  && ln -s "${TRANSLATE_DIR}/crat/crat" /usr/local/bin/crat
 
