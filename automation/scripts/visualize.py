@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 from abc import abstractmethod
 from itertools import zip_longest
 from pathlib import Path
@@ -9,9 +10,15 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from tabulate import tabulate, tabulate_formats
 
+logging.basicConfig(
+    format="%(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__file__)
+
 
 class Visualizer:
-    extension = ".any"
+    extension = "any"
 
     def __init__(
         self,
@@ -38,7 +45,7 @@ class Visualizer:
                         self.dcts[bundle].append(dct)
 
                 except Exception as e:
-                    print(f"Exception while processing {file}: {e}")
+                    logger.error(f"Exception while processing {file}", exc_info=e)
 
     @abstractmethod
     def load_as_dict(self, fp) -> dict:
@@ -52,11 +59,11 @@ class Visualizer:
         output = tabulate(tab_dct, headers="keys", tablefmt=self.tablefmt) + "\n\n\n"
 
         if self.out_file == "stdout":
-            print(output)
+            logger.info(output)
         else:
             with self.out_file.open("at") as fp:
                 fp.write(output)
-                print(f"Appended to {self.out_file}")
+                logger.info(f"Appended to {self.out_file}")
 
     @abstractmethod
     def tabulate_vertical(self, output=True) -> list[dict]:
@@ -100,21 +107,21 @@ class Visualizer:
             dcts = self.tabulate_horizontal()
 
         else:
-            print(f"Unknown config orientation: {conf_orient}")
+            logger.error(f"Unknown config orientation: {conf_orient}")
             dcts = []
 
         return dcts
 
 
 class JsonVisualizer(Visualizer):
-    extension = ".json"
+    extension = "json"
 
     def load_as_dict(self, fp) -> dict:
         return json.load(fp)
 
 
 class XmlVisualizer(Visualizer):
-    extension = ".xml"
+    extension = "xml"
 
 
 class UnsafetyVisualizer(JsonVisualizer):
@@ -125,7 +132,7 @@ class UnsafetyVisualizer(JsonVisualizer):
 
         for bundle, bundle_dcts in self.dcts.items():
             if not bundle_dcts:
-                print(f"Skipping over empty bundle: {bundle}")
+                logger.warning(f"Skipping over empty bundle: {bundle}")
                 continue
 
             tab_dct = {}
@@ -170,7 +177,7 @@ class IdiomaticityVisualizer(JsonVisualizer):
 
         for bundle, bundle_dcts in self.dcts.items():
             if not bundle_dcts:
-                print(f"Skipping over empty bundle: {bundle}")
+                logger.warning(f"Skipping over empty bundle: {bundle}")
                 continue
 
             tab_dct = {}
@@ -204,7 +211,7 @@ class IdiomaticityVisualizer(JsonVisualizer):
 
         for bundle, bundle_dcts in self.dcts.items():
             if not bundle_dcts:
-                print(f"Skipping over empty bundle: {bundle}")
+                logger.warning(f"Skipping over empty bundle: {bundle}")
                 continue
 
             tab_dct = {}
@@ -215,10 +222,13 @@ class IdiomaticityVisualizer(JsonVisualizer):
                 tab_dct[first_header].append(bundle_dct["conf"])
                 conf_idx = len(tab_dct[first_header]) - 1
 
-                for tool, inner_dct in bundle_dct["lints"].items():
-                    for level, val_list in inner_dct.items():
+                for tool, inner_dct in bundle_dct.items():
+                    if tool in ["conf", "cyclomatic_complexity_counts"]:
+                        continue
+
+                    for level, lint_dct in inner_dct.items():
                         header = f"{tool}\n{level}"
-                        total_lints = val_list[0]
+                        total_lints = sum(lint_dct.values())
                         tab_dct.setdefault(header, [])
                         col = tab_dct[header]
                         col.extend([0] * (conf_idx - len(col)))
@@ -240,7 +250,7 @@ class IdiomaticityVisualizer(JsonVisualizer):
 
         for bundle, bundle_dcts in self.dcts.items():
             if not bundle_dcts:
-                print(f"Skipping over empty bundle: {bundle}")
+                logger.warning(f"Skipping over empty bundle: {bundle}")
                 continue
 
             tab_dct = {}
@@ -251,14 +261,17 @@ class IdiomaticityVisualizer(JsonVisualizer):
                 tab_dct[first_header].append(bundle_dct["conf"])
                 conf_idx = len(tab_dct[first_header]) - 1
 
-                for tool, inner_dct in bundle_dct["lints"].items():
-                    for level, val_list in inner_dct.items():
-                        for lint, num in val_list[1].items():
+                for tool, inner_dct in bundle_dct.items():
+                    if tool in ["conf", "cyclomatic_complexity_counts"]:
+                        continue
+
+                    for level, lint_dct in inner_dct.items():
+                        for lint, count in lint_dct.items():
                             header = f"[{tool} {level}]\n{lint}"
                             tab_dct.setdefault(header, [])
                             col = tab_dct[header]
                             col.extend([0] * (conf_idx - len(col)))
-                            col.append(num)
+                            col.append(count)
 
             # sort reverse lexicographically
             first_col = tab_dct.pop(first_header)
@@ -315,7 +328,7 @@ class TestsVisualizer(XmlVisualizer):
 
         for bundle, bundle_dcts in self.dcts.items():
             if not bundle_dcts:
-                print(f"Skipping over empty bundle: {bundle}")
+                logger.warning(f"Skipping over empty bundle: {bundle}")
                 continue
 
             tab_dct = {}
@@ -342,7 +355,7 @@ class TestsVisualizer(XmlVisualizer):
 
         for bundle, bundle_dcts in self.dcts.items():
             if not bundle_dcts:
-                print(f"Skipping over empty bundle: {bundle}")
+                logger.warning(f"Skipping over empty bundle: {bundle}")
                 continue
 
             tab_dct = {}
@@ -458,7 +471,7 @@ def main():
         visualizer.tabulate(args.conf_orient)
 
     else:
-        print(f"Unknown type: {args.type}")
+        logger.error(f"Unknown type: {args.type}")
 
 
 if __name__ == "__main__":
