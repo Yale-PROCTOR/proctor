@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
@@ -13,7 +14,7 @@ soup = BeautifulSoup(content, "html.parser")
 group_to_lint_file = "clippy_group_to_lint.json"
 group_to_lint = {}
 for article in soup.find_all("article"):
-    lint = article["id"].strip()
+    lint = str(article["id"]).strip()
 
     lint_group = article.find("span", class_="lint-group")
     if not lint_group:
@@ -22,7 +23,7 @@ for article in soup.find_all("article"):
     group = lint_group.text.strip()
 
     past_names = []
-    past_names_heading = article.find("h3", string="Past names")
+    past_names_heading = article.find(name="h3", string="Past names")  # type: ignore
     if past_names_heading:
         ul_tag = past_names_heading.find_next_sibling("ul")
         if ul_tag:
@@ -43,6 +44,6 @@ for dct, file in [
     (group_to_lint, group_to_lint_file),
     (lint_to_group, lint_to_group_file),
 ]:
-    with open(file, "w") as fd:
+    with Path(file).open("wt") as fd:
         json.dump(dct, fd, indent=4)
         print(f"Created {file}")

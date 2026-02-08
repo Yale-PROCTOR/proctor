@@ -2,21 +2,23 @@
 
 import argparse
 import json
+from abc import abstractmethod
 from itertools import zip_longest
+from pathlib import Path
 
 from bs4 import BeautifulSoup
 from tabulate import tabulate, tabulate_formats
 
 
 class Visualizer:
-    extension = "any"
+    extension = ".any"
 
     def __init__(
         self,
-        agg_dir: str,
+        agg_dir: Path,
         bundles: list[str],
         confs: list[str],
-        out_file: str,
+        out_file: Path,
         tablefmt: str,
     ):
         self.out_file = out_file
@@ -27,9 +29,9 @@ class Visualizer:
             self.dcts[bundle] = []
 
             for conf in confs:
-                file = f"{agg_dir}/{bundle}_{conf}.{self.extension}"
+                file = Path(f"{agg_dir}/{bundle}_{conf}.{self.extension}")
                 try:
-                    with open(file, "rt") as fp:
+                    with file.open("rt") as fp:
                         dct = {"conf": conf}
                         dct.update(self.load_as_dict(fp))
 
@@ -38,6 +40,7 @@ class Visualizer:
                 except Exception as e:
                     print(f"Exception while processing {file}: {e}")
 
+    @abstractmethod
     def load_as_dict(self, fp) -> dict:
         """Load item from file to json"""
         raise NotImplementedError()
@@ -51,10 +54,11 @@ class Visualizer:
         if self.out_file == "stdout":
             print(output)
         else:
-            with open(self.out_file, "at") as fp:
+            with self.out_file.open("at") as fp:
                 fp.write(output)
                 print(f"Appended to {self.out_file}")
 
+    @abstractmethod
     def tabulate_vertical(self, output=True) -> list[dict]:
         raise NotImplementedError()
 
@@ -90,22 +94,27 @@ class Visualizer:
 
     def tabulate(self, conf_orient) -> list[dict]:
         if conf_orient == "vertical":
-            return self.tabulate_vertical()
+            dcts = self.tabulate_vertical()
+
         elif conf_orient == "horizontal":
-            return self.tabulate_horizontal()
+            dcts = self.tabulate_horizontal()
+
         else:
             print(f"Unknown config orientation: {conf_orient}")
+            dcts = []
+
+        return dcts
 
 
 class JsonVisualizer(Visualizer):
-    extension = "json"
+    extension = ".json"
 
     def load_as_dict(self, fp) -> dict:
         return json.load(fp)
 
 
 class XmlVisualizer(Visualizer):
-    extension = "xml"
+    extension = ".xml"
 
 
 class UnsafetyVisualizer(JsonVisualizer):
@@ -279,6 +288,7 @@ class TestsVisualizer(XmlVisualizer):
     def load_as_dict(self, fp) -> dict:
         xmlsoup = BeautifulSoup(fp, "xml")
         testsuites = xmlsoup.testsuites
+        assert testsuites is not None
 
         dct = {}
 
@@ -290,7 +300,7 @@ class TestsVisualizer(XmlVisualizer):
 
         for testsuite in testsuites.find_all("testsuite"):
             # keep basename of the path name
-            name = testsuite[self.name_attribute].split("/")[-1]
+            name = str(testsuite[self.name_attribute]).split("/")[-1]
             dct.setdefault(name, {})
             for attr in self.attributes:
                 dct[name][attr] = testsuite[attr]
@@ -382,7 +392,7 @@ def get_parser():
     parser.add_argument(
         "--agg_dir",
         required=True,
-        type=str,
+        type=Path,
         help="the directory of the aggregate files",
     )
 
@@ -401,7 +411,7 @@ def get_parser():
 
     parser.add_argument(
         "--out_file",
-        type=str,
+        type=Path,
         required=True,
         help="the output file, use `stdout` for just printing",
     )
@@ -424,7 +434,7 @@ def get_parser():
     return parser
 
 
-if __name__ == "__main__":
+def main():
     args = get_parser().parse_args()
 
     inputs = (
@@ -449,3 +459,7 @@ if __name__ == "__main__":
 
     else:
         print(f"Unknown type: {args.type}")
+
+
+if __name__ == "__main__":
+    main()
