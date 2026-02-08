@@ -231,11 +231,9 @@ mkdir -p "${dst}/results"
 measure_unsafety "${dst}" 2>&1 | tee "${dst}/results/unsafety.json"
 
 measure_idiomaticity \
-    --manifest "${dst}/Cargo.toml" \
+    --include_ccc \
     --output "${dst}/results/idiomaticity.json" \
-    --debug \
-    --uid "$(id -u)" \
-    --gid "$(id -g)"
+    "${dst}"
 
 mv "${dst}"/* "${dst}/.cargo" "${true_dst}"
 rm -d "${dst}"
