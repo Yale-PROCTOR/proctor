@@ -2,39 +2,44 @@
 
 import argparse
 import json
+from abc import abstractmethod
 from pathlib import Path
+from typing import Any
 
 from bs4 import BeautifulSoup
 
 
 class Aggregator:
-    output_extension = "any"
+    output_extension = ".any"
 
-    def __init__(self, bundle_path, file_pattern, output_prefix):
+    def __init__(self, bundle_path: Path, file_pattern: str, output_prefix: str):
         self.bundle_path = bundle_path
         self.file_pattern = file_pattern
-        self.output_txt = f"{output_prefix}.txt"
-        self.output_file = f"{output_prefix}.{self.output_extension}"
+        self.output_txt = Path(output_prefix).with_suffix(".txt")
+        self.output_file = Path(output_prefix).with_suffix(self.output_extension)
 
+    @abstractmethod
     def item_merge_in_place(self, target, source):
         """Modify target in place"""
         raise NotImplementedError()
 
+    @abstractmethod
     def item_load(self, fp):
         """Load item from file"""
         raise NotImplementedError()
 
-    def item_dumps(self, item: any) -> str:
+    @abstractmethod
+    def item_dumps(self, item: Any) -> str:
         raise NotImplementedError()
 
     def aggregate(self):
         merged_item = None
         count = 0
 
-        with open(self.output_txt, "wt") as ofp:
+        with self.output_txt.open("wt") as ofp:
             for target_file in self.bundle_path.glob(self.file_pattern):
                 try:
-                    with open(target_file, "rt") as ifp:
+                    with target_file.open("rt") as ifp:
                         item = self.item_load(ifp)
                         count += 1
 
@@ -53,18 +58,18 @@ class Aggregator:
         if not merged_item:
             return
 
-        with open(self.output_txt, "at") as fp:
+        with self.output_txt.open("at") as fp:
             fp.write("Merged:\n")
             fp.write(self.item_dumps(merged_item) + "\n")
             print(f"Generated {self.output_txt}")
 
-        with open(self.output_file, "wt") as fp:
+        with self.output_file.open("wt") as fp:
             fp.write(self.item_dumps(merged_item) + "\n")
             print(f"Generated {self.output_file}\n")
 
 
 class JsonAggregator(Aggregator):
-    output_extension = "json"
+    output_extension = ".json"
 
     def item_load(self, fp):
         return json.load(fp)
@@ -74,7 +79,7 @@ class JsonAggregator(Aggregator):
 
 
 class XmlAggregator(Aggregator):
-    output_extension = "xml"
+    output_extension = ".xml"
 
     def item_load(self, fp):
         return BeautifulSoup(fp, "xml")
@@ -101,7 +106,7 @@ class IdiomaticityAggregator(JsonAggregator):
         source_lints = source_dct["lints"]
 
         for tool, inner_dct in source_lints.items():
-            for level in inner_dct.keys():
+            for level in inner_dct:
                 target_lints[tool].setdefault(level, [0, {}])
                 target_lints[tool][level][0] += source_lints[tool][level][0]
 
@@ -164,7 +169,7 @@ def get_parser():
     return parser
 
 
-if __name__ == "__main__":
+def main():
     args = get_parser().parse_args()
 
     inputs = (args.bundle_path, args.file_pattern, args.out_prefix)
@@ -183,3 +188,7 @@ if __name__ == "__main__":
 
     else:
         print(f"Unknown type: {args.type}")
+
+
+if __name__ == "__main__":
+    main()
