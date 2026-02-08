@@ -2,21 +2,28 @@
 
 import argparse
 import json
+import logging
 from abc import abstractmethod
 from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup
 
+logging.basicConfig(
+    format="%(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__file__)
+
 
 class Aggregator:
-    output_extension = ".any"
+    output_extension = "any"
 
     def __init__(self, bundle_path: Path, file_pattern: str, output_prefix: str):
         self.bundle_path = bundle_path
         self.file_pattern = file_pattern
-        self.output_txt = Path(output_prefix).with_suffix(".txt")
-        self.output_file = Path(output_prefix).with_suffix(self.output_extension)
+        self.output_txt = Path(f"{output_prefix}.txt")
+        self.output_file = Path(f"{output_prefix}.{self.output_extension}")
 
     @abstractmethod
     def item_merge_in_place(self, target, source):
@@ -52,24 +59,26 @@ class Aggregator:
                             self.item_merge_in_place(merged_item, item)
 
                 except Exception as e:
-                    print(f"Exception while processing {target_file}: {e}")
+                    logger.error(
+                        f"Exception while processing {target_file}", exc_info=e
+                    )
 
-        print(f"Processed {count} files in {self.bundle_path}")
+        logger.info(f"Processed {count} files in {self.bundle_path}")
         if not merged_item:
             return
 
         with self.output_txt.open("at") as fp:
             fp.write("Merged:\n")
             fp.write(self.item_dumps(merged_item) + "\n")
-            print(f"Generated {self.output_txt}")
+            logger.info(f"Generated {self.output_txt}")
 
         with self.output_file.open("wt") as fp:
             fp.write(self.item_dumps(merged_item) + "\n")
-            print(f"Generated {self.output_file}\n")
+            logger.info(f"Generated {self.output_file}\n")
 
 
 class JsonAggregator(Aggregator):
-    output_extension = ".json"
+    output_extension = "json"
 
     def item_load(self, fp):
         return json.load(fp)
@@ -79,7 +88,7 @@ class JsonAggregator(Aggregator):
 
 
 class XmlAggregator(Aggregator):
-    output_extension = ".xml"
+    output_extension = "xml"
 
     def item_load(self, fp):
         return BeautifulSoup(fp, "xml")
@@ -97,22 +106,22 @@ class UnsafetyAggregator(JsonAggregator):
 
 class IdiomaticityAggregator(JsonAggregator):
     def item_merge_in_place(self, target_dct, source_dct):
-        for k, v in source_dct["cyclomatic_complexity_counts"].items():
-            target_ccc = target_dct["cyclomatic_complexity_counts"]
-            target_ccc.setdefault(k, 0)
-            target_ccc[k] += v
+        for tool, inner_dct in source_dct.items():
+            if tool == "cyclomatic_complexity_counts":
+                for k, v in inner_dct.items():
+                    target_ccc = target_dct["cyclomatic_complexity_counts"]
+                    target_ccc.setdefault(k, 0)
+                    target_ccc[k] += v
+                continue
 
-        target_lints = target_dct["lints"]
-        source_lints = source_dct["lints"]
+            # process rustc and clippy inner dcts
+            for level, lint_dct in inner_dct.items():
+                target_dct[tool].setdefault(level, {})
+                target_lint_dct = target_dct[tool][level]
 
-        for tool, inner_dct in source_lints.items():
-            for level in inner_dct:
-                target_lints[tool].setdefault(level, [0, {}])
-                target_lints[tool][level][0] += source_lints[tool][level][0]
-
-                for k, v in source_lints[tool][level][1].items():
-                    target_lints[tool][level][1].setdefault(k, 0)
-                    target_lints[tool][level][1][k] += v
+                for lint, count in lint_dct.items():
+                    target_lint_dct.setdefault(lint, 0)
+                    target_lint_dct[lint] += count
 
 
 class TestsAggregator(XmlAggregator):
@@ -187,7 +196,7 @@ def main():
         aggregator.aggregate()
 
     else:
-        print(f"Unknown type: {args.type}")
+        logger.error(f"Unknown type: {args.type}")
 
 
 if __name__ == "__main__":
