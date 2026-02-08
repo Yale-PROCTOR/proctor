@@ -111,11 +111,9 @@ idiomaticity)
         --pwd "$(pwd -P)" \
         "${APPTAINER_SIF}" \
         measure_idiomaticity \
-        --manifest "${SOURCE_DIR}/Cargo.toml" \
+        --include_ccc \
         --output "${OUT_FILE}" \
-        --debug \
-        --uid "$(id -u)" \
-        --gid "$(id -g)" \
+        "${SOURCE_DIR}" \
         "${@:5}"
     ;;
 
