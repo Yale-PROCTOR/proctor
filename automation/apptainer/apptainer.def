@@ -3,10 +3,16 @@ From: ubuntu:latest
 
 %environment
 export SHELL=/bin/bash
+export HOME="/home/ubuntu"
 export CLIPPY_CONF_DIR="/usr/clippy"
-export CARGO_HOME=/usr/local/cargo
-export RUSTUP_HOME=/usr/local/rustup
+export CARGO_HOME="/usr/local/cargo"
+export RUSTUP_HOME="/usr/local/rustup"
 export PATH="${CARGO_HOME}/bin:${PATH}"
+export SYS_VENV="/usr/venvs/sys_venv"
+export VLLM_VENV="/usr/venvs/vllm_venv"
+export PROJ_VENV="/usr/venvs/proj_venv"
+export UV_PROJECT_ENVIRONMENT="${PROJ_VENV}"
+export PATH="${SYS_VENV}/bin:${VLLM_VENV}/bin:${PATH}"
 
 %setup -c /bin/bash
 
@@ -16,11 +22,11 @@ CLIPPY_CONF_DIR="${APPTAINER_ROOTFS}/usr/clippy"
 
 mkdir -p "${TRANSLATE_DIR}"
 cp ../../add_link_args.py \
-   ../../cdylib.py \
-   ../../find_fns.py \
-   ../../filter_files.py \
-   ../../get_target.py \
-   ../scripts/* "${TRANSLATE_DIR}"
+    ../../cdylib.py \
+    ../../find_fns.py \
+    ../../filter_files.py \
+    ../../get_target.py \
+    ../scripts/* "${TRANSLATE_DIR}"
 
 mkdir -p "${CLIPPY_CONF_DIR}"
 mv "${TRANSLATE_DIR}/create_clippy_lint_map.py" "${CLIPPY_CONF_DIR}"
@@ -28,7 +34,6 @@ mv "${TRANSLATE_DIR}/create_clippy_lint_map.py" "${CLIPPY_CONF_DIR}"
 cp -r "../measurements" "${MEASUREMENTS_DIR}"
 
 cp ../../ninja "${APPTAINER_ROOTFS}/usr/local/bin"
-cp -r ../../Python-3.13.0 "${APPTAINER_ROOTFS}/Python-3.13.0"
 
 cd ../../cmake-3.31.9-linux-x86_64
 cp -r bin/* "${APPTAINER_ROOTFS}/usr/local/bin"
@@ -36,11 +41,12 @@ cp -r doc/* "${APPTAINER_ROOTFS}/usr/local/doc"
 cp -r man/* "${APPTAINER_ROOTFS}/usr/local/share/man"
 cp -r share/* "${APPTAINER_ROOTFS}/usr/local/share"
 
-
 %post -c /bin/bash
 
 set -e
 
+SYS_VENV="/usr/venvs/sys_venv"
+VLLM_VENV="/usr/venvs/vllm_venv"
 TRANSLATE_DIR="/usr/translate"
 MEASUREMENTS_DIR="/usr/measurements"
 UNSAFETY_DIR="${MEASUREMENTS_DIR}/measure_unsafety"
@@ -48,41 +54,45 @@ IDIOMATICITY_DIR="${MEASUREMENTS_DIR}/measure_idiomaticity"
 CLIPPY_CONF_DIR="/usr/clippy"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update \
- && apt-get install -y \
-  build-essential \
-  clang \
-  netcat-openbsd \
-  wget \
-  curl \
-  g++ \
-  gcc \
-  git \
-  xz-utils \
-  make \
-  sudo \
-  locales \
-  llvm \
-  pkg-config \
-  libclang-dev \
-  libssl-dev \
-  libbz2-dev \
-  zlib1g-dev \
-  libreadline-dev \
-  libsqlite3-dev \
-  libncurses5-dev \
-  libncursesw5-dev \
-  tk-dev \
-  liblzma-dev \
-  vim
+apt-get update &&
+    apt-get install -y \
+        build-essential \
+        clang \
+        netcat-openbsd \
+        wget \
+        curl \
+        g++ \
+        gcc \
+        git \
+        xz-utils \
+        make \
+        sudo \
+        locales \
+        llvm \
+        pkg-config \
+        libclang-dev \
+        libssl-dev \
+        libbz2-dev \
+        zlib1g-dev \
+        libreadline-dev \
+        libsqlite3-dev \
+        libncurses5-dev \
+        libncursesw5-dev \
+        tk-dev \
+        liblzma-dev \
+        python3-dev \
+        vim
 
-cd Python-3.13.0 \
- && ./configure --prefix=/usr/local \
- && make -j \
- && make install \
- && cd .. \
- && rm -rf Python-3.13.0
-pip3 install toml tabulate requests beautifulsoup4 lxml libclang mpire
+export UV_INSTALL_DIR=/usr/local/bin
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv venv "${SYS_VENV}" &&
+    uv pip install \
+        toml tabulate requests beautifulsoup4 lxml libclang mpire \
+        --python "${SYS_VENV}"
+
+uv venv "${VLLM_VENV}" &&
+    uv pip install vllm --torch-backend=auto --python "${VLLM_VENV}"
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y nodejs
@@ -90,31 +100,28 @@ apt-get install -y nodejs
 export CARGO_HOME=/usr/local/cargo
 export RUSTUP_HOME=/usr/local/rustup
 export PATH="${CARGO_HOME}/bin:${PATH}"
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y -q --default-toolchain none
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+    sh -s -- -y -q --default-toolchain none
 
 rustup toolchain install -c rust-src,rustc-dev,llvm-tools-preview nightly-2025-06-23
 rustup component add clippy
 
 cd "${TRANSLATE_DIR}"
-git clone https://github.com/Yale-PROCTOR/c2rust.git \
- && cd c2rust \
- && git checkout tractor-0.21.0 \
- && cargo build --release --bin c2rust-transpile -Z sparse-registry \
- && ln -s "$(pwd -P)/target/release/c2rust-transpile" /usr/local/bin
+git clone https://github.com/Yale-PROCTOR/c2rust.git &&
+    cd c2rust &&
+    git checkout tractor-0.21.0 &&
+    cargo build --release --bin c2rust-transpile -Z sparse-registry &&
+    ln -s "$(pwd -P)/target/release/c2rust-transpile" /usr/local/bin
 
 cd "${TRANSLATE_DIR}"
-git clone https://github.com/Yale-PROCTOR/crat.git \
- && cd crat \
- && git checkout 3bb4355 \
- && cd deps_crate \
- && cargo build \
- && cd .. \
- && cargo build --release --bin crat \
- && ln -s "${TRANSLATE_DIR}/crat/crat" /usr/local/bin/crat
-
-cd "${CLIPPY_CONF_DIR}"
-python3 create_clippy_lint_map.py
+git clone https://github.com/Yale-PROCTOR/crat.git &&
+    cd crat &&
+    git checkout 3bb4355 &&
+    cd deps_crate &&
+    cargo build &&
+    cd .. &&
+    cargo build --release --bin crat &&
+    ln -s "${TRANSLATE_DIR}/crat/crat" /usr/local/bin/crat
 
 chmod +x "${TRANSLATE_DIR}/translate.sh"
 ln -s "${TRANSLATE_DIR}/translate.sh" /usr/local/bin/translate
