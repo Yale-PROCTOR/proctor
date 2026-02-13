@@ -83,8 +83,9 @@ class JsonAggregator(Aggregator):
     def item_load(self, fp):
         return json.load(fp)
 
-    def item_dumps(self, dct):
-        return json.dumps(dct, indent=2)
+    def item_dumps(self, item: Any):
+        assert isinstance(item, dict)
+        return json.dumps(item, indent=2)
 
 
 class XmlAggregator(Aggregator):
@@ -93,31 +94,37 @@ class XmlAggregator(Aggregator):
     def item_load(self, fp):
         return BeautifulSoup(fp, "xml")
 
-    def item_dumps(self, xmlsoup):
-        return xmlsoup.prettify()
+    def item_dumps(self, item: Any):
+        assert isinstance(item, BeautifulSoup)
+        return item.prettify()
 
 
 class UnsafetyAggregator(JsonAggregator):
-    def item_merge_in_place(self, target_dct, source_dct):
-        for k, v in source_dct.items():
-            target_dct.setdefault(k, 0)
-            target_dct[k] += v
+    def item_merge_in_place(self, target, source):
+        assert isinstance(target, dict)
+        assert isinstance(source, dict)
+        for k, v in source.items():
+            target.setdefault(k, 0)
+            target[k] += v
 
 
 class IdiomaticityAggregator(JsonAggregator):
-    def item_merge_in_place(self, target_dct, source_dct):
-        for tool, inner_dct in source_dct.items():
+    def item_merge_in_place(self, target, source):
+        assert isinstance(target, dict)
+        assert isinstance(source, dict)
+        for tool, inner_dct in source.items():
             if tool == "cyclomatic_complexity_counts":
                 for k, v in inner_dct.items():
-                    target_ccc = target_dct["cyclomatic_complexity_counts"]
+                    target_ccc = target["cyclomatic_complexity_counts"]
                     target_ccc.setdefault(k, 0)
                     target_ccc[k] += v
                 continue
 
             # process rustc and clippy inner dcts
             for level, lint_dct in inner_dct.items():
-                target_dct[tool].setdefault(level, {})
-                target_lint_dct = target_dct[tool][level]
+                target.setdefault(tool, {})
+                target[tool].setdefault(level, {})
+                target_lint_dct = target[tool][level]
 
                 for lint, count in lint_dct.items():
                     target_lint_dct.setdefault(lint, 0)
@@ -125,10 +132,12 @@ class IdiomaticityAggregator(JsonAggregator):
 
 
 class TestsAggregator(XmlAggregator):
-    def item_merge_in_place(self, target_xmlsoup, source_xmlsoup):
+    def item_merge_in_place(self, target, source):
+        assert isinstance(target, BeautifulSoup)
+        assert isinstance(source, BeautifulSoup)
         attributes = ["errors", "failures", "skipped", "tests"]
-        target_testsuites = target_xmlsoup.testsuites
-        source_testsuite = source_xmlsoup.testsuite
+        target_testsuites = target.testsuites
+        source_testsuite = source.testsuite
 
         target_testsuites.append(source_testsuite)
         target_testsuites.append("\n")
