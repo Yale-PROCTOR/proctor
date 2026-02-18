@@ -41,7 +41,7 @@ RUN cd Python-3.14.0 \
  && make install \
  && cd .. \
  && rm -rf Python-3.14.0
-RUN pip3 install toml tabulate beautifulsoup4 lxml libclang mpire
+RUN pip3 install toml tabulate requests beautifulsoup4 lxml libclang mpire
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | sh -s -- -y -q --default-toolchain none
@@ -56,7 +56,7 @@ RUN git clone https://github.com/Yale-PROCTOR/c2rust.git \
 
 RUN git clone https://github.com/Yale-PROCTOR/crat.git \
  && cd crat \
- && git checkout 3bb4355 \
+ && git checkout 4299bad \
  && cd deps_crate \
  && cargo build \
  && cd .. \
@@ -64,6 +64,10 @@ RUN git clone https://github.com/Yale-PROCTOR/crat.git \
  && ln -s ~/crat/crat ~/local/bin
 
 COPY --chown=ubuntu:ubuntu ./Test-Corpus Test-Corpus
+RUN cd Test-Corpus \
+    && git checkout 6fefd73 \
+    && sed -i 's/nightly-2025-11-11/nightly-2025-06-23/g' rust-toolchain.toml
+
 COPY --chown=ubuntu:ubuntu \
      ./add_link_args.py \
      ./cdylib.py \
