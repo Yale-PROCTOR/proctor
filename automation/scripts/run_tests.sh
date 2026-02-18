@@ -37,27 +37,14 @@ fi
 RUN_TESTS_SCRIPT="./deployment/scripts/github-actions/run_rust.sh"
 check_file "${RUN_TESTS_SCRIPT}"
 
-cargo build --release --manifest-path "${translation_dir}/Cargo.toml"
-
-lib_so=$(find "${translation_dir}/target/release/" -mindepth 1 -maxdepth 1 -type f -iname "lib*.so")
-if [[ -f "${lib_so}" ]]; then
-    build_ninja_dir="${translation_dir_dir}/build-ninja"
-    mkdir -p "${build_ninja_dir}"
-    ln -sf "${lib_so}" "${build_ninja_dir}/."
-fi
-
 ${RUN_TESTS_SCRIPT} \
     --keep-going \
     --subset "${translation_dir_dir}" \
     --junit-xml "${output_xml}" \
     "${@:3}"
 
-if [[ -f "${lib_so}" ]]; then
-    rm "${build_ninja_dir}/$(basename "${lib_so}")"
-fi
-
-if [[ -f "${translated_rust_dir_link}" ]]; then
+if [[ -L "${translated_rust_dir_link}" ]]; then
     rm "${translated_rust_dir_link}"
 else
-    echo "translated_rust link not found: ${translated_rust_dir_link}"
+    echo "translated_rust link not found for ${link_target}"
 fi

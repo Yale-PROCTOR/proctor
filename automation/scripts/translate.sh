@@ -20,6 +20,11 @@ check_file() {
     fi
 }
 
+exit_with_msg() {
+    echo "${1}"
+    exit 1
+}
+
 # set -euxo pipefail
 # set -e
 
@@ -87,43 +92,48 @@ done
 [[ $# -ne 1 ]] && usage
 
 echo "Translation Start"
-src="$(realpath "${1}")"
-# dst="${src}/${translated_dir}"
+inp="$(realpath "${1}")"
+name=$(basename "${inp}")
 
-rm -rf "${src}/build-ninja" "${src}/config.toml"
-# rm -rf "${dst:?}" "${src}/build-ninja"
-# mkdir -p "${dst}"
+true_dst="${inp}/${translated_dir}"
+rm -rf "${true_dst}"
+echo "true_dst: ${true_dst}"
+
+ws=$(mktemp -d)
+ws_src="${ws}/src"
+ws_dst="${ws}/dst"
+
+mkdir -p "${ws_src}" "${ws_dst}"
+
+cp -rL "${inp}" "${ws_src}"
+src=$(realpath "${ws_src}/${name}")
+echo "src: ${src}"
 
 # create compile commands
-pushd "${src}" >/dev/null
+pushd "${src}" >/dev/null || exit_with_msg "pushd failed for: ${src}"
 mkdir -p build-ninja/.cmake/api/v1/query
 touch build-ninja/.cmake/api/v1/query/codemodel-v2
-if [[ -f CMakePresets.json ]]; then
+if [ -f CMakePresets.json ]; then
     cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -S ./ --preset test
-    cd build-ninja
-    cmake --build ./
     src_root="${src}"
 else
     cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -S ./test_case -B ./build-ninja -G Ninja
-    cd build-ninja
-    cmake --build ./
     src_root="${src}/test_case"
 fi
-popd >/dev/null
+popd >/dev/null || exit_with_msg "popd failed after: ${src}"
 
 target_name=$("${GET_TARGET_PY}" "${src}/build-ninja" name)
 target_type=$("${GET_TARGET_PY}" "${src}/build-ninja" type)
 
-true_dst="${src}/${translated_dir}"
-dst="${src}/${translated_dir}/${target_name}"
-rm -rf "${true_dst:?}"
+dst="${ws_dst}/${target_name}"
 mkdir -p "${dst}"
+echo "dst: ${dst}"
 
-target_lib_so="${src}/build-ninja/lib${target_name}.so"
-if [[ -f "${target_lib_so}" ]]; then
-    rm "${target_lib_so}"
-    echo Removed previous "${target_lib_so}"
-fi
+# target_lib_so="${src}/build-ninja/lib${target_name}.so"
+# if [[ -f "${target_lib_so}" ]]; then
+#     rm "${target_lib_so}"
+#     echo Removed previous "${target_lib_so}"
+# fi
 
 # compile with c2rust and crat
 if [[ "${target_type}" == "EXECUTABLE" ]]; then
@@ -156,6 +166,8 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
 
         "${FIND_FNS_PY}" "${src}/build-ninja/compile_commands.json" "${src}/test_case" "${src}/config.toml"
 
+        mv "${dst}" "${true_dst}"
+
         crat \
             --config "${src}/config.toml" \
             --inplace \
@@ -163,6 +175,7 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
             --extern-build-dir "${src}/build-ninja" \
             --extern-source-dir "${src}" \
             --extern-ignore-return-type \
+            --extern-ignore-param-type \
             --io-assume-to-str-ok \
             --unsafe-remove-unused \
             --unsafe-remove-no-mangle \
@@ -170,8 +183,8 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
             --unsafe-replace-pub \
             --unexpand-use-print \
             --bin-name "${target_name}" \
-            --pass expand,preprocess,extern,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
-            "${dst}"
+            --pass expand,extern,preprocess,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
+            "${true_dst}"
     fi
 
 else
@@ -187,24 +200,25 @@ else
         echo 'rustflags = ["-Clink-arg=-Wl,-z,lazy", "-Zplt=yes"]' >>"${dst}/.cargo/config.toml"
         "${FIND_FNS_PY}" "${src}/build-ninja/compile_commands.json" "${src}/test_case" "${src}/config.toml"
 
+        mv "${dst}" "${true_dst}"
+
         crat \
             --config "${src}/config.toml" \
             --inplace \
+            --extern-ignore-return-type \
+            --extern-ignore-param-type \
             --io-assume-to-str-ok \
             --unsafe-remove-unused \
             --unsafe-remove-no-mangle \
             --unsafe-remove-extern-c \
             --unsafe-replace-pub \
             --unexpand-use-print \
-            --pass expand,preprocess,extern,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
-            "${dst}"
+            --pass expand,extern,preprocess,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
+            "${true_dst}"
     fi
 fi
 
-pushd "${dst}" >/dev/null
-# cargo generate-lockfile
-cargo fmt
-"${CDYLIB_PY}" "${src}/build-ninja" "${src}" "${dst}"
+pushd "${true_dst}" >/dev/null || exit_with_msg "pushd failed for: ${true_dst}"
 
 # refine with clippy fix
 if [[ "${use_cfix}" == "true" ]]; then
@@ -223,24 +237,22 @@ if [[ "${use_cfix}" == "true" ]]; then
         ((attempt++))
     done
 fi
-popd >/dev/null
+
+cargo fmt
+"${CDYLIB_PY}" "${src}/build-ninja" "${src}" "${true_dst}"
 
 # measure unsafety and idiomaticity and run tests
-mkdir -p "${dst}/results"
+mkdir -p "${true_dst}/results"
 
-measure_unsafety "${dst}" 2>&1 | tee "${dst}/results/unsafety.json"
+measure_unsafety "${true_dst}" 2>&1 | tee "${true_dst}/results/unsafety.json"
 
 measure_idiomaticity \
     --include_ccc \
-    --output "${dst}/results/idiomaticity.json" \
-    "${dst}"
+    --output "${true_dst}/results/idiomaticity.json" \
+    "${true_dst}"
 
-mv "${dst}"/* "${dst}/.cargo" "${true_dst}"
-rm -d "${dst}"
-
-# test_case directory needs to be the parent of the target directory
-# thus we move our directories first and then run tests
 run_tests "${true_dst}" "${true_dst}/results/tests.xml" --verbose
 
-rm -r "${src}/build-ninja" "${src}/config.toml"
+rm -rf "${ws}"
+
 echo "Translation End"
