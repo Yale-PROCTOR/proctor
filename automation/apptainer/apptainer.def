@@ -29,7 +29,6 @@ cp ../../add_link_args.py \
     ../scripts/* "${TRANSLATE_DIR}"
 
 mkdir -p "${CLIPPY_CONF_DIR}"
-mv "${TRANSLATE_DIR}/create_clippy_lint_map.py" "${CLIPPY_CONF_DIR}"
 
 cp -r "../measurements" "${MEASUREMENTS_DIR}"
 
@@ -116,7 +115,7 @@ git clone https://github.com/Yale-PROCTOR/c2rust.git &&
 cd "${TRANSLATE_DIR}"
 git clone https://github.com/Yale-PROCTOR/crat.git &&
     cd crat &&
-    git checkout 3bb4355 &&
+    git checkout 4299bad &&
     cd deps_crate &&
     cargo build &&
     cd .. &&
