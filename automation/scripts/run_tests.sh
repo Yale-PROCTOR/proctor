@@ -52,5 +52,12 @@ ${RUN_TESTS_SCRIPT} \
     --junit-xml "${output_xml}" \
     "${@:3}"
 
-[[ -f "${lib_so}" ]] && rm "${build_ninja_dir}/$(basename "${lib_so}")"
-rm "${translated_rust_dir_link}"
+if [[ -f "${lib_so}" ]]; then
+    rm "${build_ninja_dir}/$(basename "${lib_so}")"
+fi
+
+if [[ -f "${translated_rust_dir_link}" ]]; then
+    rm "${translated_rust_dir_link}"
+else
+    echo "translated_rust link not found: ${translated_rust_dir_link}"
+fi
