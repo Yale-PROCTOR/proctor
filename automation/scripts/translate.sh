@@ -22,6 +22,7 @@ check_file() {
 
 exit_with_msg() {
     echo "${1}"
+    [[ -d "${2}" ]] && rm -rf "${2}"
     exit 1
 }
 
@@ -103,14 +104,21 @@ ws=$(mktemp -d)
 ws_src="${ws}/src"
 ws_dst="${ws}/dst"
 
-mkdir -p "${ws_src}" "${ws_dst}"
-
-cp -rL "${inp}" "${ws_src}"
-src=$(realpath "${ws_src}/${name}")
+src="${ws_src}/${name}"
 echo "src: ${src}"
 
+mkdir -p "${ws_src}" "${ws_dst}" "${src}"
+
+copy_items=("test_case" "test_vectors" "runner" "CMakeLists.txt" "CMakePresets.json")
+for item in "${copy_items[@]}"; do
+    path="${inp}/${item}"
+    if [[ -e "${path}" ]]; then
+        cp -rL "${path}" "${src}"/.
+    fi
+done
+
 # create compile commands
-pushd "${src}" >/dev/null || exit_with_msg "pushd failed for: ${src}"
+pushd "${src}" >/dev/null || exit_with_msg "pushd failed for: ${src}" "${ws}"
 mkdir -p build-ninja/.cmake/api/v1/query
 touch build-ninja/.cmake/api/v1/query/codemodel-v2
 if [ -f CMakePresets.json ]; then
@@ -120,7 +128,7 @@ else
     cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -S ./test_case -B ./build-ninja -G Ninja
     src_root="${src}/test_case"
 fi
-popd >/dev/null || exit_with_msg "popd failed after: ${src}"
+popd >/dev/null || exit_with_msg "popd failed after: ${src}" "${ws}"
 
 target_name=$("${GET_TARGET_PY}" "${src}/build-ninja" name)
 target_type=$("${GET_TARGET_PY}" "${src}/build-ninja" type)
@@ -128,12 +136,6 @@ target_type=$("${GET_TARGET_PY}" "${src}/build-ninja" type)
 dst="${ws_dst}/${target_name}"
 mkdir -p "${dst}"
 echo "dst: ${dst}"
-
-# target_lib_so="${src}/build-ninja/lib${target_name}.so"
-# if [[ -f "${target_lib_so}" ]]; then
-#     rm "${target_lib_so}"
-#     echo Removed previous "${target_lib_so}"
-# fi
 
 # compile with c2rust and crat
 if [[ "${target_type}" == "EXECUTABLE" ]]; then
@@ -166,8 +168,6 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
 
         "${FIND_FNS_PY}" "${src}/build-ninja/compile_commands.json" "${src}/test_case" "${src}/config.toml"
 
-        mv "${dst}" "${true_dst}"
-
         crat \
             --config "${src}/config.toml" \
             --inplace \
@@ -184,7 +184,7 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
             --unexpand-use-print \
             --bin-name "${target_name}" \
             --pass expand,extern,preprocess,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
-            "${true_dst}"
+            "${dst}"
     fi
 
 else
@@ -200,8 +200,6 @@ else
         echo 'rustflags = ["-Clink-arg=-Wl,-z,lazy", "-Zplt=yes"]' >>"${dst}/.cargo/config.toml"
         "${FIND_FNS_PY}" "${src}/build-ninja/compile_commands.json" "${src}/test_case" "${src}/config.toml"
 
-        mv "${dst}" "${true_dst}"
-
         crat \
             --config "${src}/config.toml" \
             --inplace \
@@ -214,11 +212,12 @@ else
             --unsafe-replace-pub \
             --unexpand-use-print \
             --pass expand,extern,preprocess,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
-            "${true_dst}"
+            "${dst}"
     fi
 fi
 
-pushd "${true_dst}" >/dev/null || exit_with_msg "pushd failed for: ${true_dst}"
+mv "${dst}" "${true_dst}"
+pushd "${true_dst}" >/dev/null || exit_with_msg "pushd failed for: ${true_dst}" "${ws}"
 
 # refine with clippy fix
 if [[ "${use_cfix}" == "true" ]]; then
