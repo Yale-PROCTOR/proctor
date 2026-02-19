@@ -3,6 +3,7 @@
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 APPTAINER_SIF="${SCRIPT_DIR}/apptainer.sif"
 APPTAINER_OVERLAY="${SCRIPT_DIR}/apptainer_ext3.img"
+TMP_DIR="/tmp"
 
 MODE="${1}"
 TEST_CORPUS_DIR="$(realpath "${2}")"
@@ -25,6 +26,7 @@ translate_all)
         --overlay "${APPTAINER_OVERLAY}" \
         --containall \
         --bind "${TEST_CORPUS_DIR}" \
+        --bind "${TMP_DIR}" \
         --pwd "${TEST_CORPUS_DIR}" \
         "${APPTAINER_SIF}" \
         process_all \
@@ -72,6 +74,7 @@ translate)
         --bind "${TEST_CORPUS_DIR}" \
         --bind "$(dirname "${SRC_DIR}")" \
         --bind "${SRC_DIR}" \
+        --bind "${TMP_DIR}" \
         --pwd "${TEST_CORPUS_DIR}" \
         "${APPTAINER_SIF}" \
         translate \
