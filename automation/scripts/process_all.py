@@ -80,7 +80,7 @@ class Action:
         logger.info(f"{self.prefix} Processing in parallel: start")
 
         with WorkerPool(
-            n_jobs=self.args.max_workers,
+            n_jobs=self.args.processes,
         ) as pool:
 
             def handle_signal(sig, _):
@@ -380,10 +380,10 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--max_workers",
+        "--processes",
         type=int,
         default=None,
-        help="the maximum number of workers for parallel actions",
+        help="the maximum number of processes for parallel actions",
     )
 
     parser.add_argument(
