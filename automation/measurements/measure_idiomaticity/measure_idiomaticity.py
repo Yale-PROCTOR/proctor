@@ -36,7 +36,7 @@ class Clippy:
             )
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.error("Exception occured during rustup add clippy", exc_info=e)
+            logger.error("Exception occurred during rustup add clippy", exc_info=e)
             logger.error(f"stdout: {e.stdout}")
             logger.error(f"stderr: {e.stderr}")
 
@@ -228,7 +228,7 @@ class Clippy:
             error = str(e.stderr.strip())
 
         except Exception as e:
-            logger.error("Exception occured during clippy", exc_info=e)
+            logger.error("Exception occurred during clippy", exc_info=e)
             res_base = {}
             error = str(e)
 
@@ -241,12 +241,12 @@ class Clippy:
         {
             "rustc": {
                 "level": {
-                    "code": occurence_count,
+                    "code": occurrence_count,
                 }
             },
             "clippy": {
                 "group": {
-                    "lint": occurence_count,
+                    "lint": occurrence_count,
                 }
             },
         }
@@ -359,7 +359,7 @@ def main():
     )
 
     if err:
-        logger.error(f"Error occured: {err}")
+        logger.error(f"Error occurred: {err}")
         return
 
     count_dct = clippy.convert_to_count(base_dct)
