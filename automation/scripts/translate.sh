@@ -26,8 +26,8 @@ exit_with_msg() {
     exit 1
 }
 
+set -euo pipefail
 # set -euxo pipefail
-# set -e
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 
