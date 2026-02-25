@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-
 import argparse
 import logging
 import subprocess
 import time
 import traceback
 from abc import abstractmethod
+from datetime import datetime
 from pathlib import Path
 from signal import SIGHUP, SIGINT, SIGTERM, signal, strsignal
 
@@ -100,6 +100,10 @@ class Action:
         logger.info(f"{self.prefix} Processing in parallel: end")
 
     def process(self):
+        with self.args.failed_file.open("at") as fp:
+            header = f"=== {datetime.now()} {self.prefix} ===\n"
+            fp.write(header)
+
         if self.args.mode == "sequential":
             self.sequential_process()
         elif self.args.mode == "parallel":
@@ -405,7 +409,6 @@ def get_parser():
 
 def main():
     args = get_parser().parse_args()
-    args.failed_file.unlink(missing_ok=True)
 
     action2class = {
         "translate": Translate,
