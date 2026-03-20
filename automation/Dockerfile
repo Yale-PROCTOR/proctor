@@ -53,7 +53,9 @@ RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | b
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y -q --default-toolchain none
 
-RUN rustup toolchain install -c rust-src,rustc-dev,llvm-tools-preview nightly-2025-06-23
+RUN rustup toolchain install -c rust-src,rustc-dev,llvm-tools-preview nightly-2025-06-23 \
+    && rustup component add rust-analyzer \
+    && cargo install ripgrep
 
 # build c2rust
 RUN git clone https://github.com/Yale-PROCTOR/c2rust.git \
@@ -65,7 +67,7 @@ RUN git clone https://github.com/Yale-PROCTOR/c2rust.git \
 # build crat
 RUN git clone https://github.com/Yale-PROCTOR/crat.git \
     && cd crat \
-    && git checkout bc6a708 \
+    && git checkout d15a3ce \
     && cd deps_crate \
     && cargo build \
     && cd .. \
@@ -73,9 +75,12 @@ RUN git clone https://github.com/Yale-PROCTOR/crat.git \
     && ln -s ~/crat/crat ~/local/bin
 
 COPY --chown=ubuntu:ubuntu ./Test-Corpus Test-Corpus
+COPY --chown=ubuntu:ubuntu 0001-fixed.patch 0001-fixed.patch
 RUN cd Test-Corpus \
-    && git checkout 6fefd73 \
-    && sed -i 's/nightly-2025-11-11/nightly-2025-06-23/g' rust-toolchain.toml
+    && git restore . \
+    && git clean -f \
+    && git checkout 0319ab0 \
+    && git apply ../0001-fixed.patch
 
 COPY --chown=ubuntu:ubuntu \
     ./add_link_args.py \

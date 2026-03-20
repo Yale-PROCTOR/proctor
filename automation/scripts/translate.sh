@@ -176,6 +176,7 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
             --extern-source-dir "${src}" \
             --extern-ignore-return-type \
             --extern-ignore-param-type \
+            --outparam-simplify \
             --io-assume-to-str-ok \
             --unsafe-remove-unused \
             --unsafe-remove-no-mangle \
@@ -183,7 +184,7 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
             --unsafe-replace-pub \
             --unexpand-use-print \
             --bin-name "${target_name}" \
-            --pass expand,extern,preprocess,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
+            --pass expand,extern,preprocess,outparam,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
             "${dst}"
     fi
 
@@ -205,13 +206,14 @@ else
             --inplace \
             --extern-ignore-return-type \
             --extern-ignore-param-type \
+            --outparam-simplify \
             --io-assume-to-str-ok \
             --unsafe-remove-unused \
             --unsafe-remove-no-mangle \
             --unsafe-remove-extern-c \
             --unsafe-replace-pub \
             --unexpand-use-print \
-            --pass expand,extern,preprocess,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
+            --pass expand,extern,preprocess,outparam,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
             "${dst}"
     fi
 fi
