@@ -122,7 +122,7 @@ git clone https://github.com/Yale-PROCTOR/c2rust.git &&
 cd "${TRANSLATE_DIR}"
 git clone https://github.com/Yale-PROCTOR/crat.git &&
     cd crat &&
-    git checkout bc6a708 &&
+    git checkout d15a3ce &&
     cd deps_crate &&
     cargo build &&
     cd .. &&
