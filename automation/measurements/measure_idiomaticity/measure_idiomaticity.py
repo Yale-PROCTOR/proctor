@@ -360,7 +360,6 @@ def main():
 
     if err:
         logger.error(f"Error occurred: {err}")
-        return
 
     count_dct = clippy.convert_to_count(base_dct)
     dct_str = json.dumps(count_dct, indent=2)
