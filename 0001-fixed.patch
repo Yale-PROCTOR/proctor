@@ -1,0 +1,10 @@
+diff --git a/rust-toolchain.toml b/rust-toolchain.toml
+index 48f1049..8b63c63 100644
+--- a/rust-toolchain.toml
++++ b/rust-toolchain.toml
+@@ -2,4 +2,4 @@
+ # MIT License
+ 
+ [toolchain]
+-channel = "nightly-2025-11-11"
++channel = "nightly-2025-06-23"
