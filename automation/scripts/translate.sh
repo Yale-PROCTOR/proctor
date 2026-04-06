@@ -225,6 +225,22 @@ pushd "${true_dst}" >/dev/null || exit_with_msg "pushd failed for: ${true_dst}" 
 if [[ "${use_cfix}" == "true" ]]; then
     attempt=1
     max_attempts=10
+    echo "Running cargo fix (attempt: ${attempt})"
+    while [ "${attempt}" -le "${max_attempts}" ] &&
+        cargo fix \
+            --workspace \
+            --allow-no-vcs \
+            --allow-dirty \
+            --all-targets \
+            2>&1 |
+        grep -q "run \`cargo fix"; do
+        echo "Running cargo fix (attempt: ${attempt})"
+        ((attempt++))
+    done
+
+    attempt=1
+    max_attempts=10
+    echo "Running clippy --fix (attempt: ${attempt})"
     while [ "${attempt}" -le "${max_attempts}" ] &&
         cargo clippy \
             --workspace \
