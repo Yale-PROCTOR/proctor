@@ -79,7 +79,7 @@ COPY --chown=ubuntu:ubuntu 0001-fixed.patch 0001-fixed.patch
 RUN cd Test-Corpus \
     && git restore . \
     && git clean -f \
-    && git checkout 0319ab0 \
+    && git checkout f4fa82f \
     && git apply ../0001-fixed.patch
 
 COPY --chown=ubuntu:ubuntu \
