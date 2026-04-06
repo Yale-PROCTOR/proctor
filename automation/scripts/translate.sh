@@ -184,7 +184,7 @@ if [[ "${target_type}" == "EXECUTABLE" ]]; then
             --unsafe-replace-pub \
             --unexpand-use-print \
             --bin-name "${target_name}" \
-            --pass expand,extern,preprocess,outparam,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
+            --pass expand,extern,preprocess,outparam,punning,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
             "${dst}"
     fi
 
@@ -213,7 +213,7 @@ else
             --unsafe-remove-extern-c \
             --unsafe-replace-pub \
             --unexpand-use-print \
-            --pass expand,extern,preprocess,outparam,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
+            --pass expand,extern,preprocess,outparam,punning,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
             "${dst}"
     fi
 fi

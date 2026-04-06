@@ -67,7 +67,7 @@ RUN git clone https://github.com/Yale-PROCTOR/c2rust.git \
 # build crat
 RUN git clone https://github.com/Yale-PROCTOR/crat.git \
     && cd crat \
-    && git checkout d15a3ce \
+    && git checkout 3e4b29f \
     && cd deps_crate \
     && cargo build \
     && cd .. \
