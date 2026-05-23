@@ -8,29 +8,13 @@ import sys
 import threading
 
 MAX_WORKERS = int(sys.argv[1]) if len(sys.argv) > 1 else os.cpu_count() or 1
-directories = sorted(glob.glob("Public-Tests/*/*/"))
+directories = sorted(glob.glob("Hidden-Tests/*/*/") + glob.glob("Public-Tests/*/*/"))
 successes = []
 failures = []
 process_lock = threading.Lock()
 active_processes = set()
 
-excludes = [
-    'arr_del_lib',
-    'arr_ins_lib',
-    'arr_push_lib',
-    'helxo_lib',
-    'hm_geti_lib',
-    'intput_lib',
-    'sh_geti_lib',
-    'sh_puts_lib',
-    'str_dups_lib',
-    'str_put_lib',
-    'generic_foreach',
-    'cJSON_lib',
-    'fallcalc_lib',
-    'jumpnode_lib',
-    'inreftree_lib'
-]
+excludes = []
 
 def finish():
     global successes, failures, directories

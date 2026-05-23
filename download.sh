@@ -23,7 +23,7 @@ if [ ! -d "Python-3.14.0" ]; then
   rm Python-3.14.0.tgz
 fi
 
-if [ ! -d "Test-Corpus" ]; then
-  echo "Downloading Test-Corpus"
-  git clone https://github.com/DARPA-TRACTOR-Program/Test-Corpus
+if [ ! -d "PUBLIC-Test-Corpus" ]; then
+  echo "Downloading PUBLIC-Test-Corpus"
+  git clone https://github.com/DARPA-TRACTOR-Program/PUBLIC-Test-Corpus
 fi
