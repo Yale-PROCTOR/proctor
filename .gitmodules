@@ -1,9 +1,9 @@
 [submodule "Test-Corpus"]
 	path = Test-Corpus
-	url = https://github.com/Yale-PROCTOR/Test-Corpus
+	url = git@github.com:Yale-PROCTOR/Test-Corpus
 [submodule "PUBLIC-Test-Corpus"]
 	path = PUBLIC-Test-Corpus
-	url = https://github.com/Yale-PROCTOR/PUBLIC-Test-Corpus
+	url = git@github.com:Yale-PROCTOR/PUBLIC-Test-Corpus
 [submodule "aws-translate"]
 	path = aws-translate
-	url = https://github.com/DARPA-TRACTOR-Program/aws-translate
+	url = git@github.com:DARPA-TRACTOR-Program/aws-translate
