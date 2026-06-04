@@ -20,31 +20,22 @@ check_file() {
     fi
 }
 
-exit_with_msg() {
-    echo "${1}"
-    [[ -d "${2}" ]] && rm -rf "${2}"
-    exit 1
+check_dir() {
+    if [[ ! -d "${1}" ]]; then
+        echo "Required directory not found: ${1}"
+        exit 1
+    fi
 }
 
 set -euo pipefail
 # set -euxo pipefail
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+ORCHESTRATE_PY="${SCRIPT_DIR}/orchestrate.py"
 
-GET_TARGET_PY="${SCRIPT_DIR}/get_target.py"
-CDYLIB_PY="${SCRIPT_DIR}/cdylib.py"
-ADD_LINK_ARGS_PY="${SCRIPT_DIR}/add_link_args.py"
-FILTER_FILES_PY="${SCRIPT_DIR}/filter_files.py"
-FIND_FNS_PY="${SCRIPT_DIR}/find_fns.py"
+check_file "${ORCHESTRATE_PY}"
 
-check_file "${GET_TARGET_PY}"
-check_file "${CDYLIB_PY}"
-check_file "${ADD_LINK_ARGS_PY}"
-check_file "${FILTER_FILES_PY}"
-
-use_crat=true
-use_cfix=true
-translated_dir="translated_c2rust_crat_cfix"
+conf="c2rust_crat_cfix"
 
 args=$(getopt -o '' --long help,c2rust,c2rust_cfix,c2rust_crat,c2rust_crat_cfix -- "$@")
 [[ ! $? -eq 0 ]] && usage
@@ -53,27 +44,19 @@ eval set -- "${args}"
 while true; do
     case "${1}" in
     --c2rust)
-        use_crat=false
-        use_cfix=false
-        translated_dir="translated_c2rust"
+        conf="c2rust"
         shift
         ;;
     --c2rust_cfix)
-        use_crat=false
-        use_cfix=true
-        translated_dir="translated_c2rust_cfix"
+        conf="c2rust_cfix"
         shift
         ;;
     --c2rust_crat)
-        use_crat=true
-        use_cfix=false
-        translated_dir="translated_c2rust_crat"
+        conf="c2rust_crat"
         shift
         ;;
     --c2rust_crat_cfix)
-        use_crat=true
-        use_cfix=true
-        translated_dir="translated_c2rust_crat_cfix"
+        conf="c2rust_crat_cfix"
         shift
         ;;
     --help)
@@ -93,183 +76,30 @@ done
 [[ $# -ne 1 ]] && usage
 
 echo "Translation Start"
-inp="$(realpath "${1}")"
-name=$(basename "${inp}")
+src="$(realpath "${1}")"
+src_bundle="${src/Test-Corpus/Test-Corpus/bundles}.tar.gz"
+check_file "${src_bundle}"
+echo "source: ${src_bundle}"
 
-true_dst="${inp}/${translated_dir}"
-rm -rf "${true_dst}"
-echo "true_dst: ${true_dst}"
+translated_dir="translated_${conf}"
+dst="${src}/${translated_dir}"
+rm -rf "${dst}"
+echo "destination: ${dst}"
 
-ws=$(mktemp -d)
-ws_src="${ws}/src"
-ws_dst="${ws}/dst"
+# translate
+"${ORCHESTRATE_PY}" "${src_bundle}" "${dst}" "${conf}"
 
-src="${ws_src}/${name}"
-echo "src: ${src}"
+# measure unsafety and idiomaticity
+mkdir -p "${dst}/results"
 
-mkdir -p "${ws_src}" "${ws_dst}" "${src}"
-
-copy_items=("test_case" "test_vectors" "runner" "CMakeLists.txt" "CMakePresets.json")
-for item in "${copy_items[@]}"; do
-    path="${inp}/${item}"
-    if [[ -e "${path}" ]]; then
-        cp -rL "${path}" "${src}"/.
-    fi
-done
-
-# create compile commands
-pushd "${src}" >/dev/null || exit_with_msg "pushd failed for: ${src}" "${ws}"
-mkdir -p build-ninja/.cmake/api/v1/query
-touch build-ninja/.cmake/api/v1/query/codemodel-v2
-if [ -f CMakePresets.json ]; then
-    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -S ./ --preset test
-    src_root="${src}"
-else
-    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -S ./test_case -B ./build-ninja -G Ninja
-    src_root="${src}/test_case"
-fi
-popd >/dev/null || exit_with_msg "popd failed after: ${src}" "${ws}"
-
-target_name=$("${GET_TARGET_PY}" "${src}/build-ninja" name)
-target_type=$("${GET_TARGET_PY}" "${src}/build-ninja" type)
-
-dst="${ws_dst}/${target_name}"
-mkdir -p "${dst}"
-echo "dst: ${dst}"
-
-# compile with c2rust and crat
-if [[ "${target_type}" == "EXECUTABLE" ]]; then
-    "${FILTER_FILES_PY}" "${src}/build-ninja" "${src_root}" "${src}/build-ninja/compile_commands.json"
-
-    if [[ "${use_crat}" == "false" ]]; then
-        main_file="main"
-        if [[ "${src}" == *"P01_sphincs_plus"* ]]; then
-            main_file="PQCgenKAT_sign"
-        fi
-
-        c2rust-transpile \
-            --binary "${main_file}" \
-            -e "${src}/build-ninja/compile_commands.json" \
-            -o "${dst}"
-
-        sed -i "s/name = \"${main_file}\"/name = \"${target_name}\"/" "${dst}/Cargo.toml"
-        "${ADD_LINK_ARGS_PY}" "${src}/build-ninja" "${dst}/build.rs"
-
-    else
-        c2rust-transpile \
-            -e "${src}/build-ninja/compile_commands.json" \
-            -o "${dst}"
-
-        "${ADD_LINK_ARGS_PY}" "${src}/build-ninja" "${dst}/build.rs"
-
-        mkdir -p "${dst}/.cargo"
-        echo '[target.x86_64-unknown-linux-gnu]' >"${dst}/.cargo/config.toml"
-        echo 'rustflags = ["-Clink-arg=-Wl,-z,lazy", "-Zplt=yes"]' >>"${dst}/.cargo/config.toml"
-
-        "${FIND_FNS_PY}" "${src}/build-ninja/compile_commands.json" "${src}/test_case" "${src}/config.toml"
-
-        crat \
-            --config "${src}/config.toml" \
-            --inplace \
-            --extern-cmake-reply-index-file "${src}/build-ninja/.cmake/api/v1/reply/index-*.json" \
-            --extern-build-dir "${src}/build-ninja" \
-            --extern-source-dir "${src}" \
-            --extern-ignore-return-type \
-            --extern-ignore-param-type \
-            --outparam-simplify \
-            --io-assume-to-str-ok \
-            --unsafe-remove-unused \
-            --unsafe-remove-no-mangle \
-            --unsafe-remove-extern-c \
-            --unsafe-replace-pub \
-            --unexpand-use-print \
-            --bin-name "${target_name}" \
-            --pass expand,extern,preprocess,outparam,punning,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
-            "${dst}"
-    fi
-
-else
-    c2rust-transpile \
-        -e "${src}/build-ninja/compile_commands.json" \
-        -o "${dst}"
-
-    "${ADD_LINK_ARGS_PY}" "${src}/build-ninja" "${dst}/build.rs"
-
-    if [[ "${use_crat}" == "true" ]]; then
-        mkdir -p "${dst}/.cargo"
-        echo '[target.x86_64-unknown-linux-gnu]' >"${dst}/.cargo/config.toml"
-        echo 'rustflags = ["-Clink-arg=-Wl,-z,lazy", "-Zplt=yes"]' >>"${dst}/.cargo/config.toml"
-        "${FIND_FNS_PY}" "${src}/build-ninja/compile_commands.json" "${src}/test_case" "${src}/config.toml"
-
-        crat \
-            --config "${src}/config.toml" \
-            --inplace \
-            --extern-ignore-return-type \
-            --extern-ignore-param-type \
-            --outparam-simplify \
-            --io-assume-to-str-ok \
-            --unsafe-remove-unused \
-            --unsafe-remove-no-mangle \
-            --unsafe-remove-extern-c \
-            --unsafe-replace-pub \
-            --unexpand-use-print \
-            --pass expand,extern,preprocess,outparam,punning,pointer,io,libc,static,simpl,check,interface,unsafe,unexpand,split,bin \
-            "${dst}"
-    fi
-fi
-
-mv "${dst}" "${true_dst}"
-pushd "${true_dst}" >/dev/null || exit_with_msg "pushd failed for: ${true_dst}" "${ws}"
-
-# refine with clippy fix
-if [[ "${use_cfix}" == "true" ]]; then
-    attempt=1
-    max_attempts=10
-    echo "Running cargo fix (attempt: ${attempt})"
-    while [ "${attempt}" -le "${max_attempts}" ] &&
-        cargo fix \
-            --workspace \
-            --allow-no-vcs \
-            --allow-dirty \
-            --all-targets \
-            2>&1 |
-        grep -q "run \`cargo fix"; do
-        echo "Running cargo fix (attempt: ${attempt})"
-        ((attempt++))
-    done
-
-    attempt=1
-    max_attempts=10
-    echo "Running clippy --fix (attempt: ${attempt})"
-    while [ "${attempt}" -le "${max_attempts}" ] &&
-        cargo clippy \
-            --workspace \
-            --fix \
-            --allow-no-vcs \
-            --allow-dirty \
-            --all-targets \
-            2>&1 |
-        grep -q "run \`cargo clippy --fix"; do
-        echo "Running clippy --fix (attempt: ${attempt})"
-        ((attempt++))
-    done
-fi
-
-cargo fmt
-"${CDYLIB_PY}" "${src}/build-ninja" "${src}" "${true_dst}"
-
-# measure unsafety and idiomaticity and run tests
-mkdir -p "${true_dst}/results"
-
-measure_unsafety "${true_dst}" 2>&1 | tee "${true_dst}/results/unsafety.json"
+measure_unsafety "${dst}" 2>&1 | tee "${dst}/results/unsafety.json"
 
 measure_idiomaticity \
     --include_ccc \
-    --output "${true_dst}/results/idiomaticity.json" \
-    "${true_dst}"
+    --output "${dst}/results/idiomaticity.json" \
+    "${dst}"
 
-run_tests "${true_dst}" "${true_dst}/results/tests.xml" --verbose
-
-rm -rf "${ws}"
+# run tests
+run_tests "${dst}" "${dst}/results/tests.xml" --verbose
 
 echo "Translation End"
