@@ -153,7 +153,10 @@ def _get_exposed_fns(
 
 
 def translate(
-    archive_file: Path, dst_dir: Path, parameters: Parameters | None = None
+    archive_file: Path,
+    dst_dir: Path,
+    parameters: Parameters | None = None,
+    is_final: bool = False,
 ) -> None:
     tc_name = get_name_without_suffix(archive_file)
     temp_dir = Path(
@@ -245,6 +248,14 @@ def translate(
             "-e",
             str(commands_file),
         ]
+
+        is_final_bin = is_final and bin_name is not None
+        if is_final_bin:
+            bin_file = "main"
+            if "P01_sphincs_plus" in str(archive_file):
+                bin_file = "PQCgenKAT_sign"
+            command.extend(["--binary", bin_file])
+
         run(command, stdout_log=stdout_log, stderr_log=stderr_log)
 
         link_args = sorted(set([arg for target in targets for arg in target.link_args]))
@@ -252,7 +263,10 @@ def translate(
 
         cargo_toml_path = rust_dir / "Cargo.toml"
         cargo_toml = load_toml(cargo_toml_path)
-        cargo_toml["lib"]["crate-type"].append("cdylib")
+        if is_final_bin:
+            cargo_toml["bin"][0]["name"] = bin_name
+        else:
+            cargo_toml["lib"]["crate-type"].append("cdylib")
         dump_toml(cargo_toml, cargo_toml_path)
 
         if dst_dir.exists():

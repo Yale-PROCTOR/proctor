@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from enum import StrEnum, auto
 
 import shutil
 import sys
@@ -24,6 +25,19 @@ from utils import (
     ParamVal,
     Parameters,
 )
+
+
+class Mode(StrEnum):
+    C2RUST = auto()
+    C2RUST_CFIX = auto()
+    C2RUST_CRAT = auto()
+    C2RUST_CRAT_CFIX = auto()
+
+    def uses_cfix(self) -> bool:
+        return self in [Mode.C2RUST_CFIX, Mode.C2RUST_CRAT_CFIX]
+
+    def uses_crat(self) -> bool:
+        return self in [Mode.C2RUST_CRAT, Mode.C2RUST_CRAT_CFIX]
 
 
 @dataclass(frozen=True)
@@ -127,30 +141,46 @@ def _format(
     run(command, stdout_log=stdout_log, stderr_log=stderr_log, cwd=rust_dir)
 
 
-def _translate_and_transform(workspace: Path, archive_file: Path) -> bool:
+def _translate_and_transform(
+    workspace: Path, archive_file: Path, mode: Mode
+) -> tuple[bool, Path]:
     tc_name = get_name_without_suffix(archive_file)
+    final_dir = workspace / "c2rust" / tc_name
     try:
-        translate(archive_file, workspace / "c2rust" / tc_name)
-        transform(workspace, tc_name)
-        final_dir = workspace / "bin" / tc_name
-        _apply_fix(final_dir)
+        is_final = not mode.uses_crat()
+        translate(archive_file, workspace / "c2rust" / tc_name, is_final=is_final)
+        if mode.uses_crat():
+            transform(workspace, tc_name)
+            final_dir = workspace / "bin" / tc_name
+        if mode.uses_cfix():
+            _apply_fix(final_dir)
         _format(final_dir)
-        return True
-    except:
-        return False
+        return True, final_dir
+    except Exception as e:
+        print(f"Exception: {e}")
+        return False, final_dir
 
 
 def _translate_and_transform_with_parameters(
-    arg: tuple[Path, Path, Parameters],
+    arg: tuple[Path, Path, Parameters, Mode],
 ) -> tuple[bool, Parameters, Path]:
-    workspace, archive_file, parameters = arg
+    workspace, archive_file, parameters, mode = arg
     tc_name = get_name_without_suffix(archive_file)
     name = "_".join([str(value) for _, value in parameters])
-    final_dir = workspace / name / "bin" / tc_name
+    final_dir = workspace / name / "c2rust" / tc_name
     try:
-        translate(archive_file, workspace / name / "c2rust" / tc_name, parameters)
-        transform(workspace / name, tc_name)
-        _apply_fix(final_dir)
+        is_final = not mode.uses_crat()
+        translate(
+            archive_file,
+            workspace / name / "c2rust" / tc_name,
+            parameters,
+            is_final=is_final,
+        )
+        if mode.uses_crat():
+            transform(workspace / name, tc_name)
+            final_dir = workspace / name / "bin" / tc_name
+        if mode.uses_cfix():
+            _apply_fix(final_dir)
         return (True, parameters, final_dir)
     except:
         return (False, parameters, final_dir)
@@ -167,7 +197,7 @@ def _combine_logs(log_paths: list[Path], destination: Path) -> None:
             out.write("\n")
 
 
-def orchestrate(archive_file: Path, dst_dir: Path) -> None:
+def orchestrate(archive_file: Path, dst_dir: Path, mode: Mode) -> None:
     tc_name = get_name_without_suffix(archive_file)
     workspace = Path(
         tempfile.mkdtemp(prefix="tmp-", dir=tempfile.gettempdir())
@@ -178,7 +208,8 @@ def orchestrate(archive_file: Path, dst_dir: Path) -> None:
         if config_info:
             parameter_sets = _build_parameter_sets(config_info.config_vars)
             args = [
-                (workspace, archive_file, parameters) for parameters in parameter_sets
+                (workspace, archive_file, parameters, mode)
+                for parameters in parameter_sets
             ]
             successes: list[tuple[Parameters, Path]] = []
             failures: list[Parameters] = []
@@ -254,15 +285,22 @@ def orchestrate(archive_file: Path, dst_dir: Path) -> None:
             shutil.copy2(stderr_log, dst_dir)
 
         else:
-            _translate_and_transform(workspace, archive_file)
-            copy_translated_rust(workspace / "bin" / tc_name, dst_dir)
+            ok, final_dir = _translate_and_transform(workspace, archive_file, mode)
+            if ok:
+                copy_translated_rust(final_dir, dst_dir)
+            else:
+                print(f"Run failed: {archive_file=} {dst_dir=} {mode=}")
 
     finally:
         shutil.rmtree(workspace)
 
 
 def _usage() -> str:
-    return f"Usage: {sys.argv[0]} <test_case_tarball> <dst_dir>"
+    return (
+        f"Usage: {sys.argv[0]} <test_case_tarball> <dst_dir> [<mode>]\n"
+        f"Available modes: {[mode.value for mode in Mode]}\n"
+        f"Default mode: {Mode.C2RUST_CRAT_CFIX}"
+    )
 
 
 def main() -> None:
@@ -270,13 +308,14 @@ def main() -> None:
         print_help(_usage())
         sys.exit(0)
 
-    if len(sys.argv) != 3:
+    if len(sys.argv) < 3:
         print_help(_usage())
         sys.exit(1)
 
     archive_file = Path(sys.argv[1])
     dst_dir = Path(sys.argv[2])
-    orchestrate(archive_file, dst_dir)
+    mode = Mode(sys.argv[3]) if len(sys.argv) == 4 else Mode.C2RUST_CRAT_CFIX
+    orchestrate(archive_file, dst_dir, mode)
 
 
 if __name__ == "__main__":
