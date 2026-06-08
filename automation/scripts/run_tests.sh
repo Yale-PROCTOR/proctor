@@ -19,6 +19,8 @@ check_file() {
 translation_dir="$(realpath "${1}")"
 output_xml="$(realpath "${2}")"
 
+check_file "${translation_dir}/Cargo.toml"
+
 translation_dir_dir=$(dirname "${translation_dir}")
 translated_rust_dir_link="${translation_dir_dir}/translated_rust"
 

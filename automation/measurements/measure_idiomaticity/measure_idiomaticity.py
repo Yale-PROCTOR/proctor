@@ -191,6 +191,8 @@ class Clippy:
         args = [
             "cargo",
             "clippy",
+            "--manifest-path",
+            "Cargo.toml",
             "--message-format",
             "json",
             "--workspace",
