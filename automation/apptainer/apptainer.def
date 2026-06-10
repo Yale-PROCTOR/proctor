@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: ubuntu:25.04
+From: ubuntu:20.04
 
 %environment
 export SHELL=/bin/bash
@@ -66,7 +66,6 @@ apt-get update &&
         pkg-config \
         libclang-dev \
         libssl-dev \
-        libz3-dev \
         libbz2-dev \
         zlib1g-dev \
         libreadline-dev \
@@ -83,7 +82,7 @@ export UV_INSTALL_DIR=/usr/local/bin
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # uv uses the system python for the venv
-uv venv "${SYS_VENV}" &&
+uv venv --python 3.14 "${SYS_VENV}" &&
     uv pip install \
         toml tabulate requests beautifulsoup4 lxml libclang mpire \
         --python "${SYS_VENV}"

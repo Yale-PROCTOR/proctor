@@ -1,7 +1,7 @@
 # Use this Dockerfile with the build context of the repo root
 # Prefix necessary files with dir: automation/file
 # Invoke from repo root: docker build -t <label> -f automation/Dockerfile .
-FROM ubuntu:25.04
+FROM ubuntu:20.04
 SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update \
@@ -14,7 +14,6 @@ RUN apt-get update \
     git \
     libclang-dev \
     libssl-dev \
-    libz3-dev \
     llvm \
     locales \
     make \
@@ -24,6 +23,7 @@ RUN apt-get update \
     vim
 
 RUN locale-gen en_US.UTF-8
+RUN useradd -m -s /bin/bash ubuntu
 RUN echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
 USER ubuntu
@@ -37,7 +37,7 @@ ENV PATH="${SYS_VENV}/bin:/home/ubuntu/local/bin:/home/ubuntu/.cargo/bin:/home/u
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # uv uses the system python for the venv
-RUN uv venv "${SYS_VENV}" \
+RUN uv venv --python 3.14 "${SYS_VENV}" \
     && uv pip install \
         toml tabulate requests beautifulsoup4 lxml libclang mpire \
         --python "${SYS_VENV}"
