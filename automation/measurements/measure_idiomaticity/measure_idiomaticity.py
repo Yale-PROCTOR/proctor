@@ -179,10 +179,6 @@ class Clippy:
 
         clippy_lint_args = [
             ("-D", "correctness"),
-            ("-W", "suspicious"),
-            ("-W", "complexity"),
-            ("-W", "perf"),
-            ("-W", "style"),
         ]
 
         if ccc_counts:
@@ -199,7 +195,7 @@ class Clippy:
             "--all-targets",
             *(["--fix", "--allow-no-vcs", "--allow-dirty"] if fix else []),
             "--",
-            "-A",
+            "-W",
             "clippy::all",
         ]
         for flag, name in clippy_lint_args:
