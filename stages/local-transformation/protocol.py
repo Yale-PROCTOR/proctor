@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from model import CallableCorrespondence, ItemRecord, SkeletonView, StatementDisposition
+
+from proctor.llm.types import Message, Request, RequestMetadata
+from proctor.prompts.library import PromptLibrary, RenderedPrompt
+
+NO_FENCE_DIAGNOSTIC = (
+    "The LLM response contained no triple-backtick fenced code block; return "
+    "exactly one triple-backtick fenced Rust code block."
+)
+
+_OPENING = re.compile(r"(?m)^```(?!`)([A-Za-z0-9_+-]+)?(?:\r\n|\n)")
+_CLOSING = re.compile(r"(?m)^```(?!`)(?:\r\n|\n|$)")
+
+
+@dataclass(frozen=True)
+class Extraction:
+    candidate: str | None
+    failed_text: str | None
+    diagnostics: str | None
+
+
+@dataclass(frozen=True)
+class PromptRenderInput:
+    dependency_context: str
+    transformation_targets: str
+    failed_transformation: str | None = None
+    diagnostics: str | None = None
+    use_xj_scanf_guidance: bool = False
+    libc_guidance: str = ""
+    printf_guidance: str = ""
+    proctor_libc_call_guidance: str = ""
+    foreign_static_guidance: str = ""
+
+
+def extract_code_block(response: str) -> Extraction:
+    blocks: list[str] = []
+    cursor = 0
+    while True:
+        opening = _OPENING.search(response, cursor)
+        if opening is None:
+            break
+        closing = _CLOSING.search(response, opening.end())
+        if closing is None:
+            cursor = opening.end()
+            continue
+        content = response[opening.end() : closing.start()]
+        if content.endswith("\r\n"):
+            content = content[:-2]
+        elif content.endswith("\n"):
+            content = content[:-1]
+        blocks.append(content)
+        cursor = closing.end()
+    if not blocks:
+        return Extraction(None, response, NO_FENCE_DIAGNOSTIC)
+    candidate = max(enumerate(blocks), key=lambda pair: (len(pair[1]), -pair[0]))[1]
+    return Extraction(candidate, None, None)
+
+
+def validation_request(
+    members: tuple[int, ...],
+    records_by_id: dict[int, ItemRecord],
+    views_by_id: dict[int, SkeletonView],
+    transformation: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "expected_functions": [
+            {
+                "id": records_by_id[item_id].id,
+                "name": records_by_id[item_id].name,
+                "view": skeleton_view_value(views_by_id[item_id]),
+            }
+            for item_id in sorted(members)
+        ],
+        "transformation": transformation,
+    }
+
+
+def replacement_request(
+    members: tuple[int, ...],
+    records_by_id: dict[int, ItemRecord],
+    views_by_id: dict[int, SkeletonView],
+    transformation: str,
+    accepted_correspondence: tuple[CallableCorrespondence, ...] = (),
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "items": [
+            {
+                "id": records_by_id[item_id].id,
+                "path": records_by_id[item_id].path,
+                "name": records_by_id[item_id].name,
+                "view": skeleton_view_value(views_by_id[item_id]),
+            }
+            for item_id in sorted(members)
+        ],
+        "transformation": transformation,
+        "accepted_correspondence": [
+            {
+                "item_id": record.item_id,
+                "logical_path": record.logical_path,
+                "implementation_path": record.implementation_path,
+                "wrapper_path": record.wrapper_path,
+            }
+            for record in accepted_correspondence
+        ],
+    }
+
+
+def _disposition_value(value: StatementDisposition) -> dict[str, object]:
+    return {
+        "label": value.label,
+        "disposition": value.disposition,
+        "children": [_disposition_value(child) for child in value.children],
+    }
+
+
+def skeleton_view_value(value: SkeletonView) -> dict[str, object]:
+    return {
+        "skeleton": value.skeleton,
+        "needs_transformation": value.needs_transformation,
+        "statement_dispositions": [
+            _disposition_value(node) for node in value.statement_dispositions
+        ],
+        "statement_pair_metadata": [
+            {
+                "label": statement.label,
+                "before_statement": statement.before_statement,
+                "printf_template": (
+                    None
+                    if statement.printf_template is None
+                    else {
+                        "rust_format": statement.printf_template.rust_format,
+                        "argument_count": statement.printf_template.argument_count,
+                    }
+                ),
+                "pointer_variables_complete": statement.pointer_variables_complete,
+                "pointer_variables": [
+                    {
+                        "name": variable.name,
+                        "origin": (
+                            {"kind": "parameter", "index": variable.origin.value}
+                            if variable.origin.kind == "parameter"
+                            else {
+                                "kind": "local",
+                                "declaration_label": variable.origin.value,
+                            }
+                        ),
+                        "before_type": variable.before_type,
+                        "selected_target_type": variable.selected_target_type,
+                        "before_type_is_inferred": variable.before_type_is_inferred,
+                    }
+                    for variable in statement.pointer_variables
+                ],
+            }
+            for statement in value.statement_pair_metadata
+        ],
+    }
+
+
+def repair_context(failed_transformation: str, diagnostics: str) -> str:
+    return (
+        "The previous transformation failed.\n\n"
+        "Previous transformation:\n\n"
+        f"```rust\n{failed_transformation}\n```\n\n"
+        "Diagnostics:\n\n"
+        f"```text\n{diagnostics}\n```\n\n"
+        "Regenerate every function in Transformation Targets."
+    )
+
+
+def render_prompt(
+    value: PromptRenderInput, prompt_dir: Path | None = None
+) -> RenderedPrompt:
+    directory = prompt_dir or Path(__file__).parent / "prompts"
+    template = PromptLibrary(directory).get("local_transformation", version=1)
+    repair = ""
+    if value.failed_transformation is not None and value.diagnostics is not None:
+        repair = repair_context(value.failed_transformation, value.diagnostics)
+    return template.render(
+        dependency_context=value.dependency_context,
+        transformation_targets=value.transformation_targets,
+        repair_context=repair,
+        use_xj_scanf_guidance=value.use_xj_scanf_guidance,
+        libc_guidance=value.libc_guidance,
+        printf_guidance=value.printf_guidance,
+        proctor_libc_call_guidance=value.proctor_libc_call_guidance,
+        foreign_static_guidance=value.foreign_static_guidance,
+    )
+
+
+def llm_request(
+    rendered: RenderedPrompt,
+    *,
+    run_id: str,
+    members: tuple[int, ...],
+) -> Request:
+    return Request(
+        messages=(Message(role="user", content=rendered.text),),
+        metadata=RequestMetadata(
+            run_id=run_id,
+            stage="local_transformation",
+            item=",".join(str(item_id) for item_id in sorted(members)),
+            prompt_id=rendered.id,
+            prompt_version=rendered.version,
+            prompt_hash=rendered.content_hash,
+        ),
+    )
+
+
+def make_skeleton_command(
+    crat_tool: Path,
+    current_project: Path,
+    output: Path,
+    rule_set: Path | None = None,
+) -> list[str]:
+    command = [
+        str(crat_tool),
+        "make-skeleton",
+        "--output",
+        str(output),
+    ]
+    if rule_set is not None:
+        command.extend(("--rules", str(rule_set)))
+    command.append(str(current_project))
+    return command
+
+
+def merge_observations_command(
+    crat_tool: Path, output: Path, inputs: tuple[Path, ...]
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "merge-observations",
+        "--output",
+        str(output),
+        *(str(path) for path in inputs),
+    ]
+
+
+def normalize_safety_command(
+    crat_tool: Path, library_source: Path, output: Path
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "normalize-safety",
+        "--output",
+        str(output),
+        str(library_source),
+    ]
+
+
+def validate_command(crat_tool: Path, request: Path, response: Path) -> list[str]:
+    return [
+        str(crat_tool),
+        "validate",
+        "--input",
+        str(request),
+        "--output",
+        str(response),
+    ]
+
+
+def make_initial_command(
+    crat_tool: Path, analysis_project: Path, output: Path
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "make-initial",
+        "--output",
+        str(output),
+        str(analysis_project),
+    ]
+
+
+def add_functions_command(
+    crat_tool: Path,
+    analysis_project: Path,
+    current_project: Path,
+    request: Path,
+    output: Path,
+    statement_pairs_output: Path,
+    observation_source_output: Path,
+    observation_metadata_output: Path,
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "add-functions",
+        "--request",
+        str(request),
+        "--current-project",
+        str(current_project),
+        "--output",
+        str(output),
+        "--statement-pairs-output",
+        str(statement_pairs_output),
+        "--observation-source-output",
+        str(observation_source_output),
+        "--observation-metadata-output",
+        str(observation_metadata_output),
+        str(analysis_project),
+    ]
+
+
+def finalize_project_command(
+    crat_tool: Path,
+    analysis_project: Path,
+    current_project: Path,
+    manifest: Path,
+    output: Path,
+    manifest_output: Path,
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "finalize-project",
+        "--manifest",
+        str(manifest),
+        "--current-project",
+        str(current_project),
+        "--output",
+        str(output),
+        "--manifest-output",
+        str(manifest_output),
+        str(analysis_project),
+    ]
+
+
+def extract_observations_command(
+    crat_tool: Path,
+    observation_source: Path,
+    metadata: Path,
+    output: Path,
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "extract-observations",
+        "--metadata",
+        str(metadata),
+        "--output",
+        str(output),
+        str(observation_source),
+    ]
