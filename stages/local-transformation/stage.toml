@@ -1,0 +1,15 @@
+id = "local_transformation"
+version = "0.1.0"
+description = "Transform pointer-local Rust code SCC-by-SCC with validated LLM output."
+
+exec = ["python3", "main.py"]
+warmup = ["python3", "main.py", "--build-only"]
+
+[requires]
+rust_project = "required"
+
+[produces]
+rust_project = true
+
+[config]
+crat_dir = { type = "string", default = "../crat", doc = "crat checkout, relative to this stage" }

@@ -1,0 +1,9 @@
+[project]
+name = "local-transformation-stage"
+version = "0.1.0"
+description = "PROCTOR local pointer-transformation stage"
+requires-python = ">=3.12"
+dependencies = ["proctor"]
+
+[tool.uv.sources]
+proctor = { path = "../..", editable = true }
