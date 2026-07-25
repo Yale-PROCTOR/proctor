@@ -85,16 +85,22 @@ class RunState:
     logs: tuple[str, ...] = ()
 
 
-def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, str]:
+def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise StageFailure("stage config must be an object")
-    unknown = sorted(set(config) - {"crat_dir"})
+    unknown = sorted(set(config) - {"crat_dir", "dump_llm_exchanges"})
     if unknown:
         raise StageFailure(f"unknown local-transformation config keys: {unknown}")
     crat_dir = config.get("crat_dir", "../crat")
     if not isinstance(crat_dir, str) or not crat_dir:
         raise StageFailure("config.crat_dir must be a nonempty string")
-    return {"crat_dir": str((stage_dir / crat_dir).resolve())}
+    dump_llm_exchanges = config.get("dump_llm_exchanges", False)
+    if not isinstance(dump_llm_exchanges, bool):
+        raise StageFailure("config.dump_llm_exchanges must be a boolean")
+    return {
+        "crat_dir": str((stage_dir / crat_dir).resolve()),
+        "dump_llm_exchanges": dump_llm_exchanges,
+    }
 
 
 def _library_relative_path(project: Path) -> Path:
@@ -129,7 +135,7 @@ def _library_relative_path(project: Path) -> Path:
 
 def _validate_boundaries(
     stage_input: StageInput, stage_dir: Path
-) -> tuple[Path, Path, Path, Path, dict[str, str]]:
+) -> tuple[Path, Path, Path, Path, dict[str, Any]]:
     config = _effective_config(stage_input.config, stage_dir)
     source = stage_input.inputs.rust_project
     destination = stage_input.outputs.rust_project
@@ -374,6 +380,7 @@ def _process_scc(
     client: Any,
     tracker: UsageTracker,
     usage_path: Path,
+    exchange_root: Path | None,
     state: RunState,
 ) -> None:
     duplicate_names: dict[str, list[ItemRecord]] = {}
@@ -405,11 +412,19 @@ def _process_scc(
             )
         )
         request = llm_request(rendered, run_id=stage_input.run_id, members=members)
+        exchange_dir: Path | None = None
+        if exchange_root is not None:
+            scc = "_".join(str(item_id) for item_id in sorted(members))
+            exchange_dir = exchange_root / f"scc-{scc}" / f"generation-{generation:02d}"
+            exchange_dir.mkdir(parents=True, exist_ok=True)
+            (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
         state.prompt_used = True
         state.metrics.llm_generation_calls += 1
         before = len(read_usage(usage_path))
         response = client.complete(request)
         _record_untracked_response(tracker, usage_path, before, request, response)
+        if exchange_dir is not None:
+            (exchange_dir / "response.md").write_text(response.text, encoding="utf-8")
         extraction = extract_code_block(response.text)
         if extraction.candidate is None:
             state.metrics.structural_failures += 1
@@ -541,6 +556,11 @@ def run_stage(
                 )
             )
             client = factory(llm_settings, tracker)
+            exchange_root = (
+                (artifacts or workdir) / "llm-exchanges"
+                if config["dump_llm_exchanges"]
+                else None
+            )
             for members in schedule:
                 _process_scc(
                     members,
@@ -553,6 +573,7 @@ def run_stage(
                     client=client,
                     tracker=tracker,
                     usage_path=usage_path,
+                    exchange_root=exchange_root,
                     state=state,
                 )
         _copy_final(current, destination)

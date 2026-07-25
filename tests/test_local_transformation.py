@@ -1346,8 +1346,9 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
     assert manifest["warmup"] == ["python3", "main.py", "--build-only"]
     assert manifest["requires"] == {"rust_project": "required"}
     assert manifest["produces"] == {"rust_project": True}
-    assert set(manifest["config"]) == {"crat_dir"}
+    assert set(manifest["config"]) == {"crat_dir", "dump_llm_exchanges"}
     assert manifest["config"]["crat_dir"]["default"] == "../crat"
+    assert manifest["config"]["dump_llm_exchanges"]["default"] is False
     assert not (
         {"c_project", "test_package", "rule_set"}
         & (set(manifest["requires"]) | set(manifest["produces"]))
@@ -1413,7 +1414,10 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
     assert [(prompt.id, prompt.version) for prompt in output.prompts] == [
         ("local_transformation", 1)
     ]
-    assert output.config_used == {"crat_dir": str((STAGE_DIR / "../crat").resolve())}
+    assert output.config_used == {
+        "crat_dir": str((STAGE_DIR / "../crat").resolve()),
+        "dump_llm_exchanges": False,
+    }
     assert output.metrics == {
         "function_count": 1,
         "scc_count": 1,
@@ -1428,15 +1432,60 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
         assert output.logs == ("local-transformation.log",)
         assert value.outputs.artifacts_dir.joinpath(output.logs[0]).is_file()
         assert all(not Path(log).is_absolute() for log in output.logs)
+        assert not value.outputs.artifacts_dir.joinpath("llm-exchanges").exists()
     else:
         assert output.logs == ()
         assert value.framework.workdir.joinpath("local-transformation.log").is_file()
+        assert not value.framework.workdir.joinpath("llm-exchanges").exists()
     usage_path = (
         value.framework.workdir / "usage.jsonl"
         if case == "default_usage_log"
         else explicit_usage
     )
     assert usage_path.is_file()
+
+
+@pytest.mark.parametrize("artifacts", [True, False])
+def test_dump_llm_exchanges_preserves_each_generation(tmp_path, artifacts):
+    first_response = "first response\n" + response()
+    second_response = "second response\n" + response()
+    client = FakeClient([first_response, second_response])
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[INVALID, VALID],
+        candidates=["final\n"],
+    )
+    value, output = run_fake(
+        tmp_path,
+        tools,
+        client,
+        artifacts=artifacts,
+        config={"dump_llm_exchanges": True},
+    )
+    assert output.status == "success"
+    root = (
+        value.outputs.artifacts_dir
+        if value.outputs.artifacts_dir is not None
+        else value.framework.workdir
+    )
+    exchange_root = root / "llm-exchanges" / "scc-0"
+    for generation, raw_response in enumerate([first_response, second_response]):
+        generation_dir = exchange_root / f"generation-{generation:02d}"
+        assert generation_dir.joinpath("prompt.md").read_text(encoding="utf-8") == (
+            client.requests[generation].messages[0].content
+        )
+        assert (
+            generation_dir.joinpath("response.md").read_text(encoding="utf-8")
+            == raw_response
+        )
+    assert (
+        "The previous transformation failed."
+        not in client.requests[0].messages[0].content
+    )
+    assert (
+        "The previous transformation failed." in client.requests[1].messages[0].content
+    )
 
 
 def test_failure_after_llm_still_reports_accumulated_usage(tmp_path):
@@ -1623,6 +1672,7 @@ def test_build_only_warms_both_crat_binaries_without_stage_io(
         "absolute_lib",
         "empty_crat",
         "wrong_crat",
+        "wrong_dump",
         "unknown_config",
         "output_inside_input",
         "work_equals_input",
@@ -1670,6 +1720,8 @@ def test_missing_required_paths_fail_before_side_effects(tmp_path, mutation):
         value = replace(value, config={"crat_dir": ""})
     elif mutation == "wrong_crat":
         value = replace(value, config={"crat_dir": 7})
+    elif mutation == "wrong_dump":
+        value = replace(value, config={"dump_llm_exchanges": "yes"})
     elif mutation == "unknown_config":
         value = replace(value, config={"unknown": True})
     elif mutation == "output_inside_input":

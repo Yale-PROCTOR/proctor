@@ -13,3 +13,4 @@ rust_project = true
 
 [config]
 crat_dir = { type = "string", default = "../crat", doc = "crat checkout, relative to this stage" }
+dump_llm_exchanges = { type = "bool", default = false, doc = "persist each rendered prompt and LLM response under stage artifacts" }
