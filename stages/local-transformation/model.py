@@ -34,6 +34,7 @@ class ItemRecord:
     target_signature: str | None = None
     needs_transformation: bool | None = None
     statements_requiring_transformation: tuple[int, ...] = ()
+    foreign_function_names: tuple[str, ...] = ()
     declaration: str | None = None
     definition: str | None = None
 
@@ -92,6 +93,35 @@ def _dependencies(data: dict[str, Any], key: str, record_id: int) -> tuple[int, 
     return result
 
 
+def _foreign_function_names(data: dict[str, Any], record_id: int) -> tuple[str, ...]:
+    value = data.get("foreign_function_names")
+    if not isinstance(value, list):
+        raise SkeletonError(
+            f"record {record_id} field 'foreign_function_names' must be an array"
+        )
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise SkeletonError(
+                f"record {record_id} field 'foreign_function_names' entries "
+                "must be strings"
+            )
+        if not item:
+            raise SkeletonError(
+                f"record {record_id} field 'foreign_function_names' entries "
+                "must not be empty"
+            )
+        result.append(item)
+    for previous, current in pairwise(result):
+        if current <= previous:
+            detail = "duplicate" if current == previous else "out-of-order"
+            raise SkeletonError(
+                f"record {record_id} field 'foreign_function_names' has {detail} "
+                f"name {current!r}"
+            )
+    return tuple(result)
+
+
 def _load_record(data: Any, index: int) -> ItemRecord:
     if not isinstance(data, dict):
         raise SkeletonError(f"record {index} must be an object")
@@ -109,6 +139,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             "target_signature",
             "needs_transformation",
             "statements_requiring_transformation",
+            "foreign_function_names",
             "signature_dependencies",
             "dependencies",
         )
@@ -145,6 +176,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             target_signature=_string(data, "target_signature", record_id),
             needs_transformation=needs_transformation,
             statements_requiring_transformation=statements_requiring_transformation,
+            foreign_function_names=_foreign_function_names(data, record_id),
             signature_dependencies=signature_dependencies,
             dependencies=dependencies,
         )
@@ -298,9 +330,10 @@ def leaf_schedule(graph: dict[int, set[int]]) -> tuple[tuple[int, ...], ...]:
 
 
 def render_dependency_entry(record: ItemRecord) -> str:
+    name = record.path.rsplit("::", 1)[-1]
     if record.kind == "Fn":
         return (
-            f"### Function {record.id}: {record.path}\n"
+            f"### Function `{name}`\n\n"
             "Source signature:\n"
             f"```rust\n{record.source_signature}\n```\n"
             "Target signature:\n"
@@ -309,7 +342,7 @@ def render_dependency_entry(record: ItemRecord) -> str:
     text = (
         record.declaration if record.kind in {"Static", "Const"} else record.definition
     )
-    return f"### {record.kind} {record.id}: {record.path}\n```rust\n{text}\n```"
+    return f"### {record.kind} `{name}`\n\n```rust\n{text}\n```"
 
 
 def render_transformation_targets(
@@ -318,8 +351,13 @@ def render_transformation_targets(
     entries = []
     for item_id in sorted(members):
         record = records_by_id[item_id]
+        foreign_references = ""
+        if record.foreign_function_names:
+            names = ", ".join(f"`{name}`" for name in record.foreign_function_names)
+            foreign_references = f"Foreign function references: {names}\n\n"
         entries.append(
-            f"### Function {record.id}: {record.path}\n"
+            f"### Function `{record.name}`\n\n"
+            f"{foreign_references}"
             f"Source:\n```rust\n{record.annotated_source}\n```\n"
             f"Target skeleton:\n```rust\n{record.annotated_skeleton}\n```"
         )

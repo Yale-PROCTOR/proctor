@@ -53,9 +53,12 @@ Requirements:
    all its existing labeled nested statements. Other siblings must not have a
    control form in that same direct role and must contain no labels below their
    own group label.
-10. Do not introduce an explicit `unsafe` block or a statement or expression
+10. For each listed foreign-function reference, prefer a behavior-equivalent
+    safe Rust function or method when one is available; otherwise preserve the
+    foreign call.
+11. Do not introduce an explicit `unsafe` block or a statement or expression
     attribute other than the required `#[proctor(N)]` labels.
-11. Return exactly one Rust code block delimited by triple-backtick fences.
+12. Return exactly one Rust code block delimited by triple-backtick fences.
     Include all requested functions and no prose. Do not use tilde or
     longer-backtick fences.
 
@@ -112,11 +115,11 @@ unsafe fn read_value(mut p: &[i32], mut q: Option<&i32>) -> i32 {
 }
 ```
 
-Dependency Context:
+{% if dependency_context %}## Dependency Context
 
 {{ dependency_context }}
 
-Transformation Targets:
+{% endif %}## Transformation Targets
 
 {{ transformation_targets }}
 

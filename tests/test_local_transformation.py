@@ -68,6 +68,7 @@ def fn_record(
     *,
     needs_transformation: bool = True,
     transformation_labels: list[int] | None = None,
+    foreign_function_names: list[str] | None = None,
 ) -> dict[str, object]:
     labels = (
         ([0] if needs_transformation else [])
@@ -88,6 +89,9 @@ def fn_record(
         "target_signature": f"unsafe fn {name}()",
         "needs_transformation": needs_transformation,
         "statements_requiring_transformation": labels,
+        "foreign_function_names": (
+            [] if foreign_function_names is None else foreign_function_names
+        ),
         "signature_dependencies": (
             [] if signature_dependencies is None else signature_dependencies
         ),
@@ -171,6 +175,313 @@ CONTEXT_RECORDS = [
     type_record(29, "E", "Enum", "enum E { A }", []),
 ]
 
+A3_SRC_PLAIN = """pub unsafe fn scalar(value: i32) -> i32 {
+    value + 1
+}"""
+
+A3_SRC_FOREIGN = """#![feature(extern_types)]
+
+unsafe extern "C" {
+    fn strlen(text: *const core::ffi::c_char) -> usize;
+    fn free(pointer: *mut core::ffi::c_void);
+    fn transitive_foreign(value: i32) -> i32;
+    fn unused_foreign(value: i32) -> i32;
+    static FOREIGN_COUNTER: i32;
+    type ForeignOpaque;
+}
+
+use strlen as c_strlen;
+
+pub unsafe extern "C" fn local_abi(value: i32) -> i32 {
+    transitive_foreign(value)
+}
+
+pub mod parser {
+    pub unsafe fn scan(
+        pointer: *mut core::ffi::c_void,
+        text: *const core::ffi::c_char,
+    ) -> usize {
+        crate::free(pointer);
+        let first = crate::c_strlen(text);
+        let second = crate::strlen(text);
+        let _ = crate::FOREIGN_COUNTER;
+        let _: Option<*mut crate::ForeignOpaque> = None;
+        let _ = crate::local_abi(first as i32);
+        first + second + core::mem::size_of::<usize>()
+    }
+
+    pub unsafe fn release(pointer: *mut core::ffi::c_void) {
+        crate::free(pointer);
+        crate::free(pointer);
+    }
+
+    pub unsafe fn scalar(value: i32) -> i32 {
+        crate::local_abi(value)
+    }
+}"""
+
+A3_SRC_KINDS = """pub struct Point {
+    pub value: i32,
+}
+
+pub static LIMIT: i32 = 10;
+pub const STEP: i32 = 1;
+
+pub unsafe fn helper(point: Point) -> i32 {
+    point.value
+}
+
+pub unsafe fn target(point: Point) -> i32 {
+    helper(point) + LIMIT + STEP
+}"""
+
+A3_SRC_COLLISION = """pub mod outer {
+    pub mod left {
+        pub unsafe fn parse(value: i32) -> i32 {
+            value + 1
+        }
+    }
+
+    pub mod right {
+        pub unsafe fn parse(value: i32) -> i32 {
+            value - 1
+        }
+    }
+}
+
+pub unsafe fn target(value: i32) -> i32 {
+    outer::left::parse(value) + outer::right::parse(value)
+}"""
+
+
+def a3_plain_records():
+    assert A3_SRC_PLAIN.endswith("}")
+    record = fn_record(0, "scalar", "scalar", [], needs_transformation=False)
+    record["annotated_source"] = (
+        "pub unsafe fn scalar(mut value: i32) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    (value + 1)\n"
+        "}"
+    )
+    record["annotated_skeleton"] = record["annotated_source"]
+    record["source_signature"] = "pub unsafe fn scalar(mut value: i32) -> i32"
+    record["target_signature"] = record["source_signature"]
+    return loaded([record])
+
+
+def a3_foreign_records():
+    assert "use strlen as c_strlen;" in A3_SRC_FOREIGN
+    local_abi = fn_record(
+        0,
+        "local_abi",
+        "local_abi",
+        [],
+        foreign_function_names=["transitive_foreign"],
+    )
+    local_abi["annotated_source"] = (
+        "pub unsafe fn local_abi(mut value: i32) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    transitive_foreign(value)\n"
+        "}"
+    )
+    local_abi["annotated_skeleton"] = (
+        "pub unsafe fn local_abi(mut value: i32) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    todo!()\n"
+        "}"
+    )
+    local_abi["source_signature"] = "pub unsafe fn local_abi(mut value: i32) -> i32"
+    local_abi["target_signature"] = local_abi["source_signature"]
+    scan = fn_record(
+        1,
+        "parser::scan",
+        "scan",
+        [0],
+        foreign_function_names=["free", "strlen"],
+    )
+    scan["annotated_source"] = (
+        "pub unsafe fn scan(mut pointer: *mut core::ffi::c_void,\n"
+        "    mut text: *const core::ffi::c_char) -> usize {\n"
+        "    #[proctor(0)]\n"
+        "    crate::free(pointer);\n"
+        "    #[proctor(1)]\n"
+        "    let mut first = crate::c_strlen(text);\n"
+        "    #[proctor(2)]\n"
+        "    let mut second = crate::strlen(text);\n"
+        "    #[proctor(3)]\n"
+        "    let _ = crate::FOREIGN_COUNTER;\n"
+        "    #[proctor(4)]\n"
+        "    let _: Option<*mut crate::ForeignOpaque> = None;\n"
+        "    #[proctor(5)]\n"
+        "    let _ = crate::local_abi(first as i32);\n"
+        "    #[proctor(6)]\n"
+        "    (first + second + core::mem::size_of::<usize>())\n"
+        "}"
+    )
+    scan["annotated_skeleton"] = (
+        "pub unsafe fn scan(mut pointer: *mut core::ffi::c_void, mut text: &[i8])\n"
+        "    -> usize {\n"
+        "    #[proctor(0)]\n"
+        "    todo!();\n"
+        "    #[proctor(1)]\n"
+        "    let mut first: usize = todo!();\n"
+        "    #[proctor(2)]\n"
+        "    let mut second: usize = todo!();\n"
+        "    #[proctor(3)]\n"
+        "    let _ = crate::FOREIGN_COUNTER;\n"
+        "    #[proctor(4)]\n"
+        "    let _: Option<*mut crate::ForeignOpaque> = todo!();\n"
+        "    #[proctor(5)]\n"
+        "    let _ = crate::local_abi(first as i32);\n"
+        "    #[proctor(6)]\n"
+        "    (first + second + core::mem::size_of::<usize>())\n"
+        "}"
+    )
+    scan["source_signature"] = (
+        "pub unsafe fn scan(mut pointer: *mut core::ffi::c_void,\n"
+        "mut text: *const core::ffi::c_char) -> usize"
+    )
+    scan["target_signature"] = (
+        "pub unsafe fn scan(mut pointer: *mut core::ffi::c_void, mut text: &[i8])\n"
+        "-> usize"
+    )
+    scan["statements_requiring_transformation"] = [0, 1, 2, 4]
+    release = fn_record(
+        2,
+        "parser::release",
+        "release",
+        [],
+        transformation_labels=[0, 1],
+        foreign_function_names=["free"],
+    )
+    release["annotated_source"] = (
+        "pub unsafe fn release(mut pointer: *mut core::ffi::c_void) {\n"
+        "    #[proctor(0)]\n"
+        "    crate::free(pointer);\n"
+        "    #[proctor(1)]\n"
+        "    crate::free(pointer);\n"
+        "}"
+    )
+    release["annotated_skeleton"] = (
+        "pub unsafe fn release(mut pointer: *mut core::ffi::c_void) {\n"
+        "    #[proctor(0)]\n"
+        "    todo!();\n"
+        "    #[proctor(1)]\n"
+        "    todo!();\n"
+        "}"
+    )
+    release["source_signature"] = (
+        "pub unsafe fn release(mut pointer: *mut core::ffi::c_void)"
+    )
+    release["target_signature"] = release["source_signature"]
+    scalar = fn_record(
+        3,
+        "parser::scalar",
+        "scalar",
+        [0],
+        needs_transformation=False,
+    )
+    scalar["annotated_source"] = (
+        "pub unsafe fn scalar(mut value: i32) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    crate::local_abi(value)\n"
+        "}"
+    )
+    scalar["annotated_skeleton"] = scalar["annotated_source"]
+    scalar["source_signature"] = "pub unsafe fn scalar(mut value: i32) -> i32"
+    scalar["target_signature"] = scalar["source_signature"]
+    return loaded([local_abi, scan, release, scalar])
+
+
+def a3_kind_records():
+    assert "pub struct Point" in A3_SRC_KINDS
+    helper = fn_record(3, "helper", "helper", [0], [0], needs_transformation=False)
+    helper["annotated_source"] = (
+        "pub unsafe fn helper(mut point: Point) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    point.value\n"
+        "}"
+    )
+    helper["annotated_skeleton"] = helper["annotated_source"]
+    helper["source_signature"] = "pub unsafe fn helper(mut point: Point) -> i32"
+    helper["target_signature"] = helper["source_signature"]
+    target = fn_record(
+        4,
+        "target",
+        "target",
+        [0, 1, 2, 3],
+        [0],
+        needs_transformation=False,
+    )
+    target["annotated_source"] = (
+        "pub unsafe fn target(mut point: Point) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    (helper(point) + LIMIT + STEP)\n"
+        "}"
+    )
+    target["annotated_skeleton"] = target["annotated_source"]
+    target["source_signature"] = "pub unsafe fn target(mut point: Point) -> i32"
+    target["target_signature"] = target["source_signature"]
+    return loaded(
+        [
+            type_record(
+                0,
+                "Point",
+                "Struct",
+                "pub struct Point {\n    pub value: i32,\n}",
+                [],
+            ),
+            value_record(1, "LIMIT", "Static", "pub static LIMIT: i32;", [], []),
+            value_record(2, "STEP", "Const", "pub const STEP: i32;", [], []),
+            helper,
+            target,
+        ]
+    )
+
+
+def a3_collision_records():
+    assert "outer::left::parse" in A3_SRC_COLLISION
+    left = fn_record(
+        0,
+        "outer::left::parse",
+        "parse",
+        [],
+        needs_transformation=False,
+    )
+    left["annotated_source"] = (
+        "pub unsafe fn parse(mut value: i32) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    (value + 1)\n"
+        "}"
+    )
+    left["annotated_skeleton"] = left["annotated_source"]
+    left["source_signature"] = "pub unsafe fn parse(mut value: i32) -> i32"
+    left["target_signature"] = left["source_signature"]
+    right = copy.deepcopy(left)
+    right["id"] = 1
+    right["path"] = "outer::right::parse"
+    right["annotated_source"] = str(right["annotated_source"]).replace(
+        "(value + 1)", "(value - 1)"
+    )
+    right["annotated_skeleton"] = right["annotated_source"]
+    target = fn_record(2, "target", "target", [0, 1], needs_transformation=False)
+    target["annotated_source"] = (
+        "pub unsafe fn target(mut value: i32) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    (outer::left::parse(value) + outer::right::parse(value))\n"
+        "}"
+    )
+    target["annotated_skeleton"] = target["annotated_source"]
+    target["source_signature"] = "pub unsafe fn target(mut value: i32) -> i32"
+    target["target_signature"] = target["source_signature"]
+    return loaded(
+        [
+            left,
+            right,
+            target,
+        ]
+    )
+
 
 def loaded(raw: list[dict[str, object]]):
     return load_skeletons(json.dumps(raw, ensure_ascii=False))
@@ -233,6 +544,66 @@ def test_amendment_2_loader_requires_and_preserves_function_disposition():
     malformed["needs_transformation"] = False
     with pytest.raises(SkeletonError, match="inconsistent"):
         loaded([malformed])
+
+
+def test_existing_function_records_and_helpers_adopt_the_final_shape():
+    plain = fn_record(0, "scalar", "scalar", [])
+    assert list(plain) == [
+        "id",
+        "path",
+        "kind",
+        "name",
+        "annotated_source",
+        "annotated_skeleton",
+        "source_signature",
+        "target_signature",
+        "needs_transformation",
+        "statements_requiring_transformation",
+        "foreign_function_names",
+        "signature_dependencies",
+        "dependencies",
+    ]
+    assert plain["foreign_function_names"] == []
+    assert a3_plain_records()[0].foreign_function_names == ()
+    assert a3_foreign_records()[1].foreign_function_names == ("free", "strlen")
+
+    point = type_record(1, "Point", "Struct", "struct Point;", [])
+    assert "foreign_function_names" not in point
+    assert a3_kind_records()[0].foreign_function_names == ()
+
+
+def test_loader_requires_sorted_unique_nonempty_foreign_names():
+    plain = fn_record(0, "scalar", "scalar", [])
+    foreign = fn_record(
+        0,
+        "parser::scan",
+        "scan",
+        [],
+        foreign_function_names=["free", "strlen"],
+    )
+    assert loaded([plain])[0].foreign_function_names == ()
+    assert loaded([foreign])[0].foreign_function_names == ("free", "strlen")
+
+    malformed_values = (
+        None,
+        "free",
+        ["free", 1],
+        [""],
+        ["free", "free"],
+        ["strlen", "free"],
+    )
+    for value in malformed_values:
+        malformed = copy.deepcopy(foreign)
+        if value is None:
+            del malformed["foreign_function_names"]
+        else:
+            malformed["foreign_function_names"] = value
+        with pytest.raises(SkeletonError):
+            loaded([malformed])
+
+    non_function = type_record(1, "Point", "Struct", "struct Point;", [])
+    assert "foreign_function_names" not in non_function
+    assert loaded([non_function])[0].foreign_function_names == ()
 
 
 def test_ids_and_same_namespace_paths_are_valid_and_unique():
@@ -425,8 +796,8 @@ def test_closure_follows_signature_edges_but_not_body_only_edges():
 
 def test_closure_deduplicates_at_shortest_union_depth():
     text, _ = dependency_context((0,), record_map())
-    assert text.count("### Struct 26:") == 1
-    assert text.count("### Struct 28:") == 1
+    assert text.count("### Struct `U`") == 1
+    assert text.count("### Struct `X`") == 1
 
 
 def test_entries_are_finally_sorted_by_item_id_not_discovery_parent():
@@ -450,7 +821,7 @@ def test_empty_context_is_exact_empty_string():
 
 def test_rendering_matches_exact_golden():
     expected = (
-        "### Function 1: callee\nSource signature:\n```rust\n"
+        "### Function `callee`\n\nSource signature:\n```rust\n"
         "unsafe fn callee(mut p: *const T) -> i32\n```\nTarget signature:\n"
         "```rust\nunsafe fn callee(mut p: &T) -> i32\n```"
     )
@@ -489,7 +860,97 @@ def test_mandatory_overflow_aborts_before_llm():
 
 def test_transformation_targets_render_in_member_id_order():
     text = render_transformation_targets((3, 0), record_map())
-    assert text.index("### Function 0") < text.index("### Function 3")
+    assert text.index("### Function `target`") < text.index("### Function `peer`")
+
+
+def test_targets_use_final_names_and_omit_empty_foreign_line():
+    records = {record.id: record for record in a3_foreign_records()}
+    text = render_transformation_targets((3, 2, 1), records)
+    entries = text.split("\n\n### Function ")
+    entries = [entries[0], *(f"### Function {entry}" for entry in entries[1:])]
+
+    assert entries[0].startswith(
+        "### Function `scan`\n\n"
+        "Foreign function references: `free`, `strlen`\n\n"
+        "Source:\n"
+    )
+    assert entries[1].startswith(
+        "### Function `release`\n\nForeign function references: `free`\n\nSource:\n"
+    )
+    assert entries[2].startswith("### Function `scalar`\n\nSource:\n")
+    assert "Foreign function references:" not in entries[2]
+    headings = [entry.splitlines()[0] for entry in entries]
+    assert headings == [
+        "### Function `scan`",
+        "### Function `release`",
+        "### Function `scalar`",
+    ]
+    assert all("parser::" not in heading for heading in headings)
+    assert text == "\n\n".join(entries)
+
+
+def test_noncolliding_dependencies_use_kind_and_final_name():
+    records = {record.id: record for record in a3_kind_records()}
+    text, selected = dependency_context((4,), records)
+    assert selected == (0, 1, 2, 3)
+    headings = [line for line in text.splitlines() if line.startswith("### ")]
+    assert headings == [
+        "### Struct `Point`",
+        "### Static `LIMIT`",
+        "### Const `STEP`",
+        "### Function `helper`",
+    ]
+    assert all(f" {item_id}:" not in text for item_id in selected)
+    assert all("::" not in heading for heading in headings)
+
+
+def test_duplicate_dependency_names_remain_name_only():
+    records = {record.id: record for record in a3_collision_records()}
+    text, selected = dependency_context((2,), records)
+    assert selected == (0, 1)
+    assert text.count("### Function `parse`") == 2
+    headings = [line for line in text.splitlines() if line.startswith("### ")]
+    assert headings == ["### Function `parse`", "### Function `parse`"]
+    assert all(
+        component not in heading
+        for heading in headings
+        for component in ("outer::", "left::", "right::")
+    )
+
+
+def test_budget_counts_final_name_only_entries_not_section_heading():
+    records = {record.id: record for record in a3_collision_records()}
+    entries = "\n\n".join(
+        render_dependency_entry(records[item_id]) for item_id in (0, 1)
+    )
+    text, selected = dependency_context((2,), records, limit=len(entries))
+    assert text == entries
+    assert selected == (0, 1)
+    with pytest.raises(ContextOverflow):
+        dependency_context((2,), records, limit=len(entries) - 1)
+
+    rendered = render_prompt(PromptRenderInput(text, "TARGET"))
+    assert f"## Dependency Context\n\n{entries}" in rendered.text
+
+
+def test_existing_context_budget_and_prompt_goldens_use_final_presentation():
+    kind_records = {record.id: record for record in a3_kind_records()}
+    kind_context, _ = dependency_context((4,), kind_records)
+    collision_records = {record.id: record for record in a3_collision_records()}
+    collision_context, _ = dependency_context((2,), collision_records)
+    foreign_records = {record.id: record for record in a3_foreign_records()}
+    targets = render_transformation_targets((1,), foreign_records)
+
+    authored = "\n\n".join((kind_context, collision_context, targets))
+    headings = [line for line in authored.splitlines() if line.startswith("### ")]
+    assert headings
+    assert all(not any(char.isdigit() for char in heading) for heading in headings)
+    assert all("::" not in heading for heading in headings)
+    rendered = render_prompt(PromptRenderInput(kind_context, targets))
+    assert "## Dependency Context" in rendered.text
+    assert "## Transformation Targets" in rendered.text
+    assert "\nDependency Context:" not in rendered.text
+    assert "\nTransformation Targets:" not in rendered.text
 
 
 def test_initial_prompt_uses_versioned_template_and_empty_repair():
@@ -507,16 +968,20 @@ def test_repair_prompt_contains_only_latest_failure():
     assert "second bad code" in rendered.text and "first bad code" not in rendered.text
 
 
-def test_initial_prompt_matches_complete_normative_golden():
-    rendered = render_prompt(PromptRenderInput("DEPENDENCY\n", "TARGETS\n"))
+def test_version_1_prompt_has_exact_hierarchy_and_advisory():
+    kind_records = {record.id: record for record in a3_kind_records()}
+    dependency_entries, _ = dependency_context((4,), kind_records)
+    foreign_records = {record.id: record for record in a3_foreign_records()}
+    target_entries = render_transformation_targets((1,), foreign_records)
+    rendered = render_prompt(PromptRenderInput(dependency_entries, target_entries))
     plan = (Path(__file__).parents[2] / "prototype-plan.md").read_text()
     start = plan.index("The exact prompt body begins after that frontmatter:")
     start = plan.index("````text\n", start) + len("````text\n")
     end = plan.index("\n````\n\nFor a repair request", start)
     expected = (
         plan[start:end]
-        .replace("{{ dependency_context }}", "DEPENDENCY\n")
-        .replace("{{ transformation_targets }}", "TARGETS\n")
+        .replace("{{ dependency_context }}", dependency_entries)
+        .replace("{{ transformation_targets }}", target_entries)
         .replace("{{ repair_context }}", "")
     )
     boundary = "redefine its functions, types, statics, or constants.\n\nRequirements:"
@@ -530,8 +995,83 @@ def test_initial_prompt_matches_complete_normative_golden():
         "\n"
         "Requirements:",
     )
+    old_requirements = (
+        "10. Do not introduce an explicit `unsafe` block or a statement or expression\n"
+        "    attribute other than the required `#[proctor(N)]` labels.\n"
+        "11. Return exactly one Rust code block delimited by triple-backtick fences.\n"
+        "    Include all requested functions and no prose. Do not use tilde or\n"
+        "    longer-backtick fences."
+    )
+    new_requirements = (
+        "10. For each listed foreign-function reference, prefer a behavior-equivalent\n"
+        "    safe Rust function or method when one is available; otherwise preserve the\n"
+        "    foreign call.\n"
+        "11. Do not introduce an explicit `unsafe` block or a statement or expression\n"
+        "    attribute other than the required `#[proctor(N)]` labels.\n"
+        "12. Return exactly one Rust code block delimited by triple-backtick fences.\n"
+        "    Include all requested functions and no prose. Do not use tilde or\n"
+        "    longer-backtick fences."
+    )
+    expected = expected.replace(old_requirements, new_requirements)
+    expected = expected.replace(
+        f"Dependency Context:\n\n{dependency_entries}\n\n"
+        f"Transformation Targets:\n\n{target_entries}",
+        f"## Dependency Context\n\n{dependency_entries}\n\n"
+        f"## Transformation Targets\n\n{target_entries}",
+    )
     assert rendered.text == expected
     assert rendered.content_hash == hashlib.sha256(expected.encode()).hexdigest()
+    assert (
+        rendered.content_hash
+        == "c121eec81f2aaa7eb3955448c5eb6075780a97f5e2784ffae9a3df8b781ee174"
+    )
+    amendment_2 = (
+        "Complete every generated `todo!()` hole. Preserve every complete labeled "
+        "statement already present in the Target Skeleton exactly as provided."
+    )
+    advisory = (
+        "10. For each listed foreign-function reference, prefer a behavior-equivalent\n"
+        "    safe Rust function or method when one is available; otherwise preserve the\n"
+        "    foreign call."
+    )
+    assert rendered.text.count(amendment_2) == 1
+    assert rendered.text.count(advisory) == 1
+    assert "11. Do not introduce an explicit `unsafe` block" in rendered.text
+    assert "12. Return exactly one Rust code block" in rendered.text
+    assert (
+        f"## Dependency Context\n\n{dependency_entries}\n\n"
+        f"## Transformation Targets\n\n{target_entries}"
+    ) in rendered.text
+    assert all(
+        line.startswith(("## ", "### "))
+        for line in rendered.text.splitlines()
+        if line.startswith("##")
+    )
+
+
+def test_empty_dependency_section_is_omitted_and_repair_text_is_unchanged():
+    plain = {record.id: record for record in a3_plain_records()}
+    context, selected = dependency_context((0,), plain)
+    assert context == "" and selected == ()
+    targets = render_transformation_targets((0,), plain)
+    initial = render_prompt(PromptRenderInput(context, targets))
+    assert "## Transformation Targets" in initial.text
+    assert "## Dependency Context" not in initial.text
+    assert "\nDependency Context:" not in initial.text
+    assert "Foreign function references:" not in initial.text
+
+    failed = "unsafe fn scalar() { broken }"
+    diagnostics = (
+        '{"schema_version":1,"status":"invalid","failures":[{"id":0,'
+        '"name":"scalar","failed_snippet":"unsafe fn scalar() { broken }",'
+        '"errors":[{"code":"missing_label","message":"Function `scalar` '
+        '(item 0): label 0 is missing."}]}]}'
+    )
+    repaired = render_prompt(PromptRenderInput(context, targets, failed, diagnostics))
+    assert initial.text.rstrip() in repaired.text
+    assert repaired.text.count("## Transformation Targets") == 1
+    assert failed in repaired.text
+    assert diagnostics in repaired.text
 
 
 def test_single_fence_ignores_surrounding_prose_and_preserves_interior():
@@ -600,6 +1140,42 @@ def test_replacement_request_is_exact_and_member_ordered():
         "statements_requiring_transformation",
     ]
     assert set(request) == {"schema_version", "items", "transformation"}
+
+
+def test_foreign_metadata_does_not_change_graph_or_tool_requests():
+    records = a3_foreign_records()
+    records_by_id = {record.id: record for record in records}
+    assert function_graph(records) == {0: set(), 1: {0}, 2: set(), 3: {0}}
+
+    transformation = (
+        "pub unsafe fn release(mut pointer: *mut core::ffi::c_void) {\n"
+        "    #[proctor(0)]\n"
+        "    crate::free(pointer);\n"
+        "    #[proctor(1)]\n"
+        "    crate::free(pointer);\n"
+        "}"
+    )
+    validation = validation_request((2,), records_by_id, transformation)
+    replacement = replacement_request((2,), records_by_id, transformation)
+    assert validation["transformation"] == transformation
+    assert replacement["transformation"] == transformation
+    assert "foreign_function_names" not in validation["expected_functions"][0]
+    assert "foreign_function_names" not in replacement["items"][0]
+    assert list(validation["expected_functions"][0]) == [
+        "id",
+        "name",
+        "skeleton",
+        "needs_transformation",
+        "statements_requiring_transformation",
+    ]
+    assert list(replacement["items"][0]) == [
+        "id",
+        "path",
+        "name",
+        "skeleton",
+        "needs_transformation",
+        "statements_requiring_transformation",
+    ]
 
 
 def test_crat_tool_argv_is_exact_for_all_four_operations():
