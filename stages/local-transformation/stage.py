@@ -395,6 +395,36 @@ def _process_scc(
         )
         raise StageFailure(f"duplicate function names inside SCC: {detail}")
 
+    if not any(
+        records_by_id[item_id].needs_transformation is True for item_id in members
+    ):
+        transformation = "\n\n".join(
+            records_by_id[item_id].annotated_skeleton or ""
+            for item_id in sorted(members)
+        )
+        replacement_request_path = workdir / "replacement-request.json"
+        candidate = workdir / "candidate.rs"
+        write_json(
+            replacement_request_path,
+            replacement_request(members, records_by_id, transformation),
+        )
+        tools.replace(current, replacement_request_path, candidate)
+        state.metrics.cargo_builds += 1
+        build = install_candidate_transaction(
+            library_source,
+            candidate,
+            workdir / "rollback",
+            lambda: tools.cargo_build(current),
+        )
+        if build.returncode != 0:
+            state.metrics.compilation_failures += 1
+            raise StageFailure(
+                "mechanical SCC candidate cargo build failed "
+                f"({build.returncode})\nstdout:\n{build.stdout}"
+                f"\nstderr:\n{build.stderr}"
+            )
+        return
+
     context, _ = dependency_context(members, records_by_id, limit=CONTEXT_LIMIT)
     targets = render_transformation_targets(members, records_by_id)
     latest_failed: str | None = None

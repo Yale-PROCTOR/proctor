@@ -69,6 +69,10 @@ def validation_request(
                 "id": records_by_id[item_id].id,
                 "name": records_by_id[item_id].name,
                 "skeleton": records_by_id[item_id].annotated_skeleton,
+                "needs_transformation": records_by_id[item_id].needs_transformation,
+                "statements_requiring_transformation": list(
+                    records_by_id[item_id].statements_requiring_transformation
+                ),
             }
             for item_id in sorted(members)
         ],
@@ -88,6 +92,11 @@ def replacement_request(
                 "id": records_by_id[item_id].id,
                 "path": records_by_id[item_id].path,
                 "name": records_by_id[item_id].name,
+                "skeleton": records_by_id[item_id].annotated_skeleton,
+                "needs_transformation": records_by_id[item_id].needs_transformation,
+                "statements_requiring_transformation": list(
+                    records_by_id[item_id].statements_requiring_transformation
+                ),
             }
             for item_id in sorted(members)
         ],

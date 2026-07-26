@@ -65,7 +65,16 @@ def fn_record(
     name: str,
     dependencies: list[int],
     signature_dependencies: list[int] | None = None,
+    *,
+    needs_transformation: bool = True,
+    transformation_labels: list[int] | None = None,
 ) -> dict[str, object]:
+    labels = (
+        ([0] if needs_transformation else [])
+        if transformation_labels is None
+        else transformation_labels
+    )
+    body = "todo!()" if needs_transformation else "()"
     return {
         "id": item_id,
         "path": path,
@@ -73,10 +82,12 @@ def fn_record(
         "name": name,
         "annotated_source": (f"unsafe fn {name}() {{\n    #[proctor(0)]\n    ()\n}}"),
         "annotated_skeleton": (
-            f"unsafe fn {name}() {{\n    #[proctor(0)]\n    todo!()\n}}"
+            f"unsafe fn {name}() {{\n    #[proctor(0)]\n    {body}\n}}"
         ),
         "source_signature": f"unsafe fn {name}()",
         "target_signature": f"unsafe fn {name}()",
+        "needs_transformation": needs_transformation,
+        "statements_requiring_transformation": labels,
         "signature_dependencies": (
             [] if signature_dependencies is None else signature_dependencies
         ),
@@ -184,6 +195,44 @@ def test_top_level_and_kind_shapes_fail_clearly():
             load_skeletons(text)
     with pytest.raises(SkeletonError, match="missing required fields"):
         load_skeletons('[{"id":0,"path":"f","kind":"Fn","name":"f"}]')
+
+
+def test_amendment_2_loader_requires_and_preserves_function_disposition():
+    record = fn_record(
+        0,
+        "f",
+        "f",
+        [],
+        needs_transformation=True,
+        transformation_labels=[1, 3],
+    )
+    parsed = loaded([record])[0]
+    assert parsed.needs_transformation is True
+    assert parsed.statements_requiring_transformation == (1, 3)
+    for field in ("needs_transformation", "statements_requiring_transformation"):
+        malformed = copy.deepcopy(record)
+        del malformed[field]
+        with pytest.raises(SkeletonError, match="missing required fields"):
+            loaded([malformed])
+    for labels in ([3, 1], [1, 1], [-1], [2**32], [True]):
+        malformed = copy.deepcopy(record)
+        malformed["statements_requiring_transformation"] = labels
+        with pytest.raises(SkeletonError):
+            loaded([malformed])
+    for value in (0, 1, "true", None):
+        malformed = copy.deepcopy(record)
+        malformed["needs_transformation"] = value
+        with pytest.raises(SkeletonError):
+            loaded([malformed])
+    for value in (None, 1, "1,3", {"labels": [1, 3]}):
+        malformed = copy.deepcopy(record)
+        malformed["statements_requiring_transformation"] = value
+        with pytest.raises(SkeletonError):
+            loaded([malformed])
+    malformed = copy.deepcopy(record)
+    malformed["needs_transformation"] = False
+    with pytest.raises(SkeletonError, match="inconsistent"):
+        loaded([malformed])
 
 
 def test_ids_and_same_namespace_paths_are_valid_and_unique():
@@ -470,6 +519,17 @@ def test_initial_prompt_matches_complete_normative_golden():
         .replace("{{ transformation_targets }}", "TARGETS\n")
         .replace("{{ repair_context }}", "")
     )
+    boundary = "redefine its functions, types, statics, or constants.\n\nRequirements:"
+    expected = expected.replace(
+        boundary,
+        "redefine its functions, types, statics, or constants.\n"
+        "\n"
+        "Complete every generated `todo!()` hole. Preserve every complete "
+        "labeled statement already present in the Target Skeleton exactly as "
+        "provided.\n"
+        "\n"
+        "Requirements:",
+    )
     assert rendered.text == expected
     assert rendered.content_hash == hashlib.sha256(expected.encode()).hexdigest()
 
@@ -518,12 +578,27 @@ def test_missing_fence_is_repairable_with_raw_failed_text(text):
 def test_validation_request_is_exact_and_member_ordered():
     request = validation_request((3, 0), record_map(), "code")
     assert [value["id"] for value in request["expected_functions"]] == [0, 3]
+    assert list(request["expected_functions"][0]) == [
+        "id",
+        "name",
+        "skeleton",
+        "needs_transformation",
+        "statements_requiring_transformation",
+    ]
     assert request["transformation"] == "code"
 
 
 def test_replacement_request_is_exact_and_member_ordered():
     request = replacement_request((3, 0), record_map(), "code")
     assert [value["id"] for value in request["items"]] == [0, 3]
+    assert list(request["items"][0]) == [
+        "id",
+        "path",
+        "name",
+        "skeleton",
+        "needs_transformation",
+        "statements_requiring_transformation",
+    ]
     assert set(request) == {"schema_version", "items", "transformation"}
 
 
@@ -994,7 +1069,7 @@ def test_normalized_initial_build_failure_aborts_without_llm(tmp_path):
         builds=[CommandResult(101, "out", "err")],
     )
     client = FakeClient([])
-    _, output = run_fake(tmp_path, tools, client)
+    value, output = run_fake(tmp_path, tools, client)
     assert output.status == "failure" and not client.requests
 
 
@@ -1009,6 +1084,192 @@ def test_valid_initial_generation_validates_replaces_and_builds_once(tmp_path):
     assert output.status == "success"
     assert (value.outputs.rust_project / "lib.rs").read_text() == "candidate-one\n"
     assert output.metrics["cargo_builds"] == 2
+
+
+def test_amendment_2_all_preserved_singleton_skips_llm_and_validator(tmp_path):
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
+        builds=[CommandResult(0), CommandResult(0)],
+        candidates=["mechanical\n"],
+    )
+    client = FakeClient([])
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success"
+    assert client.requests == []
+    assert not [event for event in tools.events if event[0] == "validate"]
+    replacement = next(event for event in tools.events if event[0] == "replace")
+    assert replacement[2]["transformation"].endswith("#[proctor(0)]\n    ()\n}")
+    assert (value.outputs.rust_project / "lib.rs").read_text() == "mechanical\n"
+    assert output.metrics["llm_generation_calls"] == 0
+    assert output.metrics["cargo_builds"] == 2
+
+
+def test_amendment_2_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
+    tools = FakeTools(
+        skeletons=[
+            fn_record(0, "first", "first", [], needs_transformation=False),
+            fn_record(1, "second", "second", [0], needs_transformation=False),
+        ],
+        builds=[CommandResult(0), CommandResult(0), CommandResult(0)],
+        candidates=["first-candidate\n", "second-candidate\n"],
+    )
+    client = FakeClient([])
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success"
+    assert client.requests == []
+    assert len([event for event in tools.events if event[0] == "replace"]) == 2
+    assert output.metrics == {
+        "function_count": 2,
+        "scc_count": 2,
+        "llm_generation_calls": 0,
+        "repair_calls": 0,
+        "structural_failures": 0,
+        "compilation_failures": 0,
+        "cargo_builds": 3,
+    }
+
+
+def test_amendment_2_mixed_scc_still_uses_one_llm_request(tmp_path):
+    tools = FakeTools(
+        skeletons=[
+            fn_record(
+                0,
+                "preserved",
+                "preserved",
+                [1],
+                needs_transformation=False,
+            ),
+            fn_record(1, "changed", "changed", [0]),
+        ],
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[VALID],
+        candidates=[
+            "unsafe fn preserved() { () }\nunsafe fn changed() { transformed(); }\n"
+        ],
+    )
+    client = FakeClient(
+        [
+            "```rust\n"
+            "unsafe fn preserved() { #[proctor(0)] 999 }\n"
+            "unsafe fn changed() { #[proctor(0)] () }\n"
+            "```"
+        ]
+    )
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success"
+    assert len(client.requests) == 1
+    replacement = next(event for event in tools.events if event[0] == "replace")
+    items = replacement[2]["items"]
+    assert [item["needs_transformation"] for item in items] == [False, True]
+    emitted = (value.outputs.rust_project / "lib.rs").read_text()
+    assert "unsafe fn preserved() { () }" in emitted
+    assert "999" not in emitted
+    assert "transformed()" in emitted
+    assert output.metrics["llm_generation_calls"] == 1
+
+
+def test_amendment_2_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_path):
+    tools = FakeTools(
+        skeletons=[
+            fn_record(
+                0,
+                "scalar_leaf",
+                "scalar_leaf",
+                [],
+                needs_transformation=False,
+            ),
+            fn_record(1, "pointer_leaf", "pointer_leaf", []),
+            fn_record(2, "root", "root", [0, 1]),
+        ],
+        builds=[
+            CommandResult(0),
+            CommandResult(0),
+            CommandResult(0),
+            CommandResult(0),
+        ],
+        validators=[VALID, VALID],
+        candidates=["scalar\n", "pointer\n", "root\n"],
+    )
+    client = FakeClient([response("pointer_leaf"), response("root")])
+    _, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success"
+    replacements = [
+        event[2]["items"][0]["name"] for event in tools.events if event[0] == "replace"
+    ]
+    assert replacements == ["scalar_leaf", "pointer_leaf", "root"]
+    assert len(client.requests) == 2
+    assert "pointer_leaf" in client.requests[0].messages[0].content
+    assert "root" in client.requests[1].messages[0].content
+    assert output.metrics["cargo_builds"] == 4
+
+
+def test_amendment_2_mechanical_signature_change_runs_replacer_and_build(tmp_path):
+    record = fn_record(
+        0,
+        "unused_pointer",
+        "unused_pointer",
+        [],
+        needs_transformation=False,
+    )
+    record["annotated_skeleton"] = (
+        "unsafe fn unused_pointer(pointer: &mut i32, value: i32) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    value * 2\n"
+        "}"
+    )
+    record["target_signature"] = (
+        "unsafe fn unused_pointer(pointer: &mut i32, value: i32) -> i32"
+    )
+    tools = FakeTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(0)],
+        candidates=["implementation\ncompatibility-wrapper\n"],
+    )
+    client = FakeClient([])
+    _, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success"
+    replacement = next(event for event in tools.events if event[0] == "replace")
+    assert replacement[2]["transformation"] == record["annotated_skeleton"]
+    assert "&mut i32" in replacement[2]["items"][0]["skeleton"]
+    assert client.requests == []
+    assert output.metrics["cargo_builds"] == 2
+
+
+def test_amendment_2_mechanical_build_failure_is_fatal_without_repair(tmp_path):
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
+        builds=[CommandResult(0), CommandResult(101, "out", "bad")],
+        candidates=["broken\n"],
+    )
+    client = FakeClient([])
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "failure"
+    assert "mechanical SCC candidate cargo build failed" in output.error
+    assert client.requests == []
+    assert output.metrics["repair_calls"] == 0
+    assert output.metrics["compilation_failures"] == 1
+    assert (value.framework.workdir / "current/lib.rs").read_text() == "normalized\n"
+    assert not value.outputs.rust_project.exists()
+
+
+def test_amendment_2_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
+    class BrokenMechanicalReplacer(FakeTools):
+        def replace(self, current, request, candidate):
+            raise StageFailure("mechanical replacement rejected")
+
+    tools = BrokenMechanicalReplacer(
+        skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
+        builds=[CommandResult(0)],
+    )
+    client = FakeClient([])
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "failure"
+    assert "mechanical replacement rejected" in output.error
+    assert client.requests == []
+    assert output.metrics["repair_calls"] == 0
+    assert output.metrics["cargo_builds"] == 1
+    assert (value.framework.workdir / "current/lib.rs").read_text() == "normalized\n"
+    assert not value.outputs.rust_project.exists()
 
 
 def test_validator_invalid_consumes_one_repair_then_succeeds(tmp_path):

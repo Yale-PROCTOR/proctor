@@ -6,6 +6,7 @@ from itertools import pairwise
 from typing import Any
 
 U64_MAX = 2**64 - 1
+U32_MAX = 2**32 - 1
 VALUE_KINDS = frozenset({"Fn", "Static", "Const"})
 TYPE_KINDS = frozenset({"TyAlias", "Enum", "Struct", "Union"})
 ALL_KINDS = VALUE_KINDS | TYPE_KINDS
@@ -31,6 +32,8 @@ class ItemRecord:
     annotated_skeleton: str | None = None
     source_signature: str | None = None
     target_signature: str | None = None
+    needs_transformation: bool | None = None
+    statements_requiring_transformation: tuple[int, ...] = ()
     declaration: str | None = None
     definition: str | None = None
 
@@ -45,6 +48,23 @@ def _integer(value: Any, where: str) -> int:
     if not 0 <= value <= U64_MAX:
         raise SkeletonError(f"{where} must be in the u64 range")
     return value
+
+
+def _u32_labels(value: Any, where: str) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise SkeletonError(f"{where} must be an array")
+    result: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise SkeletonError(f"{where} entries must be integers")
+        if not 0 <= item <= U32_MAX:
+            raise SkeletonError(f"{where} entries must be in the u32 range")
+        result.append(item)
+    for previous, current in pairwise(result):
+        if current <= previous:
+            detail = "duplicate" if current == previous else "out-of-order"
+            raise SkeletonError(f"{where} has {detail} label {current}")
+    return tuple(result)
 
 
 def _string(data: dict[str, Any], key: str, record_id: int) -> str:
@@ -87,6 +107,8 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             "annotated_skeleton",
             "source_signature",
             "target_signature",
+            "needs_transformation",
+            "statements_requiring_transformation",
             "signature_dependencies",
             "dependencies",
         )
@@ -99,6 +121,19 @@ def _load_record(data: Any, index: int) -> ItemRecord:
         signature_dependencies = _dependencies(
             data, "signature_dependencies", record_id
         )
+        needs_transformation = data["needs_transformation"]
+        if not isinstance(needs_transformation, bool):
+            raise SkeletonError(
+                f"record {record_id} field 'needs_transformation' must be a Boolean"
+            )
+        statements_requiring_transformation = _u32_labels(
+            data["statements_requiring_transformation"],
+            f"record {record_id} field 'statements_requiring_transformation'",
+        )
+        if needs_transformation != bool(statements_requiring_transformation):
+            raise SkeletonError(
+                f"record {record_id} preservation Boolean and label array are inconsistent"
+            )
         return ItemRecord(
             id=record_id,
             path=path,
@@ -108,6 +143,8 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             annotated_skeleton=_string(data, "annotated_skeleton", record_id),
             source_signature=_string(data, "source_signature", record_id),
             target_signature=_string(data, "target_signature", record_id),
+            needs_transformation=needs_transformation,
+            statements_requiring_transformation=statements_requiring_transformation,
             signature_dependencies=signature_dependencies,
             dependencies=dependencies,
         )

@@ -15,6 +15,8 @@ Implement every function in Transformation Targets exactly once. Emit no
 other top-level item. Use Dependency Context only as reference; do not emit or
 redefine its functions, types, statics, or constants.
 
+Complete every generated `todo!()` hole. Preserve every complete labeled statement already present in the Target Skeleton exactly as provided.
+
 Requirements:
 
 1. Exactly preserve source behavior wherever it is defined, including apparent
