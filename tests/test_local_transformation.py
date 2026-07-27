@@ -57,6 +57,9 @@ from tooling import (
 from proctor.usage.tracker import read_usage
 
 STAGE_DIR = Path(__file__).parents[1] / "stages" / "local-transformation"
+PROMPT_GOLDEN = (
+    Path(__file__).parent / "fixtures" / "local_transformation_prompt_golden.md"
+)
 
 
 def fn_record(
@@ -175,11 +178,11 @@ CONTEXT_RECORDS = [
     type_record(29, "E", "Enum", "enum E { A }", []),
 ]
 
-A3_SRC_PLAIN = """pub unsafe fn scalar(value: i32) -> i32 {
+SCALAR_SOURCE = """pub unsafe fn scalar(value: i32) -> i32 {
     value + 1
 }"""
 
-A3_SRC_FOREIGN = """#![feature(extern_types)]
+FOREIGN_FUNCTION_SOURCE = """#![feature(extern_types)]
 
 unsafe extern "C" {
     fn strlen(text: *const core::ffi::c_char) -> usize;
@@ -220,7 +223,7 @@ pub mod parser {
     }
 }"""
 
-A3_SRC_KINDS = """pub struct Point {
+ITEM_KIND_SOURCE = """pub struct Point {
     pub value: i32,
 }
 
@@ -235,7 +238,7 @@ pub unsafe fn target(point: Point) -> i32 {
     helper(point) + LIMIT + STEP
 }"""
 
-A3_SRC_COLLISION = """pub mod outer {
+DUPLICATE_NAME_SOURCE = """pub mod outer {
     pub mod left {
         pub unsafe fn parse(value: i32) -> i32 {
             value + 1
@@ -254,8 +257,8 @@ pub unsafe fn target(value: i32) -> i32 {
 }"""
 
 
-def a3_plain_records():
-    assert A3_SRC_PLAIN.endswith("}")
+def scalar_records():
+    assert SCALAR_SOURCE.endswith("}")
     record = fn_record(0, "scalar", "scalar", [], needs_transformation=False)
     record["annotated_source"] = (
         "pub unsafe fn scalar(mut value: i32) -> i32 {\n"
@@ -269,8 +272,8 @@ def a3_plain_records():
     return loaded([record])
 
 
-def a3_foreign_records():
-    assert "use strlen as c_strlen;" in A3_SRC_FOREIGN
+def foreign_function_records():
+    assert "use strlen as c_strlen;" in FOREIGN_FUNCTION_SOURCE
     local_abi = fn_record(
         0,
         "local_abi",
@@ -393,8 +396,8 @@ def a3_foreign_records():
     return loaded([local_abi, scan, release, scalar])
 
 
-def a3_kind_records():
-    assert "pub struct Point" in A3_SRC_KINDS
+def item_kind_records():
+    assert "pub struct Point" in ITEM_KIND_SOURCE
     helper = fn_record(3, "helper", "helper", [0], [0], needs_transformation=False)
     helper["annotated_source"] = (
         "pub unsafe fn helper(mut point: Point) -> i32 {\n"
@@ -439,8 +442,8 @@ def a3_kind_records():
     )
 
 
-def a3_collision_records():
-    assert "outer::left::parse" in A3_SRC_COLLISION
+def duplicate_name_records():
+    assert "outer::left::parse" in DUPLICATE_NAME_SOURCE
     left = fn_record(
         0,
         "outer::left::parse",
@@ -508,7 +511,7 @@ def test_top_level_and_kind_shapes_fail_clearly():
         load_skeletons('[{"id":0,"path":"f","kind":"Fn","name":"f"}]')
 
 
-def test_amendment_2_loader_requires_and_preserves_function_disposition():
+def test_loader_requires_and_preserves_function_disposition():
     record = fn_record(
         0,
         "f",
@@ -564,12 +567,12 @@ def test_existing_function_records_and_helpers_adopt_the_final_shape():
         "dependencies",
     ]
     assert plain["foreign_function_names"] == []
-    assert a3_plain_records()[0].foreign_function_names == ()
-    assert a3_foreign_records()[1].foreign_function_names == ("free", "strlen")
+    assert scalar_records()[0].foreign_function_names == ()
+    assert foreign_function_records()[1].foreign_function_names == ("free", "strlen")
 
     point = type_record(1, "Point", "Struct", "struct Point;", [])
     assert "foreign_function_names" not in point
-    assert a3_kind_records()[0].foreign_function_names == ()
+    assert item_kind_records()[0].foreign_function_names == ()
 
 
 def test_loader_requires_sorted_unique_nonempty_foreign_names():
@@ -864,7 +867,7 @@ def test_transformation_targets_render_in_member_id_order():
 
 
 def test_targets_use_final_names_and_omit_empty_foreign_line():
-    records = {record.id: record for record in a3_foreign_records()}
+    records = {record.id: record for record in foreign_function_records()}
     text = render_transformation_targets((3, 2, 1), records)
     entries = text.split("\n\n### Function ")
     entries = [entries[0], *(f"### Function {entry}" for entry in entries[1:])]
@@ -890,7 +893,7 @@ def test_targets_use_final_names_and_omit_empty_foreign_line():
 
 
 def test_noncolliding_dependencies_use_kind_and_final_name():
-    records = {record.id: record for record in a3_kind_records()}
+    records = {record.id: record for record in item_kind_records()}
     text, selected = dependency_context((4,), records)
     assert selected == (0, 1, 2, 3)
     headings = [line for line in text.splitlines() if line.startswith("### ")]
@@ -905,7 +908,7 @@ def test_noncolliding_dependencies_use_kind_and_final_name():
 
 
 def test_duplicate_dependency_names_remain_name_only():
-    records = {record.id: record for record in a3_collision_records()}
+    records = {record.id: record for record in duplicate_name_records()}
     text, selected = dependency_context((2,), records)
     assert selected == (0, 1)
     assert text.count("### Function `parse`") == 2
@@ -919,7 +922,7 @@ def test_duplicate_dependency_names_remain_name_only():
 
 
 def test_budget_counts_final_name_only_entries_not_section_heading():
-    records = {record.id: record for record in a3_collision_records()}
+    records = {record.id: record for record in duplicate_name_records()}
     entries = "\n\n".join(
         render_dependency_entry(records[item_id]) for item_id in (0, 1)
     )
@@ -934,11 +937,11 @@ def test_budget_counts_final_name_only_entries_not_section_heading():
 
 
 def test_existing_context_budget_and_prompt_goldens_use_final_presentation():
-    kind_records = {record.id: record for record in a3_kind_records()}
+    kind_records = {record.id: record for record in item_kind_records()}
     kind_context, _ = dependency_context((4,), kind_records)
-    collision_records = {record.id: record for record in a3_collision_records()}
+    collision_records = {record.id: record for record in duplicate_name_records()}
     collision_context, _ = dependency_context((2,), collision_records)
-    foreign_records = {record.id: record for record in a3_foreign_records()}
+    foreign_records = {record.id: record for record in foreign_function_records()}
     targets = render_transformation_targets((1,), foreign_records)
 
     authored = "\n\n".join((kind_context, collision_context, targets))
@@ -955,7 +958,7 @@ def test_existing_context_budget_and_prompt_goldens_use_final_presentation():
 
 def test_initial_prompt_uses_versioned_template_and_empty_repair():
     rendered = render_prompt(PromptRenderInput("DEPENDENCY\n", "TARGETS\n"))
-    request = llm_request(rendered, run_id="phase4-run", members=(3, 0))
+    request = llm_request(rendered, run_id="local-transformation-run", members=(3, 0))
     assert rendered.id == "local_transformation" and rendered.version == 1
     assert "The previous transformation failed." not in rendered.text
     assert request.metadata.item == "0,3"
@@ -969,55 +972,15 @@ def test_repair_prompt_contains_only_latest_failure():
 
 
 def test_version_1_prompt_has_exact_hierarchy_and_advisory():
-    kind_records = {record.id: record for record in a3_kind_records()}
+    kind_records = {record.id: record for record in item_kind_records()}
     dependency_entries, _ = dependency_context((4,), kind_records)
-    foreign_records = {record.id: record for record in a3_foreign_records()}
+    foreign_records = {record.id: record for record in foreign_function_records()}
     target_entries = render_transformation_targets((1,), foreign_records)
     rendered = render_prompt(PromptRenderInput(dependency_entries, target_entries))
-    plan = (Path(__file__).parents[2] / "prototype-plan.md").read_text()
-    start = plan.index("The exact prompt body begins after that frontmatter:")
-    start = plan.index("````text\n", start) + len("````text\n")
-    end = plan.index("\n````\n\nFor a repair request", start)
     expected = (
-        plan[start:end]
+        PROMPT_GOLDEN.read_text()
         .replace("{{ dependency_context }}", dependency_entries)
         .replace("{{ transformation_targets }}", target_entries)
-        .replace("{{ repair_context }}", "")
-    )
-    boundary = "redefine its functions, types, statics, or constants.\n\nRequirements:"
-    expected = expected.replace(
-        boundary,
-        "redefine its functions, types, statics, or constants.\n"
-        "\n"
-        "Complete every generated `todo!()` hole. Preserve every complete "
-        "labeled statement already present in the Target Skeleton exactly as "
-        "provided.\n"
-        "\n"
-        "Requirements:",
-    )
-    old_requirements = (
-        "10. Do not introduce an explicit `unsafe` block or a statement or expression\n"
-        "    attribute other than the required `#[proctor(N)]` labels.\n"
-        "11. Return exactly one Rust code block delimited by triple-backtick fences.\n"
-        "    Include all requested functions and no prose. Do not use tilde or\n"
-        "    longer-backtick fences."
-    )
-    new_requirements = (
-        "10. For each listed foreign-function reference, prefer a behavior-equivalent\n"
-        "    safe Rust function or method when one is available; otherwise preserve the\n"
-        "    foreign call.\n"
-        "11. Do not introduce an explicit `unsafe` block or a statement or expression\n"
-        "    attribute other than the required `#[proctor(N)]` labels.\n"
-        "12. Return exactly one Rust code block delimited by triple-backtick fences.\n"
-        "    Include all requested functions and no prose. Do not use tilde or\n"
-        "    longer-backtick fences."
-    )
-    expected = expected.replace(old_requirements, new_requirements)
-    expected = expected.replace(
-        f"Dependency Context:\n\n{dependency_entries}\n\n"
-        f"Transformation Targets:\n\n{target_entries}",
-        f"## Dependency Context\n\n{dependency_entries}\n\n"
-        f"## Transformation Targets\n\n{target_entries}",
     )
     assert rendered.text == expected
     assert rendered.content_hash == hashlib.sha256(expected.encode()).hexdigest()
@@ -1025,7 +988,7 @@ def test_version_1_prompt_has_exact_hierarchy_and_advisory():
         rendered.content_hash
         == "c121eec81f2aaa7eb3955448c5eb6075780a97f5e2784ffae9a3df8b781ee174"
     )
-    amendment_2 = (
+    preservation_instruction = (
         "Complete every generated `todo!()` hole. Preserve every complete labeled "
         "statement already present in the Target Skeleton exactly as provided."
     )
@@ -1034,7 +997,7 @@ def test_version_1_prompt_has_exact_hierarchy_and_advisory():
         "    safe Rust function or method when one is available; otherwise preserve the\n"
         "    foreign call."
     )
-    assert rendered.text.count(amendment_2) == 1
+    assert rendered.text.count(preservation_instruction) == 1
     assert rendered.text.count(advisory) == 1
     assert "11. Do not introduce an explicit `unsafe` block" in rendered.text
     assert "12. Return exactly one Rust code block" in rendered.text
@@ -1050,7 +1013,7 @@ def test_version_1_prompt_has_exact_hierarchy_and_advisory():
 
 
 def test_empty_dependency_section_is_omitted_and_repair_text_is_unchanged():
-    plain = {record.id: record for record in a3_plain_records()}
+    plain = {record.id: record for record in scalar_records()}
     context, selected = dependency_context((0,), plain)
     assert context == "" and selected == ()
     targets = render_transformation_targets((0,), plain)
@@ -1143,7 +1106,7 @@ def test_replacement_request_is_exact_and_member_ordered():
 
 
 def test_foreign_metadata_does_not_change_graph_or_tool_requests():
-    records = a3_foreign_records()
+    records = foreign_function_records()
     records_by_id = {record.id: record for record in records}
     assert function_graph(records) == {0: set(), 1: {0}, 2: set(), 3: {0}}
 
@@ -1315,7 +1278,7 @@ class FakeClient:
             text=value,
             finish_reason="stop",
             provider="replay",
-            model="phase4-test",
+            model="fixture-model",
             latency_s=0.25,
             usage=Usage(100, 20, 30, 4),
         )
@@ -1339,7 +1302,7 @@ def stage_input(tmp_path, *, artifacts=True, config=None, llm=None):
     if artifact_dir:
         artifact_dir.mkdir()
     return StageInput(
-        run_id="phase4-run",
+        run_id="local-transformation-run",
         stage_id="local_transformation",
         stage_index=0,
         inputs=InputArtifacts(rust_project=source),
@@ -1351,9 +1314,9 @@ def stage_input(tmp_path, *, artifacts=True, config=None, llm=None):
             llm=llm
             or {
                 "provider": "replay",
-                "model": "phase4-test",
+                "model": "fixture-model",
                 "pricing": {
-                    "replay/phase4-test": {
+                    "replay/fixture-model": {
                         "input": 0,
                         "cached_input": 0,
                         "output": 0,
@@ -1422,7 +1385,7 @@ def test_nonzero_build_preparation_or_crat_tool_exit_is_fatal(
         operation = _classify_tool_command(command, cwd)
         events.append(operation)
         if operation == "git revision":
-            return CommandResult(0, "phase4-sha\n")
+            return CommandResult(0, "fixture-revision\n")
         if operation == failed_operation:
             return CommandResult(7, "partial stdout\n", "tool failed\n")
         if operation == "release cargo build --bin crat":
@@ -1662,7 +1625,7 @@ def test_valid_initial_generation_validates_replaces_and_builds_once(tmp_path):
     assert output.metrics["cargo_builds"] == 2
 
 
-def test_amendment_2_all_preserved_singleton_skips_llm_and_validator(tmp_path):
+def test_all_preserved_singleton_skips_llm_and_validator(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
         builds=[CommandResult(0), CommandResult(0)],
@@ -1680,7 +1643,7 @@ def test_amendment_2_all_preserved_singleton_skips_llm_and_validator(tmp_path):
     assert output.metrics["cargo_builds"] == 2
 
 
-def test_amendment_2_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
+def test_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
     tools = FakeTools(
         skeletons=[
             fn_record(0, "first", "first", [], needs_transformation=False),
@@ -1705,7 +1668,7 @@ def test_amendment_2_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
     }
 
 
-def test_amendment_2_mixed_scc_still_uses_one_llm_request(tmp_path):
+def test_mixed_scc_still_uses_one_llm_request(tmp_path):
     tools = FakeTools(
         skeletons=[
             fn_record(
@@ -1744,7 +1707,7 @@ def test_amendment_2_mixed_scc_still_uses_one_llm_request(tmp_path):
     assert output.metrics["llm_generation_calls"] == 1
 
 
-def test_amendment_2_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_path):
+def test_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_path):
     tools = FakeTools(
         skeletons=[
             fn_record(
@@ -1779,7 +1742,7 @@ def test_amendment_2_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_pa
     assert output.metrics["cargo_builds"] == 4
 
 
-def test_amendment_2_mechanical_signature_change_runs_replacer_and_build(tmp_path):
+def test_mechanical_signature_change_runs_replacer_and_build(tmp_path):
     record = fn_record(
         0,
         "unused_pointer",
@@ -1811,7 +1774,7 @@ def test_amendment_2_mechanical_signature_change_runs_replacer_and_build(tmp_pat
     assert output.metrics["cargo_builds"] == 2
 
 
-def test_amendment_2_mechanical_build_failure_is_fatal_without_repair(tmp_path):
+def test_mechanical_build_failure_is_fatal_without_repair(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
         builds=[CommandResult(0), CommandResult(101, "out", "bad")],
@@ -1828,7 +1791,7 @@ def test_amendment_2_mechanical_build_failure_is_fatal_without_repair(tmp_path):
     assert not value.outputs.rust_project.exists()
 
 
-def test_amendment_2_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
+def test_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
     class BrokenMechanicalReplacer(FakeTools):
         def replace(self, current, request, candidate):
             raise StageFailure("mechanical replacement rejected")
@@ -1972,7 +1935,7 @@ def test_context_overflow_is_forced_to_error_and_aborts(tmp_path):
     tools = FakeTools(skeletons=[fn_record(0, "target", "target", [])])
     llm = {
         "provider": "replay",
-        "model": "phase4-test",
+        "model": "fixture-model",
         "context_overflow": "truncate_middle",
         "max_retries": 5,
     }
@@ -2000,7 +1963,7 @@ def test_context_overflow_is_forced_to_error_and_aborts(tmp_path):
     assert seen["context_overflow"] == "error"
     assert value.framework.llm == llm
     assert output.models[0].provider == "replay"
-    assert output.models[0].model == "phase4-test"
+    assert output.models[0].model == "fixture-model"
     assert output.prompts[0].id == "local_transformation"
     assert output.prompts[0].version == 1
     assert output.usage.calls == 1
@@ -2017,7 +1980,7 @@ def test_context_overflow_is_forced_to_error_and_aborts(tmp_path):
         value.framework.usage_log or value.framework.workdir / "usage.jsonl"
     )
     assert usage[0]["provider"] == "replay"
-    assert usage[0]["model"] == "phase4-test"
+    assert usage[0]["model"] == "fixture-model"
     assert usage[0]["error"] == "ContextLimitExceeded: too long"
 
 
@@ -2206,9 +2169,9 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
     artifacts = case != "no_artifacts"
     llm = {
         "provider": "replay",
-        "model": "phase4-test",
+        "model": "fixture-model",
         "pricing": {
-            "replay/phase4-test": {
+            "replay/fixture-model": {
                 "input": 0,
                 "cached_input": 0,
                 "output": 0,
@@ -2240,7 +2203,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
     assert output.outputs.rust_project == value.outputs.rust_project
     assert output.outputs.rule_set is None
     assert [(model.provider, model.model) for model in output.models] == [
-        ("replay", "phase4-test")
+        ("replay", "fixture-model")
     ]
     assert output.usage.calls == 1
     assert output.usage.input_tokens == 100
@@ -2351,7 +2314,7 @@ def test_provider_retry_success_counts_attempts_but_one_generation(tmp_path):
                     response(),
                     "stop",
                     "replay",
-                    "phase4-test",
+                    "fixture-model",
                     0.25,
                     Usage(100, 20, 30, 4),
                 ),
@@ -2448,7 +2411,7 @@ def test_build_only_warms_both_crat_binaries_without_stage_io(
     def runner(command, *, cwd=None, env=None):
         operation = _classify_tool_command(command, cwd)
         if operation == "git revision":
-            return CommandResult(0, "phase4-sha\n")
+            return CommandResult(0, "fixture-revision\n")
         cargo_calls.append((command, cwd))
         if operation == failed_target:
             return CommandResult(7, "partial stdout\n", "tool failed\n")
