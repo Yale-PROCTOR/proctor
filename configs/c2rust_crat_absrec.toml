@@ -1,0 +1,49 @@
+# Full component pipeline: C source -> c2rust -> CRAT -> abstraction
+# recovery (LLM, Claude Code). Demonstrates per-stage vector testing on a
+# library case. Run locally (the abstraction_recovery stage shells out to
+# the `claude` CLI, which needs ANTHROPIC_API_KEY in the environment).
+#
+#   export CPATH=$(gcc -print-file-name=include)        # c2rust builtin hdrs
+#   export Z3_SYS_Z3_HEADER=~/.cache/proctor/z3/include/z3.h  # crat build
+#   ... (see tests/e2e/README.md for the full crat build env)
+#   uv run proctor run -c configs/c2rust_crat_absrec.toml \
+#     --input-c tractor-test-corpus/Test-Corpus/Public-Tests/B02_organic/arr_del_lib
+
+[run]
+provides = ["c_project"]
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = ["c2rust", "crat", "abstraction_recovery"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 900
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.abstraction_recovery]
+uses = "stages/abstraction-recovery"
+timeout_s = 2400
+
+[stages.abstraction_recovery.config]
+max_candidates = 1
+max_repair_iterations = 3
+on_give_up = "skip"
