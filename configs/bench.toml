@@ -1,10 +1,10 @@
-# Run c2rust -> crat across the whole B01_synthetic corpus directory.
-# One run dir per case; a case succeeds if both stages complete (this
-# branch has no vector gating, so "ok" means translation COMPLETED, not
-# verified correct).
+# Corpus-scale bench WITHOUT vector verification: c2rust -> crat over a
+# corpus suite, one run dir per case. A case is "ok" when both stages
+# COMPLETE (translation succeeded) — not verified correct. For vector
+# gating use configs/bench_vectors.toml (or ./bench.sh <suite>).
 #
-#   uv run proctor bench -c configs/b01_bench.toml \
-#     --corpus tractor-test-corpus/Test-Corpus/Public-Tests/B01_synthetic --jobs 16
+#   uv run proctor bench -c configs/bench.toml \
+#     --corpus tractor-test-corpus/Test-Corpus/Public-Tests/B02_organic --jobs 16
 
 [run]
 provides = ["c_project"]

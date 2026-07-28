@@ -166,7 +166,12 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     config = _load_pipeline_config(args)
     name = args.name or Path(args.config[0]).stem
     result = run_bench(
-        config, args.root, args.corpus.resolve(), name=name, jobs=args.jobs
+        config,
+        args.root,
+        args.corpus.resolve(),
+        name=name,
+        jobs=args.jobs,
+        match=args.match,
     )
     ok_count = 0
     for o in result.outcomes:
@@ -187,16 +192,28 @@ def _cmd_bench(args: argparse.Namespace) -> int:
 
 
 def _fmt_vectors(o: BenchOutcome) -> str:
-    """Compact per-case vector summary for the bench line, e.g.
-    '  vectors 3/3 (crat)'. Empty when vectors weren't verified."""
+    """Per-case vector summary for the bench line. One verified stage:
+    ``vectors 3/3 (crat)``. Multiple (verify_all_stages): per stage,
+    ``vectors [c2rust 0/8, crat 8/8]``. Empty when not verified."""
     if o.vectors is None or not o.vectors.stages:
         return ""
-    last = o.vectors.stages[-1]
-    if last.report is None:
-        return f"  vectors ERROR ({last.stage_id}: {last.error})"
-    r = last.report
-    tail = "" if r.build_ok else " build-fail"
-    return f"  vectors {r.passed}/{r.total} ({last.stage_id}){tail}"
+    stages = o.vectors.stages
+    if len(stages) == 1:
+        sv = stages[0]
+        if sv.report is None:
+            return f"  vectors ERROR ({sv.stage_id}: {sv.error})"
+        r = sv.report
+        tail = "" if r.build_ok else " build-fail"
+        return f"  vectors {r.passed}/{r.total} ({sv.stage_id}){tail}"
+    parts = []
+    for sv in stages:
+        if sv.report is None:
+            parts.append(f"{sv.stage_id} ERR")
+        else:
+            r = sv.report
+            bf = "" if r.build_ok else " build-fail"
+            parts.append(f"{sv.stage_id} {r.passed}/{r.total}{bf}")
+    return "  vectors [" + ", ".join(parts) + "]"
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
@@ -324,6 +341,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_args(bench)
     bench.add_argument("--corpus", type=Path, required=True)
     bench.add_argument("--jobs", type=int, default=None, help="parallel cases")
+    bench.add_argument(
+        "--match",
+        default=None,
+        metavar="REGEX",
+        help="only run cases whose name matches this regex (e.g. one case)",
+    )
     bench.add_argument("--name", help="bench name (default: config file stem)")
     bench.set_defaults(func=_cmd_bench)
 

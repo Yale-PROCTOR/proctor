@@ -15,6 +15,7 @@ the chained/merge policies later.
 from __future__ import annotations
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -168,12 +169,20 @@ def run_bench(
     *,
     name: str,
     jobs: int | None = None,
+    match: str | None = None,
 ) -> BenchResult:
     settings = BenchSettings.from_config(config.raw)
     cases = discover_cases(corpus, config.run.provides, settings.layout)
+    if match is not None:
+        try:
+            pattern = re.compile(match)
+        except re.error as exc:
+            raise RunError(f"invalid --match regex {match!r}: {exc}") from exc
+        cases = [c for c in cases if pattern.search(c.name)]
     if not cases:
+        suffix = f" matching {match!r}" if match else ""
         raise RunError(
-            f"no cases found under {corpus} for provides="
+            f"no cases found under {corpus}{suffix} for provides="
             f"{list(config.run.provides)} with layout {settings.layout}"
         )
 

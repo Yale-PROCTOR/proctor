@@ -1,5 +1,5 @@
 id = "c2rust"
-version = "0.1.1"
+version = "0.2.0"
 description = "C2Rust transpilation of a TRACTOR C project directory or tar archive (translation component, first half)."
 
 exec = ["python3", "main.py"]

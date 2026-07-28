@@ -6,11 +6,11 @@
 # Needs read access to the DARPA-TRACTOR-Program repos (your git/gh
 # credentials are used). Run from anywhere:
 #
-#   tools/fetch_corpus.sh                 # Test-Corpus (needed for testing)
-#   tools/fetch_corpus.sh --with-aws      # also aws-translate (packaging)
+#   ./fetch_corpus.sh                 # Test-Corpus (needed for testing)
+#   ./fetch_corpus.sh --with-aws      # also aws-translate (packaging)
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # repo -> pinned commit. Test-Corpus @ 0319ab0 is the direct-harness era
 # that matches tools/tractor_runtests (see its PROVENANCE.md).

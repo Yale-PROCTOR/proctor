@@ -176,3 +176,10 @@ the newer harness. (File-change vectors stay the separate Falco-only gap.)
 `vector_harness.py` gains a second engine that drives the newer
 `tools/test_runner` (with `--no-falco`) instead of `runtests.rust` — same
 corpus-staging and JUnit-parsing.
+
+Once that newer harness is up and running (and it matches the corpus pin
+anyway), the vendored **`tools/tractor_runtests`** copy can be **removed**:
+it exists only to give us the Falco-free direct harness independent of
+the corpus. At that point vector verification drives the corpus's own
+`tools/test_runner` (`--no-falco`), so the duplicated runner is no longer
+needed. See `tools/tractor_runtests/PROVENANCE.md`.

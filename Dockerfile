@@ -14,7 +14,7 @@
 #     -v "$PWD/tractor-test-corpus/Test-Corpus/Public-Tests/B01_synthetic:/corpus:ro" \
 #     -v "$PWD/out:/out" \
 #     proctor-framework:dev \
-#     bench -c configs/b01_bench.toml --corpus /corpus \
+#     bench -c configs/bench.toml --corpus /corpus \
 #     --set run.output_dir=/out --jobs 16
 #
 # Single translation:

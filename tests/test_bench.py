@@ -121,3 +121,15 @@ def test_bench_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert code == 0
     assert "1/1 cases ok" in out
+
+
+def test_bench_match_filters_to_one_case(tmp_path: Path) -> None:
+    corpus = _corpus(tmp_path, {"keep": False, "drop": False})
+    result = run_bench(_config(), tmp_path, corpus, name="t", match="keep")
+    assert [o.case.name for o in result.outcomes] == ["keep"]
+
+
+def test_bench_match_no_cases_errors(tmp_path: Path) -> None:
+    corpus = _corpus(tmp_path, {"a": False})
+    with pytest.raises(RunError, match="matching"):
+        run_bench(_config(), tmp_path, corpus, name="t", match="nope")

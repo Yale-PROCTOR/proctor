@@ -164,3 +164,25 @@ def test_bench_records_vector_results(
     assert case["vectors"][0]["passed"] == 3
     assert case["vectors"][0]["total"] == 3
     assert case["vectors"][0]["build_ok"] is True
+
+
+def test_fmt_vectors_single_vs_per_stage() -> None:
+    from proctor.cli import _fmt_vectors
+    from proctor.orchestrator.bench import BenchCase, BenchOutcome
+    from proctor.testing.vector_harness import StageVectorResult, VectorComparison
+
+    def outcome(*stages: tuple[str, int]) -> BenchOutcome:
+        comp = VectorComparison(case="x")
+        for sid, passed in stages:
+            comp.stages.append(StageVectorResult(sid, _report("x", passed=passed)))
+        return BenchOutcome(
+            case=BenchCase(name="x", inputs={}), run=RuntimeError("n/a"), vectors=comp
+        )
+
+    # one verified stage -> compact form
+    assert _fmt_vectors(outcome(("crat", 3))) == "  vectors 3/3 (crat)"
+    # multiple stages (verify_all_stages) -> per-stage list
+    assert (
+        _fmt_vectors(outcome(("c2rust", 0), ("crat", 3)))
+        == "  vectors [c2rust 0/0, crat 3/3]"
+    )

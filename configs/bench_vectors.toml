@@ -1,0 +1,60 @@
+# Corpus-scale bench: c2rust -> crat over a corpus suite, then verify each
+# case's translated Rust against TRACTOR's authoritative test vectors (the
+# vendored runtests.rust harness). Suite-agnostic — used for any
+# Public-Tests/<suite>. Runs IN THE CONTAINER (c2rust/crat build in the
+# image; the harness needs cargo/cmake/ninja, which it also ships).
+#
+#   ./bench.sh B02_organic          # one-command wrapper (recommended)
+#
+# or manually — mount the FULL Test-Corpus (library cases need the
+# workspace root's tools/cando2) and point --corpus at the suite:
+#
+#   docker run --rm \
+#     -v "$PWD/tractor-test-corpus/Test-Corpus:/corpus:ro" -v "$PWD/out:/out" \
+#     proctor-framework:dev bench -c configs/bench_vectors.toml \
+#     --corpus /corpus/Public-Tests/B02_organic \
+#     --set run.output_dir=/out --jobs 16
+#
+# bench.json records per-case `vectors_ok`; with verify_all_stages it also
+# records per-stage vector counts — the c2rust -> crat correctness delta
+# (c2rust's output is a library crate with no runnable `driver`; the
+# runnable binary appears at crat's `bin` pass).
+
+[run]
+provides = ["c_project"]
+
+[testing]
+after_each_stage = false
+
+[bench]
+jobs = 16
+verify_vectors = true
+verify_all_stages = true
+
+[bench.layout]
+c_project = "."   # a corpus case root IS the C project (test_case/ inside);
+                  # test_vectors/ sits alongside it, so the harness finds them
+
+[pipeline]
+order = ["c2rust", "crat"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 600
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]

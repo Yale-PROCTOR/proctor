@@ -8,7 +8,7 @@ the ``_001_helloworld_lib_runner`` and runs it against the state vector.
 
 Opt-in (``pytest -m e2e``): needs cargo/rustup and the TRACTOR test
 corpus at the direct-harness era (0319ab0) — fetch it with
-``tools/fetch_corpus.sh``. First run builds cando2 + the runner (tens of
+``./fetch_corpus.sh``. First run builds cando2 + the runner (tens of
 seconds).
 """
 
