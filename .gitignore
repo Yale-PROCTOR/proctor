@@ -15,3 +15,5 @@ runs/
 
 # Test-Corpus bundles
 bundles/
+spike/
+out/

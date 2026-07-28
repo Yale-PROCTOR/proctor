@@ -62,6 +62,27 @@ uv run proctor bench    -c <cfg> --corpus <dir> --jobs 8   # whole corpus, one r
 uv run proctor report   runs/ --group-by stage,model       # LLM token/cost aggregation
 ```
 
+### Verifying translations against the TRACTOR vectors
+
+`bench` can check each case's translated Rust against the corpus's own
+test vectors, using TRACTOR's authoritative `runtests.rust` harness
+(vendored under `tools/tractor_runtests/`) — we drive their runner, we
+don't reimplement it. Enable it in config:
+
+```toml
+[bench]
+verify_vectors = true      # verify the final Rust output per case
+verify_all_stages = false  # true: verify every stage's output (per-stage delta)
+```
+
+Each corpus case must carry a `test_vectors/` directory (the standard
+TRACTOR layout). Results land in `bench.json` (`vectors_ok` per case and
+a top-level pass count) and print inline as `vectors 3/3 (crat)`. Needs
+only `cargo`/`cmake`/`ninja` on `PATH` — no Docker or Falco. File-change
+vectors (the Falco path) are deferred; see
+`plan_docs/vector_testing_integration_plan.md` and
+`plan_docs/falco_integration_notes.md`.
+
 Experiments are config overlays — later files win, `--set` wins over all:
 
 ```bash

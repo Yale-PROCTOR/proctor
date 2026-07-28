@@ -1,0 +1,20 @@
+[workspace]
+members = [
+]
+[package]
+name = "driver"
+authors = ["C2Rust"]
+version = "0.0.0"
+publish = false
+edition = "2021"
+autobins = false
+
+[lib]
+name = "driver"
+path = "lib.rs"
+crate-type = ["staticlib", "rlib", "cdylib"]
+[dependencies]
+
+[[bin]]
+name = "driver"
+path = "src_main_main.rs"

@@ -25,6 +25,7 @@ from typing import Any
 from proctor.config.load import ConfigError
 from proctor.config.model import PipelineConfig
 from proctor.orchestrator.run import RunError, RunResult, start_run
+from proctor.testing.vector_harness import VectorComparison
 
 DEFAULT_LAYOUT = {
     "c_project": "c",
@@ -41,6 +42,8 @@ class BenchSettings:
     jobs: int = 4
     layout: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_LAYOUT))
     rule_set_policy: str = "independent"
+    verify_vectors: bool = False  # run TRACTOR's harness on the outputs
+    verify_all_stages: bool = False  # verify each stage (per-stage comparison)
 
     @classmethod
     def from_config(cls, raw: dict[str, Any]) -> BenchSettings:
@@ -69,13 +72,28 @@ class BenchSettings:
                 f"[bench] rule_set_policy {policy!r} is not implemented yet; "
                 f"use 'independent'"
             )
-        return cls(jobs=jobs, layout=layout, rule_set_policy=policy)
+        verify_vectors = bench_raw.get("verify_vectors", False)
+        verify_all_stages = bench_raw.get("verify_all_stages", False)
+        for key, val in (
+            ("verify_vectors", verify_vectors),
+            ("verify_all_stages", verify_all_stages),
+        ):
+            if not isinstance(val, bool):
+                raise ConfigError(f"[bench] {key} must be a boolean")
+        return cls(
+            jobs=jobs,
+            layout=layout,
+            rule_set_policy=policy,
+            verify_vectors=verify_vectors,
+            verify_all_stages=verify_all_stages,
+        )
 
 
 @dataclass(frozen=True)
 class BenchCase:
     name: str
     inputs: dict[str, Path]
+    source_dir: Path | None = None  # corpus case dir (test_vectors, runner, ...)
 
 
 def discover_cases(
@@ -96,7 +114,11 @@ def discover_cases(
         else:
             if provides:
                 cases.append(
-                    BenchCase(name=str(candidate.relative_to(corpus)), inputs=inputs)
+                    BenchCase(
+                        name=str(candidate.relative_to(corpus)),
+                        inputs=inputs,
+                        source_dir=candidate,
+                    )
                 )
     # drop nested matches: a case must not contain another case
     names = {c.name for c in cases}
@@ -110,15 +132,33 @@ def discover_cases(
 
 
 @dataclass
+class BenchOutcome:
+    case: BenchCase
+    run: RunResult | Exception
+    vectors: VectorComparison | None = None
+
+    @property
+    def run_ok(self) -> bool:
+        return isinstance(self.run, RunResult) and self.run.ok
+
+    @property
+    def vectors_ok(self) -> bool | None:
+        """None when vectors weren't verified; else True iff the last
+        verified stage passed all its vectors."""
+        if self.vectors is None or not self.vectors.stages:
+            return None
+        last = self.vectors.stages[-1]
+        return last.report is not None and last.report.ok
+
+
+@dataclass
 class BenchResult:
     bench_dir: Path
-    cases: list[tuple[BenchCase, RunResult | Exception]] = field(default_factory=list)
+    outcomes: list[BenchOutcome] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return bool(self.cases) and all(
-            isinstance(r, RunResult) and r.ok for _, r in self.cases
-        )
+        return bool(self.outcomes) and all(o.run_ok for o in self.outcomes)
 
 
 def run_bench(
@@ -143,10 +183,10 @@ def run_bench(
     result = BenchResult(bench_dir=bench_dir)
     started = time.monotonic()
 
-    def one(case: BenchCase) -> tuple[BenchCase, RunResult | Exception]:
+    def one(case: BenchCase) -> BenchOutcome:
         run_dir = bench_dir / case.name.replace("/", "__")
         try:
-            return case, start_run(
+            run = start_run(
                 config,
                 root,
                 name=case.name.replace("/", "__"),
@@ -157,41 +197,83 @@ def run_bench(
                 run_dir=run_dir,
             )
         except Exception as exc:  # a broken case must not sink the batch
-            return case, exc
+            return BenchOutcome(case=case, run=exc)
+        vectors = _verify_case(settings, case, run.run_dir)
+        return BenchOutcome(case=case, run=run, vectors=vectors)
 
     workers = jobs if jobs is not None else settings.jobs
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        result.cases = list(pool.map(one, cases))
+        result.outcomes = list(pool.map(one, cases))
 
     summary = {
         "bench": name,
         "corpus": str(corpus),
         "wall_s": round(time.monotonic() - started, 1),
-        "total": len(result.cases),
-        "ok": sum(1 for _, r in result.cases if isinstance(r, RunResult) and r.ok),
-        "cases": [
-            {
-                "name": case.name,
-                "ok": isinstance(r, RunResult) and r.ok,
-                "error": str(r) if isinstance(r, Exception) else None,
-                "stages": (
-                    [
-                        {
-                            "id": s.stage_id,
-                            "status": s.status,
-                            "duration_s": round(s.duration_s, 2),
-                            "error": s.error,
-                        }
-                        for s in r.stages
-                    ]
-                    if isinstance(r, RunResult)
-                    else []
-                ),
-            }
-            for case, r in result.cases
-        ],
+        "total": len(result.outcomes),
+        "ok": sum(1 for o in result.outcomes if o.run_ok),
+        "vectors_ok": sum(1 for o in result.outcomes if o.vectors_ok is True)
+        if settings.verify_vectors
+        else None,
+        "cases": [_case_summary(o) for o in result.outcomes],
     }
     (bench_dir / "bench.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )
     return result
+
+
+def _verify_case(
+    settings: BenchSettings, case: BenchCase, run_dir: Path
+) -> VectorComparison | None:
+    """Run TRACTOR's vector harness on the case's stage output(s)."""
+    if not settings.verify_vectors or case.source_dir is None:
+        return None
+    if not (case.source_dir / "test_vectors").is_dir():
+        return None
+    from proctor.testing.vector_compare import compare_stages, verify_final
+
+    workdir = run_dir / "vectors"
+    if settings.verify_all_stages:
+        return compare_stages(run_dir, case.source_dir, workdir=workdir)
+    final = verify_final(run_dir, case.source_dir, workdir=workdir)
+    comparison = VectorComparison(case=case.name)
+    if final is not None:
+        comparison.stages.append(final)
+    return comparison
+
+
+def _case_summary(o: BenchOutcome) -> dict[str, Any]:
+    run = o.run
+    summary: dict[str, Any] = {
+        "name": o.case.name,
+        "ok": o.run_ok,
+        "error": str(run) if isinstance(run, Exception) else None,
+        "stages": (
+            [
+                {
+                    "id": s.stage_id,
+                    "status": s.status,
+                    "duration_s": round(s.duration_s, 2),
+                    "error": s.error,
+                }
+                for s in run.stages
+            ]
+            if isinstance(run, RunResult)
+            else []
+        ),
+    }
+    if o.vectors is not None:
+        summary["vectors_ok"] = o.vectors_ok
+        summary["vectors"] = [
+            {
+                "stage": sv.stage_id,
+                "passed": sv.report.passed if sv.report else None,
+                "failed": sv.report.failed if sv.report else None,
+                "skipped": sv.report.skipped if sv.report else None,
+                "total": sv.report.total if sv.report else None,
+                "build_ok": sv.report.build_ok if sv.report else None,
+                "error": sv.error,
+            }
+            for sv in o.vectors.stages
+        ]
+    return summary

@@ -1,4 +1,5 @@
 runs/
+spike/
 .venv/
 **/target/
 **/__pycache__/

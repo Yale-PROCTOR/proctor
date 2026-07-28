@@ -11,7 +11,12 @@ pipeline stages:
   test-package gate on, resume reuses the checkpoint;
 - **translation smoke** — full C source → c2rust → CRAT → tested Rust
   with `proctor.toml`;
-- **index e2e** — builds `proctor-rust-index` and indexes the fixture.
+- **index e2e** — builds `proctor-rust-index` and indexes the fixture;
+- **vector harness e2e** — drives TRACTOR's authoritative
+  `runtests.rust` harness against the real crat output
+  (`fixtures/001_helloworld/translated_rust`) and asserts all three
+  corpus vectors pass. Needs only cargo/rustup (no Docker/Falco); the
+  fixture pins nightly-2025-06-23 via its `rust-toolchain` file.
 
 ## c2rust-transpile resolution
 

@@ -9,12 +9,16 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from proctor import __version__
 from proctor.config.load import ConfigError, load_config
 from proctor.config.model import PipelineConfig
 from proctor.orchestrator.run import RunError, RunResult, resume_run, start_run
 from proctor.orchestrator.validate import validate_pipeline
+
+if TYPE_CHECKING:
+    from proctor.orchestrator.bench import BenchOutcome
 
 _NOT_YET: dict[str, str] = {}
 
@@ -160,19 +164,34 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         config, args.root, args.corpus.resolve(), name=name, jobs=args.jobs
     )
     ok_count = 0
-    for case, run in result.cases:
+    for o in result.outcomes:
+        run = o.run
+        vec = _fmt_vectors(o)
         if isinstance(run, RunResult) and run.ok:
             ok_count += 1
             statuses = ",".join(s.status for s in run.stages)
-            print(f"  ok      {case.name}  [{statuses}]")
+            print(f"  ok      {o.case.name}  [{statuses}]{vec}")
         elif isinstance(run, RunResult):
             failed = next((s for s in run.stages if s.status == "failure"), None)
             detail = f"{failed.stage_id}: {failed.error}" if failed else "?"
-            print(f"  FAILED  {case.name}  — {detail}")
+            print(f"  FAILED  {o.case.name}  — {detail}{vec}")
         else:
-            print(f"  ERROR   {case.name}  — {run}")
-    print(f"{ok_count}/{len(result.cases)} cases ok — {result.bench_dir}")
+            print(f"  ERROR   {o.case.name}  — {run}")
+    print(f"{ok_count}/{len(result.outcomes)} cases ok — {result.bench_dir}")
     return 0 if result.ok else 1
+
+
+def _fmt_vectors(o: BenchOutcome) -> str:
+    """Compact per-case vector summary for the bench line, e.g.
+    '  vectors 3/3 (crat)'. Empty when vectors weren't verified."""
+    if o.vectors is None or not o.vectors.stages:
+        return ""
+    last = o.vectors.stages[-1]
+    if last.report is None:
+        return f"  vectors ERROR ({last.stage_id}: {last.error})"
+    r = last.report
+    tail = "" if r.build_ok else " build-fail"
+    return f"  vectors {r.passed}/{r.total} ({last.stage_id}){tail}"
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
