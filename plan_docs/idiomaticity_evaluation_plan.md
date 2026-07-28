@@ -98,10 +98,11 @@ Add `proctor/testing/idiomaticity_eval.py`, analogous to
 ## 6. The three axes, together
 
 A translation stage is only a genuine win if it **improves idiomaticity
-and reduces unsafe without breaking the vectors.** Vectors
-(`vector_testing_integration_plan.md`), unsafe
-(`unsafe_evaluation_plan.md`), and idiomaticity (this doc) are the same
-per-stage pattern — drive the authoritative tool, compare across stages —
+and reduces unsafe without breaking the vectors.** Vectors (the vector
+harness, `proctor/testing/`; deferred work in
+`falco_integration_notes.md`), unsafe (`unsafe_evaluation_plan.md`), and
+idiomaticity (this doc) are the same per-stage pattern — drive the
+authoritative tool, compare across stages —
 and should share the bench plumbing and `bench.json` schema.
 
 ## 7. Tools (links)

@@ -7,9 +7,8 @@ harness) and parse its JUnit output. Binary vectors run the translated
 ``driver`` directly; library vectors run the case's real cando ``runner``.
 Neither needs Docker/Falco/root — only cargo/cmake/ninja on PATH.
 
-See ``plan_docs/vector_testing_integration_plan.md``. The Falco-based
-orchestrator (file-change vectors) is deferred — see
-``plan_docs/falco_integration_notes.md``.
+The Falco-based orchestrator (file-change vectors, and the newer-corpus
+library cases) is deferred — see ``plan_docs/falco_integration_notes.md``.
 """
 
 from __future__ import annotations

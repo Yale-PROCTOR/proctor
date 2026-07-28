@@ -7,9 +7,3 @@
 [submodule "stages/abstraction-recovery"]
 	path = stages/abstraction-recovery
 	url = https://github.com/Yale-PROCTOR/abstraction_recovery
-[submodule "tractor-test-corpus/Test-Corpus"]
-	path = tractor-test-corpus/Test-Corpus
-	url = https://github.com/DARPA-TRACTOR-Program/Test-Corpus/
-[submodule "tractor-test-corpus/aws-translate"]
-	path = tractor-test-corpus/aws-translate
-	url = https://github.com/DARPA-TRACTOR-Program/aws-translate/

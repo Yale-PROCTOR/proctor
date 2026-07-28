@@ -17,3 +17,6 @@ runs/
 bundles/
 spike/
 out/
+
+# TRACTOR corpus — fetch with tools/fetch_corpus.sh, not committed
+tractor-test-corpus/

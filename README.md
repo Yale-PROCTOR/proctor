@@ -16,9 +16,15 @@ turning a TRACTOR C project into a tested unsafe-Rust project carrying
 ```bash
 git clone <this repo> && cd proctor
 git submodule update --init stages/crat stages/c2rust
+tools/fetch_corpus.sh                # fetch the TRACTOR test corpus (DARPA
+                                     # access required); not committed here
 uv sync
 uv run proctor warmup -c tests/e2e/translation_smoke.toml   # pre-build stages
 ```
+
+The TRACTOR test corpus is **not** vendored/submoduled — `tools/fetch_corpus.sh`
+clones it at the exact pinned commit (add `--with-aws` for the
+`aws-translate` packaging tool used below).
 
 Host toolchain requirements (or use Docker below, which has them all):
 `rustup`, `cmake`, `make`/`ninja`, and CRAT's build deps — see
@@ -80,7 +86,6 @@ TRACTOR layout). Results land in `bench.json` (`vectors_ok` per case and
 a top-level pass count) and print inline as `vectors 3/3 (crat)`. Needs
 only `cargo`/`cmake`/`ninja` on `PATH` — no Docker or Falco. File-change
 vectors (the Falco path) are deferred; see
-`plan_docs/vector_testing_integration_plan.md` and
 `plan_docs/falco_integration_notes.md`.
 
 Experiments are config overlays — later files win, `--set` wins over all:

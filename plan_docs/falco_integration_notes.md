@@ -1,9 +1,11 @@
 # Falco / Full-Harness Integration — Deferred: Blockers & Setup Notes
 
 Status: **deferred.** Binary + library vectors are verified now via the
-old direct harness (`vector_testing_integration_plan.md`). This document
-captures what the **new** Falco-based orchestrator adds, exactly what
-blocks it today, and everything learned so re-setup is fast.
+old direct harness (`proctor/testing/vector_harness.py` driving the
+vendored `tools/tractor_runtests`). This document is the single home for
+everything **left to do** on vectors: what the newer Falco-based
+orchestrator adds, what blocks it today, the recommended unblock, and
+setup notes so re-setup is fast.
 
 ## 1. What Falco adds
 
@@ -130,13 +132,47 @@ reverse-engineering their harness. It only confirmed the stack runs here.
 Trigger a return to the full flow when **any** of:
 - TRACTOR fixes the `falco.yaml` mount (or the corpus bumps to a Docker
   version where it works), or
-- TRACTOR ships `--no-falco` (then binary/library file-change-free cases
-  run containerized without the mount at all), or
+- **`--no-falco` lands** (see §7 — the recommended unblock), or
 - we run on a machine matching their CI (older Docker + real Nix), or
-- we specifically need **file-change vector** verification (the only gap of
-  the old direct harness).
+- we specifically need **file-change vector** verification (the only gap
+  of the old direct harness).
 
-At that point the framework swap is small: `vector_harness.py` gains a
-second engine that calls `nix run ./tools/test_runner` instead of
-`runtests.rust`, same corpus-staging and JUnit-parsing
-(`vector_testing_integration_plan.md` §3.1, milestone V4).
+## 7. Recommended unblock: `--no-falco` on the newer harness
+
+The cleanest path — and what unblocks everything below — is a
+**`--no-falco` flag on the newer orchestrator** (`tools/test_runner`),
+upstreamed to TRACTOR.
+
+**Invasiveness (assessed against the orchestrator source): moderate,
+localized — ~5 files, not a rewrite.** Falco is concentrated in dedicated
+modules (`falco.py`, `parse_falco.py`); a null-object `NullFalcoManager`
+plus one real conditional does it:
+- `orchestrator/cli.py`: add the flag;
+- `orchestrator/__main__.py`: pick the null manager;
+- `orchestrator/container.py`: **skip the `falco.yaml` mount + Falco
+  sidecar** — this is the Docker-29 bug site;
+- `exec_test_vector/__main__.py`: skip `get_filesystem_changes`; run only
+  cando state + stdout; mark file-change vectors `skipped`;
+- `run_phases.py` / `shutdown_handler.py`: no-op via the null manager.
+
+Payoff: it **sidesteps the Docker-29 mount bug**, drops the
+privileged/eBPF requirement, and the newer harness **natively matches**
+the newer corpus era — the new cando2 (`lib_fn!`, rustc 1.94.1), the
+`_cando_librunner` runner naming, and **B03**. So it yields B01/B02/B03
+**state + stdout** vectors on TRACTOR's current harness, no back-port.
+
+### B03 library cases depend on this
+
+B03 was added in the new-cando2 era. Its library runners need the newer
+cando2, which (a) requires **rustc 1.94.1** (the 0319ab0 toolchain is
+1.93.0) and (b) is **not behavior-compatible** with the old harness —
+swapping it into the 0319ab0 corpus builds but regresses B01/B02 library
+cases (42/42 → 1/42 clean, verified). So B03 **binary** cases can run on
+the direct harness today; B03 **library** cases wait for `--no-falco` +
+the newer harness. (File-change vectors stay the separate Falco-only gap.)
+
+### The engine swap, when we return
+
+`vector_harness.py` gains a second engine that drives the newer
+`tools/test_runner` (with `--no-falco`) instead of `runtests.rust` — same
+corpus-staging and JUnit-parsing.

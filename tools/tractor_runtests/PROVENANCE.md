@@ -10,9 +10,8 @@ translated `driver` (binary cases) or the case's cando `runner` binary
 Pure Python stdlib.
 
 We drive it via `proctor.testing.vector_harness` to verify translations
-against the corpus test vectors at each pipeline stage. See
-`plan_docs/vector_testing_integration_plan.md`. The newer Falco-based
-`tools/test_runner` orchestrator is deferred — see
+against the corpus test vectors at each pipeline stage. The newer
+Falco-based `tools/test_runner` orchestrator is deferred — see
 `plan_docs/falco_integration_notes.md`.
 
 License: MIT (© Massachusetts Institute of Technology), as in the source.

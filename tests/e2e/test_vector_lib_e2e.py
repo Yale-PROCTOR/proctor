@@ -6,10 +6,10 @@ The fixture ``translated_rust`` is a real c2rust→crat translation of
 into the case slot, and run TRACTOR's direct harness: it builds cando2 +
 the ``_001_helloworld_lib_runner`` and runs it against the state vector.
 
-Opt-in (``pytest -m e2e``): needs cargo/rustup and the tractor-test-corpus
-submodule pinned to the direct-harness era (0319ab0), which ships the
-Falco-free ``deployment/scripts/github-actions/runtests``. First run
-builds cando2 + the runner (tens of seconds).
+Opt-in (``pytest -m e2e``): needs cargo/rustup and the TRACTOR test
+corpus at the direct-harness era (0319ab0) — fetch it with
+``tools/fetch_corpus.sh``. First run builds cando2 + the runner (tens of
+seconds).
 """
 
 import shutil
