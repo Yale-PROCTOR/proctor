@@ -1,0 +1,4 @@
+target_kind = "library"
+target_name = "hello"
+api_functions = ["helloworld"]
+wrappers = []

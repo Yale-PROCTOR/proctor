@@ -70,9 +70,7 @@ def test_bench_isolates_failures(tmp_path: Path) -> None:
     result = run_bench(_config(), tmp_path, corpus, name="t")
     assert not result.ok
     by_name = {
-        o.case.name: o.run
-        for o in result.outcomes
-        if isinstance(o.run, RunResult)
+        o.case.name: o.run for o in result.outcomes if isinstance(o.run, RunResult)
     }
     assert by_name["good"].ok
     assert not by_name["bad"].ok

@@ -25,7 +25,7 @@ from typing import Any
 from proctor.config.load import ConfigError
 from proctor.config.model import PipelineConfig
 from proctor.orchestrator.run import RunError, RunResult, start_run
-from proctor.testing.vector_harness import VectorComparison
+from proctor.testing.vector_harness import StageVectorResult, VectorComparison
 
 DEFAULT_LAYOUT = {
     "c_project": "c",
@@ -183,6 +183,20 @@ def run_bench(
     result = BenchResult(bench_dir=bench_dir)
     started = time.monotonic()
 
+    # Vector verification runs in place inside a corpus workspace copy
+    # (library/cando cases build their runner from the workspace, so the
+    # whole thing must be present). Make one writable copy up front.
+    ws_root: Path | None = None
+    ws_copy: Path | None = None
+    if settings.verify_vectors:
+        from proctor.testing.vector_harness import copy_workspace, find_workspace_root
+
+        seed = next((c.source_dir for c in cases if c.source_dir is not None), None)
+        if seed is not None:
+            ws_root = find_workspace_root(seed)
+        if ws_root is not None:
+            ws_copy = copy_workspace(ws_root, bench_dir / "_corpus_ws")
+
     def one(case: BenchCase) -> BenchOutcome:
         run_dir = bench_dir / case.name.replace("/", "__")
         try:
@@ -198,7 +212,7 @@ def run_bench(
             )
         except Exception as exc:  # a broken case must not sink the batch
             return BenchOutcome(case=case, run=exc)
-        vectors = _verify_case(settings, case, run.run_dir)
+        vectors = _verify_case(settings, case, run.run_dir, ws_root, ws_copy)
         return BenchOutcome(case=case, run=run, vectors=vectors)
 
     workers = jobs if jobs is not None else settings.jobs
@@ -223,16 +237,59 @@ def run_bench(
 
 
 def _verify_case(
-    settings: BenchSettings, case: BenchCase, run_dir: Path
+    settings: BenchSettings,
+    case: BenchCase,
+    run_dir: Path,
+    ws_root: Path | None,
+    ws_copy: Path | None,
 ) -> VectorComparison | None:
-    """Run TRACTOR's vector harness on the case's stage output(s)."""
+    """Run TRACTOR's vector harness on the case's stage output(s).
+
+    Prefers the in-place path (inside the corpus workspace copy), which
+    is required for library cases and works for binary cases too. Falls
+    back to the isolated per-case corpus only when no workspace is
+    present (e.g. a binary-only subset), where library cases can't run.
+    """
     if not settings.verify_vectors or case.source_dir is None:
         return None
     if not (case.source_dir / "test_vectors").is_dir():
         return None
-    from proctor.testing.vector_compare import compare_stages, verify_final
+    from proctor.testing.vector_compare import (
+        compare_stages,
+        compare_stages_in_place,
+        verify_final,
+        verify_final_in_place,
+    )
+    from proctor.testing.vector_harness import is_library_case
 
     workdir = run_dir / "vectors"
+
+    if ws_root is not None and ws_copy is not None:
+        case_rel = case.source_dir.resolve().relative_to(ws_root.resolve())
+        case_in_copy = ws_copy / case_rel
+        if settings.verify_all_stages:
+            return compare_stages_in_place(
+                run_dir, case_in_copy, workspace_root=ws_copy, workdir=workdir
+            )
+        final = verify_final_in_place(
+            run_dir, case_in_copy, workspace_root=ws_copy, workdir=workdir
+        )
+        comparison = VectorComparison(case=case.name)
+        if final is not None:
+            comparison.stages.append(final)
+        return comparison
+
+    # No corpus workspace: isolated path (binary cases only).
+    if is_library_case(case.source_dir):
+        comparison = VectorComparison(case=case.name)
+        comparison.stages.append(
+            StageVectorResult(
+                stage_id="lib",
+                report=None,
+                error="library case needs the corpus workspace (none found)",
+            )
+        )
+        return comparison
     if settings.verify_all_stages:
         return compare_stages(run_dir, case.source_dir, workdir=workdir)
     final = verify_final(run_dir, case.source_dir, workdir=workdir)

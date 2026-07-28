@@ -135,6 +135,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
             )
 
     name = args.name or Path(args.config[0]).stem
+    # Default the case label to the C-project directory name; stages that
+    # derive artifact names from it (c2rust) rely on the original case name.
+    item = args.item or (
+        supplied["c_project"].name if "c_project" in supplied else None
+    )
     result = start_run(
         config,
         args.root,
@@ -142,7 +147,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         supplied_inputs=supplied,
         config_files=[Path(p) for p in args.config],
         overrides=list(args.overrides),
-        item=args.item,
+        item=item,
     )
     _print_run_result(result)
     return 0 if result.ok else 1

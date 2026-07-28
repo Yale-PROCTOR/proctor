@@ -205,6 +205,122 @@ def _harness_env() -> dict[str, str]:
     return env
 
 
+# --- in-place verification (required for library / cando cases) -----------
+#
+# A library case's cando ``runner`` is a member of the corpus Cargo
+# workspace and depends on ``tools/cando2`` by a relative path, so it
+# only builds with the *whole* workspace present. We therefore verify
+# such cases in place inside a writable copy of the corpus: drop the
+# stage's Rust into the case's ``translated_rust`` slot and run the
+# harness scoped to that case. Binary cases work here too.
+
+
+def is_library_case(case_dir: Path) -> bool:
+    """TRACTOR marks library (cando) cases with a ``_lib`` suffix; they
+    ship a ``runner/`` package the harness builds and runs. Matches the
+    harness's own ``_is_library`` test."""
+    return case_dir.name.endswith("_lib")
+
+
+def find_workspace_root(case_dir: Path) -> Path | None:
+    """The corpus Cargo-workspace root above ``case_dir``: the nearest
+    ancestor with a ``[workspace]`` Cargo.toml and a ``tools/cando*``
+    crate. Library cases build their cando runner from here, so
+    verifying them needs the whole workspace in place. Returns ``None``
+    for a corpus without that workspace (e.g. a binary-only subset)."""
+    resolved = case_dir.resolve()
+    for parent in (resolved, *resolved.parents):
+        cargo = parent / "Cargo.toml"
+        if (
+            cargo.is_file()
+            and "[workspace]" in cargo.read_text(encoding="utf-8", errors="ignore")
+            and any(parent.glob("tools/cando*"))
+        ):
+            return parent
+    return None
+
+
+_WS_COPY_IGNORE = shutil.ignore_patterns(".git", "target", "translated_rust")
+
+
+def copy_workspace(workspace_root: Path, dest: Path) -> Path:
+    """Make one writable copy of the corpus workspace (call once per
+    bench, before the parallel case loop). Skips ``.git``, build
+    ``target`` dirs, and any pre-existing ``translated_rust`` slots. A
+    no-op if ``dest`` already exists."""
+    if dest.exists():
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(workspace_root, dest, ignore=_WS_COPY_IGNORE, symlinks=True)
+    return dest
+
+
+def run_vectors_in_place(
+    translated_rust: Path,
+    case_dir: Path,
+    *,
+    workspace_root: Path,
+    junit_out: Path,
+    timeout_s: int = 900,
+) -> VectorReport:
+    """Verify by dropping ``translated_rust`` into the case's slot inside
+    a real (writable) corpus workspace and running the harness there.
+
+    ``case_dir`` is the case directory *inside the writable copy* and
+    must live under ``workspace_root`` (also the copy). This is the path
+    library cases require; binary cases work here too. Concurrent calls
+    on different cases are safe — each writes only its own slot; the
+    shared workspace ``target`` used for cando-runner builds is
+    serialized by Cargo's own lock.
+    """
+    case_dir = case_dir.resolve()
+    workspace_root = workspace_root.resolve()
+    try:
+        case_rel = case_dir.relative_to(workspace_root)
+    except ValueError as exc:
+        raise VectorHarnessError(
+            f"{case_dir} is not under workspace root {workspace_root}"
+        ) from exc
+    if not (translated_rust / "Cargo.toml").is_file():
+        raise VectorHarnessError(
+            f"{translated_rust} is not a Cargo project (no Cargo.toml)"
+        )
+    if not (case_dir / "test_vectors").is_dir():
+        raise VectorHarnessError(f"{case_dir} has no test_vectors/")
+
+    slot = case_dir / "translated_rust"
+    if slot.exists():
+        shutil.rmtree(slot)
+    shutil.copytree(translated_rust, slot)
+
+    junit_out.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "runtests.rust",
+            "--root",
+            str(workspace_root),
+            "--subset",
+            str(case_rel),
+            "--junit-xml",
+            str(junit_out),
+            "--keep-going",
+        ],
+        cwd=str(_HARNESS_DIR),
+        env=_harness_env(),
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    if not junit_out.is_file():
+        raise VectorHarnessError(
+            f"harness produced no JUnit (exit {proc.returncode}):\n"
+            f"{(proc.stderr or proc.stdout)[-2000:]}"
+        )
+    return parse_junit(junit_out.read_text(encoding="utf-8"), case=str(case_rel))
+
+
 @dataclass(frozen=True)
 class StageVectorResult:
     stage_id: str

@@ -1,0 +1,16 @@
+[workspace]
+members = [
+]
+[package]
+name = "hello"
+authors = ["C2Rust"]
+version = "0.0.0"
+publish = false
+edition = "2021"
+autobins = false
+
+[lib]
+name = "hello"
+path = "lib.rs"
+crate-type = ["staticlib", "rlib", "cdylib"]
+[dependencies]

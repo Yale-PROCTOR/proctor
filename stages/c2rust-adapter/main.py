@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 STAGE_ID = "c2rust"
-STAGE_VERSION = "0.1.1"
+STAGE_VERSION = "0.2.0"
 SCHEMA_VERSION = 1
 
 
@@ -105,6 +105,30 @@ def find_c_root(c_project: Path) -> Path:
         if (candidate / "CMakeLists.txt").is_file():
             return candidate
     raise StageFailure(f"no CMakeLists.txt under {c_project} or its test_case/")
+
+
+def restore_case_name(source_dir: Path, item: str | None, work: Path) -> Path:
+    """Stage the C source under a parent directory named after the case.
+
+    TRACTOR CMakeLists derive the library target name from the C source's
+    PARENT directory (``cmake_path(GET CMAKE_CURRENT_SOURCE_DIR
+    PARENT_PATH ...)``). The framework records the C input under
+    ``inputs/c/``, so that derivation would name the library ``c`` and
+    build ``libc.so`` — but the cando runner dlopens ``lib<case>.so``.
+    When the case name is known (envelope ``item``), copy the source
+    under a parent named after it so the built cdylib matches. Cases
+    whose CMakeLists name the target explicitly are unaffected.
+    """
+    if not item:
+        return source_dir
+    case_name = Path(item).name
+    if not case_name or source_dir.resolve().parent.name == case_name:
+        return source_dir
+    staged = work / "named" / case_name / source_dir.name
+    if not staged.exists():
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_dir, staged)
+    return staged
 
 
 def prepare_c_root(c_project: Path, workdir: Path) -> Path:
@@ -327,6 +351,7 @@ def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
     log_file = Path(artifacts_dir or workdir) / "c2rust.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     source_dir = prepare_c_root(Path(c_project), work)
+    source_dir = restore_case_name(source_dir, envelope.get("item"), work)
     timings: dict[str, float] = {}
 
     # 1. cmake configure with the file API enabled
