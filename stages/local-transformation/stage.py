@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import json
+import re
 import shutil
+import tempfile
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -11,6 +14,8 @@ from typing import Any, Literal, cast
 from model import (
     ContextOverflow,
     ItemRecord,
+    PointerVariableMetadata,
+    StatementPairMetadata,
     SkeletonError,
     dependency_context,
     function_graph,
@@ -83,6 +88,25 @@ class RunState:
     usage_start: int = 0
     prompt_used: bool = False
     logs: tuple[str, ...] = ()
+    statement_pairs: dict[tuple[int, int], AcceptedStatementPair] = field(
+        default_factory=dict
+    )
+
+
+@dataclass(frozen=True)
+class ReplacementStatementPair:
+    item_id: int
+    path: str
+    label: int
+    after_statement: str
+
+
+@dataclass(frozen=True)
+class AcceptedStatementPair:
+    item_id: int
+    path: str
+    metadata: StatementPairMetadata
+    after_statement: str
 
 
 def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]:
@@ -135,7 +159,7 @@ def _library_relative_path(project: Path) -> Path:
 
 def _validate_boundaries(
     stage_input: StageInput, stage_dir: Path
-) -> tuple[Path, Path, Path, Path, dict[str, Any]]:
+) -> tuple[Path, Path, Path, Path, Path, dict[str, Any]]:
     config = _effective_config(stage_input.config, stage_dir)
     source = stage_input.inputs.rust_project
     destination = stage_input.outputs.rust_project
@@ -173,15 +197,47 @@ def _validate_boundaries(
             or source_resolved in path.parents
         ):
             raise StageFailure(f"{name} overlaps input Rust project: {path}")
+    report_path = (
+        stage_input.outputs.artifacts_dir / "statement-pairs.md"
+        if stage_input.outputs.artifacts_dir is not None
+        else workdir / "statement-pairs.md"
+    )
+    report_resolved = report_path.resolve()
+    destination_resolved = destination.resolve()
+    if (
+        report_resolved == destination_resolved
+        or report_resolved in destination_resolved.parents
+        or destination_resolved in report_resolved.parents
+    ):
+        raise StageFailure(
+            "statement-pairs report path overlaps output Rust project: "
+            f"{report_resolved}"
+        )
     library_relative = _library_relative_path(source)
-    return source, destination, workdir, library_relative, config
+    return source, destination, workdir, library_relative, report_path, config
 
 
-def _copy_final(current: Path, destination: Path) -> None:
+def _clear_stale_report(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise StageFailure(
+            f"statement-pairs report destination is not a regular file or symlink: "
+            f"{path}"
+        )
+
+
+def _copy_final(
+    current: Path,
+    destination: Path,
+    mark_destination_created: Callable[[], None],
+) -> None:
     def ignore(directory: str, names: list[str]) -> set[str]:
         return {"target"} if Path(directory) == current else set()
 
-    shutil.copytree(current, destination, ignore=ignore)
+    destination.mkdir()
+    mark_destination_created()
+    shutil.copytree(current, destination, ignore=ignore, dirs_exist_ok=True)
 
 
 def _usage_summary(records: list[dict[str, Any]]) -> UsageSummary | None:
@@ -368,6 +424,325 @@ def _record_untracked_response(
         )
 
 
+def _load_replacement_statement_pairs(
+    path: Path,
+    members: tuple[int, ...],
+    records_by_id: dict[int, ItemRecord],
+) -> tuple[ReplacementStatementPair, ...]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise StageFailure(
+            f"replacement statement-pairs sidecar is malformed JSON: {exc}"
+        ) from exc
+    if not isinstance(value, dict) or set(value) != {"schema_version", "statements"}:
+        raise StageFailure(
+            "replacement statement-pairs sidecar must contain exactly "
+            "['schema_version', 'statements']"
+        )
+    version = value["schema_version"]
+    if isinstance(version, bool) or version != 1:
+        raise StageFailure(
+            "unsupported replacement statement-pairs sidecar schema_version "
+            f"{version!r}"
+        )
+    statements = value["statements"]
+    if not isinstance(statements, list):
+        raise StageFailure(
+            "replacement statement-pairs sidecar statements must be an array"
+        )
+    expected: dict[tuple[int, int], str] = {
+        (item_id, label): records_by_id[item_id].path
+        for item_id in members
+        for label in records_by_id[item_id].statements_requiring_transformation
+    }
+    result: list[ReplacementStatementPair] = []
+    previous: tuple[int, int] | None = None
+    for index, statement in enumerate(statements):
+        where = f"replacement statement-pairs sidecar statements[{index}]"
+        if not isinstance(statement, dict) or set(statement) != {
+            "item_id",
+            "path",
+            "label",
+            "after_statement",
+        }:
+            raise StageFailure(
+                f"{where} must contain exactly "
+                "['after_statement', 'item_id', 'label', 'path']"
+            )
+        item_id = statement["item_id"]
+        if (
+            isinstance(item_id, bool)
+            or not isinstance(item_id, int)
+            or not 0 <= item_id <= 2**64 - 1
+        ):
+            raise StageFailure(f"{where}.item_id must be in the u64 range")
+        label = statement["label"]
+        if (
+            isinstance(label, bool)
+            or not isinstance(label, int)
+            or not 0 <= label <= 2**32 - 1
+        ):
+            raise StageFailure(f"{where}.label must be in the u32 range")
+        function_path = statement["path"]
+        if (
+            not isinstance(function_path, str)
+            or not function_path
+            or "\r" in function_path
+            or "\n" in function_path
+        ):
+            raise StageFailure(f"{where}.path must be a nonempty single-line string")
+        after_statement = statement["after_statement"]
+        if (
+            not isinstance(after_statement, str)
+            or not after_statement
+            or "\r" in after_statement
+            or after_statement.endswith("\n")
+        ):
+            raise StageFailure(
+                f"{where}.after_statement must be nonempty, contain no carriage "
+                "return, and have no trailing newline"
+            )
+        key = (item_id, label)
+        if previous is not None and key <= previous:
+            detail = "duplicate" if key == previous else "out of order"
+            raise StageFailure(
+                f"replacement statement-pairs sidecar key {key} is {detail}"
+            )
+        previous = key
+        if expected.get(key) != function_path:
+            raise StageFailure(
+                f"replacement statement-pairs sidecar item/path is outside the "
+                f"current SCC request: {item_id}:{function_path}"
+            )
+        result.append(
+            ReplacementStatementPair(
+                item_id=item_id,
+                path=function_path,
+                label=label,
+                after_statement=after_statement,
+            )
+        )
+    actual_keys = {(entry.item_id, entry.label) for entry in result}
+    if actual_keys != set(expected):
+        missing = sorted(set(expected) - actual_keys)
+        extra = sorted(actual_keys - set(expected))
+        raise StageFailure(
+            "replacement statement-pairs sidecar labels do not exactly match "
+            f"the current SCC request; missing={missing}, extra={extra}"
+        )
+    return tuple(result)
+
+
+def _accept_statement_pairs(
+    pairs: tuple[ReplacementStatementPair, ...],
+    records_by_id: dict[int, ItemRecord],
+    accumulator: dict[tuple[int, int], AcceptedStatementPair],
+) -> None:
+    for pair in pairs:
+        key = (pair.item_id, pair.label)
+        if key in accumulator:
+            raise StageFailure(
+                f"duplicate accepted statement-pair key {pair.item_id}:{pair.label}"
+            )
+        record = records_by_id[pair.item_id]
+        metadata = next(
+            (
+                statement
+                for statement in record.statement_pair_metadata
+                if statement.label == pair.label
+            ),
+            None,
+        )
+        if metadata is None:
+            raise StageFailure(
+                f"missing immutable statement metadata for {pair.item_id}:{pair.label}"
+            )
+        accumulator[key] = AcceptedStatementPair(
+            item_id=pair.item_id,
+            path=pair.path,
+            metadata=metadata,
+            after_statement=pair.after_statement,
+        )
+
+
+_TYPE_WHITESPACE = re.compile(r"[ \t\r\n\f]+")
+
+
+def _code_value(value: str) -> str:
+    if "\r" in value or "\n" in value:
+        raise StageFailure("single-line report code value contains a newline")
+    escaped = value
+    for source, replacement in (
+        ("&", "&amp;"),
+        ("<", "&lt;"),
+        (">", "&gt;"),
+        ("|", "&#124;"),
+        ("`", "&#96;"),
+        ("\\", "&#92;"),
+    ):
+        escaped = escaped.replace(source, replacement)
+    return f"<code>{escaped}</code>"
+
+
+def _type_code_value(value: str) -> str:
+    return _code_value(_TYPE_WHITESPACE.sub(" ", value).strip(" "))
+
+
+def _rust_fence(snippet: str) -> str:
+    longest = max(
+        (len(match.group(0)) for match in re.finditer(r"`+", snippet)), default=0
+    )
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}rust\n{snippet}\n{fence}"
+
+
+def _origin_text(variable: PointerVariableMetadata) -> str:
+    if variable.origin.kind == "parameter":
+        return f"parameter {variable.origin.value}"
+    return f"local statement {variable.origin.value}"
+
+
+def _pointer_variable_section(metadata: StatementPairMetadata) -> str:
+    rows = metadata.pointer_variables
+    pieces = ["#### Pointer variables"]
+    if not metadata.pointer_variables_complete:
+        pieces.append(
+            "> **Warning:** Pointer-variable metadata is incomplete because Crat "
+            "could not\n> resolve every possible binding occurrence in this source "
+            "statement."
+        )
+    if rows:
+        table = [
+            "| Variable | Origin | Before type | Selected target type | Before type inferred |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        table.extend(
+            "| "
+            + " | ".join(
+                (
+                    _code_value(variable.name),
+                    _code_value(_origin_text(variable)),
+                    _type_code_value(variable.before_type),
+                    _type_code_value(variable.selected_target_type),
+                    "yes" if variable.before_type_is_inferred else "no",
+                )
+            )
+            + " |"
+            for variable in rows
+        )
+        pieces.append("\n".join(table))
+    elif metadata.pointer_variables_complete:
+        pieces.append(
+            "_No existing source raw-pointer parameter or simple local binding "
+            "appears in\nthis statement._"
+        )
+    else:
+        pieces.append(
+            "_No eligible pointer-variable binding could be resolved for this "
+            "statement._"
+        )
+    return "\n\n".join(pieces)
+
+
+def _render_statement_pairs(
+    pairs: dict[tuple[int, int], AcceptedStatementPair],
+) -> str:
+    introduction = (
+        "# Before/After Statement Pairs\n\n"
+        "This report contains build-accepted local-transformation statement pairs."
+    )
+    if not pairs:
+        return introduction + "\n\n_No statements required local transformation._\n"
+    sections = [introduction]
+    previous_item: int | None = None
+    for key in sorted(pairs):
+        pair = pairs[key]
+        if pair.item_id != previous_item:
+            sections.append(f"## Item {pair.item_id}: {_code_value(pair.path)}")
+            previous_item = pair.item_id
+        sections.append(
+            "\n\n".join(
+                (
+                    f"### Statement {pair.metadata.label}",
+                    "#### Before",
+                    _rust_fence(pair.metadata.before_statement),
+                    "#### After",
+                    _rust_fence(pair.after_statement),
+                    _pointer_variable_section(pair.metadata),
+                )
+            )
+        )
+    return "\n\n".join(sections) + "\n"
+
+
+def _remove_exact_output(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        raise OSError(f"cannot clean up unexpected output node: {path}")
+
+
+def _remove_exact_report(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise OSError(f"cannot clean up unexpected report node: {path}")
+
+
+def _publish_final_outputs(
+    current: Path,
+    destination: Path,
+    report_path: Path,
+    report: str,
+) -> None:
+    temporary: Path | None = None
+    destination_created = False
+    report_published = False
+
+    def mark_destination_created() -> None:
+        nonlocal destination_created
+        destination_created = True
+
+    try:
+        _copy_final(current, destination, mark_destination_created)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=report_path.parent,
+            prefix=f".{report_path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            output.write(report)
+        os.replace(temporary, report_path)
+        temporary = None
+        report_published = True
+    except Exception as primary:
+        cleanup_errors: list[str] = []
+        cleanup_targets = [(temporary, _remove_exact_report)]
+        if report_published:
+            cleanup_targets.insert(1, (report_path, _remove_exact_report))
+        if destination_created:
+            cleanup_targets.append((destination, _remove_exact_output))
+        for path, remover in cleanup_targets:
+            if path is None:
+                continue
+            try:
+                remover(path)
+            except OSError as cleanup:
+                cleanup_errors.append(f"{path}: {cleanup}")
+        detail = (
+            f"; cleanup failures: {'; '.join(cleanup_errors)}" if cleanup_errors else ""
+        )
+        raise StageFailure(
+            f"failed to publish final transformation outputs: "
+            f"{type(primary).__name__}: {primary}{detail}"
+        ) from primary
+
+
 def _process_scc(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
@@ -404,11 +779,22 @@ def _process_scc(
         )
         replacement_request_path = workdir / "replacement-request.json"
         candidate = workdir / "candidate.rs"
+        statement_pairs_path = workdir / "replacement-statement-pairs.json"
         write_json(
             replacement_request_path,
             replacement_request(members, records_by_id, transformation),
         )
-        tools.replace(current, replacement_request_path, candidate)
+        tools.replace(
+            current,
+            replacement_request_path,
+            candidate,
+            statement_pairs_path,
+        )
+        statement_pairs = _load_replacement_statement_pairs(
+            statement_pairs_path,
+            members,
+            records_by_id,
+        )
         state.metrics.cargo_builds += 1
         build = install_candidate_transaction(
             library_source,
@@ -423,6 +809,11 @@ def _process_scc(
                 f"({build.returncode})\nstdout:\n{build.stdout}"
                 f"\nstderr:\n{build.stderr}"
             )
+        _accept_statement_pairs(
+            statement_pairs,
+            records_by_id,
+            state.statement_pairs,
+        )
         return
 
     context, _ = dependency_context(members, records_by_id, limit=CONTEXT_LIMIT)
@@ -480,11 +871,22 @@ def _process_scc(
 
         replacement_request_path = workdir / "replacement-request.json"
         candidate = workdir / "candidate.rs"
+        statement_pairs_path = workdir / "replacement-statement-pairs.json"
         write_json(
             replacement_request_path,
             replacement_request(members, records_by_id, transformation),
         )
-        tools.replace(current, replacement_request_path, candidate)
+        tools.replace(
+            current,
+            replacement_request_path,
+            candidate,
+            statement_pairs_path,
+        )
+        statement_pairs = _load_replacement_statement_pairs(
+            statement_pairs_path,
+            members,
+            records_by_id,
+        )
         state.metrics.cargo_builds += 1
         build = install_candidate_transaction(
             library_source,
@@ -493,6 +895,11 @@ def _process_scc(
             lambda: tools.cargo_build(current),
         )
         if build.returncode == 0:
+            _accept_statement_pairs(
+                statement_pairs,
+                records_by_id,
+                state.statement_pairs,
+            )
             return
         state.metrics.compilation_failures += 1
         latest_failed = transformation
@@ -515,9 +922,15 @@ def run_stage(
     state = RunState()
     destination: Path | None = None
     try:
-        source, destination, workdir, library_relative, config = _validate_boundaries(
-            stage_input, stage_dir
-        )
+        (
+            source,
+            destination,
+            workdir,
+            library_relative,
+            report_path,
+            config,
+        ) = _validate_boundaries(stage_input, stage_dir)
+        _clear_stale_report(report_path)
         state.config_used = config
         artifacts = stage_input.outputs.artifacts_dir
         log_path = (
@@ -606,7 +1019,8 @@ def run_stage(
                     exchange_root=exchange_root,
                     state=state,
                 )
-        _copy_final(current, destination)
+        report = _render_statement_pairs(state.statement_pairs)
+        _publish_final_outputs(current, destination, report_path, report)
         return _output("success", state, destination=destination)
     except (StageFailure, SkeletonError, ContextOverflow, OSError, ValueError) as exc:
         return _output(

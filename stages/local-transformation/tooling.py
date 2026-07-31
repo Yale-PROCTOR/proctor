@@ -226,13 +226,47 @@ class CratTools:
             raise StageFailure("validator response must be a JSON object")
         return raw, value
 
-    def replace(self, current_project: Path, request: Path, output: Path) -> None:
+    @staticmethod
+    def _clear_replace_output(path: Path) -> None:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            raise StageFailure(
+                f"crat-tool replace output destination is not a regular file "
+                f"or symlink: {path}"
+            )
+
+    def replace(
+        self,
+        current_project: Path,
+        request: Path,
+        output: Path,
+        statement_pairs_output: Path,
+    ) -> None:
         assert self.crat_tool is not None
-        self._output_operation(
-            "crat-tool replace",
-            replace_command(self.crat_tool, current_project, request, output),
-            output,
-        )
+        self._clear_replace_output(output)
+        self._clear_replace_output(statement_pairs_output)
+        try:
+            self._run(
+                "crat-tool replace",
+                replace_command(
+                    self.crat_tool,
+                    current_project,
+                    request,
+                    output,
+                    statement_pairs_output,
+                ),
+                env=self.environment,
+            )
+            self._require_regular_output("crat-tool replace", output)
+            self._require_regular_output(
+                "crat-tool replace statement pairs", statement_pairs_output
+            )
+        except Exception:
+            for path in (output, statement_pairs_output):
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+            raise
 
     def cargo_build(self, current_project: Path) -> CommandResult:
         result = self.run_command(["cargo", "build"], cwd=current_project, env=None)

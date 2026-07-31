@@ -185,7 +185,11 @@ def validate_command(crat_tool: Path, request: Path, response: Path) -> list[str
 
 
 def replace_command(
-    crat_tool: Path, current_project: Path, request: Path, output: Path
+    crat_tool: Path,
+    current_project: Path,
+    request: Path,
+    output: Path,
+    statement_pairs_output: Path,
 ) -> list[str]:
     return [
         str(crat_tool),
@@ -194,5 +198,7 @@ def replace_command(
         str(request),
         "--output",
         str(output),
+        "--statement-pairs-output",
+        str(statement_pairs_output),
         str(current_project),
     ]

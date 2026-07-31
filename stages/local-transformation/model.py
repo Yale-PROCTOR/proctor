@@ -21,6 +21,29 @@ class ContextOverflow(ValueError):
 
 
 @dataclass(frozen=True)
+class PointerVariableOrigin:
+    kind: str
+    value: int
+
+
+@dataclass(frozen=True)
+class PointerVariableMetadata:
+    name: str
+    origin: PointerVariableOrigin
+    before_type: str
+    selected_target_type: str
+    before_type_is_inferred: bool
+
+
+@dataclass(frozen=True)
+class StatementPairMetadata:
+    label: int
+    before_statement: str
+    pointer_variables_complete: bool
+    pointer_variables: tuple[PointerVariableMetadata, ...]
+
+
+@dataclass(frozen=True)
 class ItemRecord:
     id: int
     path: str
@@ -34,6 +57,7 @@ class ItemRecord:
     target_signature: str | None = None
     needs_transformation: bool | None = None
     statements_requiring_transformation: tuple[int, ...] = ()
+    statement_pair_metadata: tuple[StatementPairMetadata, ...] = ()
     foreign_function_names: tuple[str, ...] = ()
     declaration: str | None = None
     definition: str | None = None
@@ -122,6 +146,160 @@ def _foreign_function_names(data: dict[str, Any], record_id: int) -> tuple[str, 
     return tuple(result)
 
 
+def _u32(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SkeletonError(f"{where} must be an integer")
+    if not 0 <= value <= U32_MAX:
+        raise SkeletonError(f"{where} must be in the u32 range")
+    return value
+
+
+def _nonempty_string(value: Any, where: str) -> str:
+    if not isinstance(value, str):
+        raise SkeletonError(f"{where} must be a string")
+    if not value:
+        raise SkeletonError(f"{where} must not be empty")
+    return value
+
+
+def _pointer_origin(value: Any, where: str) -> PointerVariableOrigin:
+    if not isinstance(value, dict):
+        raise SkeletonError(f"{where} must be an object")
+    kind = value.get("kind")
+    if kind == "parameter":
+        if set(value) != {"kind", "index"}:
+            raise SkeletonError(
+                f"{where} parameter origin must contain exactly ['index', 'kind']"
+            )
+        return PointerVariableOrigin(
+            kind="parameter",
+            value=_u32(value["index"], f"{where}.index"),
+        )
+    if kind == "local":
+        if set(value) != {"kind", "declaration_label"}:
+            raise SkeletonError(
+                f"{where} local origin must contain exactly "
+                "['declaration_label', 'kind']"
+            )
+        return PointerVariableOrigin(
+            kind="local",
+            value=_u32(
+                value["declaration_label"],
+                f"{where}.declaration_label",
+            ),
+        )
+    raise SkeletonError(f"{where}.kind must be 'parameter' or 'local'")
+
+
+def _statement_pair_metadata(
+    value: Any,
+    record_id: int,
+    expected_labels: tuple[int, ...],
+) -> tuple[StatementPairMetadata, ...]:
+    where = f"record {record_id} field 'statement_pair_metadata'"
+    if not isinstance(value, list):
+        raise SkeletonError(f"{where} must be an array")
+    result: list[StatementPairMetadata] = []
+    for statement_index, statement in enumerate(value):
+        statement_where = f"{where}[{statement_index}]"
+        if not isinstance(statement, dict):
+            raise SkeletonError(f"{statement_where} must be an object")
+        expected_statement_keys = {
+            "label",
+            "before_statement",
+            "pointer_variables_complete",
+            "pointer_variables",
+        }
+        if set(statement) != expected_statement_keys:
+            raise SkeletonError(
+                f"{statement_where} must contain exactly "
+                f"{sorted(expected_statement_keys)}"
+            )
+        label = _u32(statement["label"], f"{statement_where}.label")
+        before_statement = _nonempty_string(
+            statement["before_statement"],
+            f"{statement_where}.before_statement",
+        )
+        if before_statement.endswith(("\r", "\n")):
+            raise SkeletonError(
+                f"{statement_where}.before_statement must not end in a newline"
+            )
+        complete = statement["pointer_variables_complete"]
+        if not isinstance(complete, bool):
+            raise SkeletonError(
+                f"{statement_where}.pointer_variables_complete must be a Boolean"
+            )
+        variables_value = statement["pointer_variables"]
+        if not isinstance(variables_value, list):
+            raise SkeletonError(f"{statement_where}.pointer_variables must be an array")
+        variables: list[PointerVariableMetadata] = []
+        origins: set[tuple[str, int]] = set()
+        for variable_index, variable in enumerate(variables_value):
+            variable_where = f"{statement_where}.pointer_variables[{variable_index}]"
+            if not isinstance(variable, dict):
+                raise SkeletonError(f"{variable_where} must be an object")
+            expected_variable_keys = {
+                "name",
+                "origin",
+                "before_type",
+                "selected_target_type",
+                "before_type_is_inferred",
+            }
+            if set(variable) != expected_variable_keys:
+                raise SkeletonError(
+                    f"{variable_where} must contain exactly "
+                    f"{sorted(expected_variable_keys)}"
+                )
+            name = _nonempty_string(variable["name"], f"{variable_where}.name")
+            if "\r" in name or "\n" in name:
+                raise SkeletonError(f"{variable_where}.name must not contain a newline")
+            origin = _pointer_origin(variable["origin"], f"{variable_where}.origin")
+            origin_key = (origin.kind, origin.value)
+            if origin_key in origins:
+                raise SkeletonError(
+                    f"{statement_where} has duplicate pointer-variable origin "
+                    f"{origin.kind} {origin.value}"
+                )
+            origins.add(origin_key)
+            before_type = _nonempty_string(
+                variable["before_type"],
+                f"{variable_where}.before_type",
+            )
+            selected_target_type = _nonempty_string(
+                variable["selected_target_type"],
+                f"{variable_where}.selected_target_type",
+            )
+            inferred = variable["before_type_is_inferred"]
+            if not isinstance(inferred, bool):
+                raise SkeletonError(
+                    f"{variable_where}.before_type_is_inferred must be a Boolean"
+                )
+            variables.append(
+                PointerVariableMetadata(
+                    name=name,
+                    origin=origin,
+                    before_type=before_type,
+                    selected_target_type=selected_target_type,
+                    before_type_is_inferred=inferred,
+                )
+            )
+        result.append(
+            StatementPairMetadata(
+                label=label,
+                before_statement=before_statement,
+                pointer_variables_complete=complete,
+                pointer_variables=tuple(variables),
+            )
+        )
+    labels = tuple(statement.label for statement in result)
+    if labels != expected_labels:
+        raise SkeletonError(
+            f"{where} labels must exactly match "
+            "'statements_requiring_transformation' in producer order"
+        )
+    return tuple(result)
+
+
 def _load_record(data: Any, index: int) -> ItemRecord:
     if not isinstance(data, dict):
         raise SkeletonError(f"record {index} must be an object")
@@ -139,6 +317,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             "target_signature",
             "needs_transformation",
             "statements_requiring_transformation",
+            "statement_pair_metadata",
             "foreign_function_names",
             "signature_dependencies",
             "dependencies",
@@ -165,6 +344,11 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             raise SkeletonError(
                 f"record {record_id} preservation Boolean and label array are inconsistent"
             )
+        statement_pair_metadata = _statement_pair_metadata(
+            data["statement_pair_metadata"],
+            record_id,
+            statements_requiring_transformation,
+        )
         return ItemRecord(
             id=record_id,
             path=path,
@@ -176,6 +360,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             target_signature=_string(data, "target_signature", record_id),
             needs_transformation=needs_transformation,
             statements_requiring_transformation=statements_requiring_transformation,
+            statement_pair_metadata=statement_pair_metadata,
             foreign_function_names=_foreign_function_names(data, record_id),
             signature_dependencies=signature_dependencies,
             dependencies=dependencies,

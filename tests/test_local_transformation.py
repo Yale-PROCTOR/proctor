@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,10 @@ from proctor.llm.types import (
 
 from model import (
     ContextOverflow,
+    PointerVariableMetadata,
+    PointerVariableOrigin,
     SkeletonError,
+    StatementPairMetadata,
     dependency_context,
     function_graph,
     leaf_schedule,
@@ -47,7 +51,17 @@ from protocol import (
     validate_command,
     validation_request,
 )
-from stage import run_stage
+import stage as stage_module
+from stage import (
+    AcceptedStatementPair,
+    _code_value,
+    _load_replacement_statement_pairs,
+    _publish_final_outputs,
+    _render_statement_pairs,
+    _rust_fence,
+    _type_code_value,
+    run_stage,
+)
 from tooling import (
     CommandResult,
     CratTools,
@@ -71,6 +85,7 @@ def fn_record(
     *,
     needs_transformation: bool = True,
     transformation_labels: list[int] | None = None,
+    statement_pair_metadata: list[dict[str, object]] | None = None,
     foreign_function_names: list[str] | None = None,
 ) -> dict[str, object]:
     labels = (
@@ -92,6 +107,19 @@ def fn_record(
         "target_signature": f"unsafe fn {name}()",
         "needs_transformation": needs_transformation,
         "statements_requiring_transformation": labels,
+        "statement_pair_metadata": (
+            [
+                {
+                    "label": label,
+                    "before_statement": f"#[proctor({label})]\n()",
+                    "pointer_variables_complete": True,
+                    "pointer_variables": [],
+                }
+                for label in labels
+            ]
+            if statement_pair_metadata is None
+            else statement_pair_metadata
+        ),
         "foreign_function_names": (
             [] if foreign_function_names is None else foreign_function_names
         ),
@@ -349,6 +377,15 @@ def foreign_function_records():
         "-> usize"
     )
     scan["statements_requiring_transformation"] = [0, 1, 2, 4]
+    scan["statement_pair_metadata"] = [
+        {
+            "label": label,
+            "before_statement": f"#[proctor({label})]\n()",
+            "pointer_variables_complete": True,
+            "pointer_variables": [],
+        }
+        for label in [0, 1, 2, 4]
+    ]
     release = fn_record(
         2,
         "parser::release",
@@ -549,7 +586,7 @@ def test_loader_requires_and_preserves_function_disposition():
         loaded([malformed])
 
 
-def test_existing_function_records_and_helpers_adopt_the_final_shape():
+def test_function_records_and_python_helpers_add_statement_pair_metadata():
     plain = fn_record(0, "scalar", "scalar", [])
     assert list(plain) == [
         "id",
@@ -562,10 +599,12 @@ def test_existing_function_records_and_helpers_adopt_the_final_shape():
         "target_signature",
         "needs_transformation",
         "statements_requiring_transformation",
+        "statement_pair_metadata",
         "foreign_function_names",
         "signature_dependencies",
         "dependencies",
     ]
+    assert plain["statement_pair_metadata"]
     assert plain["foreign_function_names"] == []
     assert scalar_records()[0].foreign_function_names == ()
     assert foreign_function_records()[1].foreign_function_names == ("free", "strlen")
@@ -1141,7 +1180,7 @@ def test_foreign_metadata_does_not_change_graph_or_tool_requests():
     ]
 
 
-def test_crat_tool_argv_is_exact_for_all_four_operations():
+def test_replacement_api_cli_and_fake_tools_require_the_sidecar_output():
     tool = Path("/tools/crat-tool")
     assert make_skeleton_command(
         tool, Path("/work/current"), Path("/work/skeletons.json")
@@ -1178,6 +1217,7 @@ def test_crat_tool_argv_is_exact_for_all_four_operations():
         Path("/work/current"),
         Path("/work/replacement-request.json"),
         Path("/work/candidate.rs"),
+        Path("/work/replacement-statement-pairs.json"),
     ) == [
         "/tools/crat-tool",
         "replace",
@@ -1185,6 +1225,8 @@ def test_crat_tool_argv_is_exact_for_all_four_operations():
         "/work/replacement-request.json",
         "--output",
         "/work/candidate.rs",
+        "--statement-pairs-output",
+        "/work/replacement-statement-pairs.json",
         "/work/current",
     ]
 
@@ -1217,12 +1259,14 @@ class FakeTools:
         builds=None,
         validators=None,
         candidates=None,
+        sidecars=None,
     ):
         self.skeletons = [] if skeletons is None else skeletons
         self.normalized = normalized
         self.builds = list(builds or [CommandResult(0)])
         self.validators = list(validators or [])
         self.candidates = list(candidates or [])
+        self.sidecars = None if sidecars is None else list(sidecars)
         self.events = []
 
     def build_tools(self, crat_dir):
@@ -1252,16 +1296,37 @@ class FakeTools:
         response.write_text(raw, encoding="utf-8")
         return raw, parsed
 
-    def replace(self, current, request, candidate):
+    def replace(self, current, request, candidate, statement_pairs_output):
+        request_value = json.loads(request.read_text())
         self.events.append(
             (
                 "replace",
                 current,
-                json.loads(request.read_text()),
+                request_value,
                 (current / "lib.rs").read_text(),
+                candidate,
+                statement_pairs_output,
             )
         )
         candidate.write_text(self.candidates.pop(0), encoding="utf-8")
+        if self.sidecars is None:
+            statements = [
+                {
+                    "item_id": item["id"],
+                    "path": item["path"],
+                    "label": label,
+                    "after_statement": f"#[proctor({label})]\n()",
+                }
+                for item in request_value["items"]
+                for label in item["statements_requiring_transformation"]
+            ]
+            sidecar = {"schema_version": 1, "statements": statements}
+        else:
+            sidecar = self.sidecars.pop(0)
+        statement_pairs_output.write_text(
+            sidecar if isinstance(sidecar, str) else json.dumps(sidecar),
+            encoding="utf-8",
+        )
 
 
 class FakeClient:
@@ -1407,6 +1472,25 @@ def test_nonzero_build_preparation_or_crat_tool_exit_is_fatal(
                 "crat-tool replace": "unsafe fn target() {}\n",
             }[operation]
             output.write_text(contents)
+            if operation == "crat-tool replace":
+                statement_pairs_output = Path(
+                    command[command.index("--statement-pairs-output") + 1]
+                )
+                statement_pairs_output.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "statements": [
+                                {
+                                    "item_id": 0,
+                                    "path": "target",
+                                    "label": 0,
+                                    "after_statement": "#[proctor(0)]\n()",
+                                }
+                            ],
+                        }
+                    )
+                )
         return CommandResult(0)
 
     tools = CratTools(
@@ -1471,6 +1555,10 @@ def test_created_outputs_cannot_be_missing_nonregular_or_stale(
         assert not output.exists()
         if created_kind == "directory":
             output.mkdir()
+        if operation == "crat-tool replace":
+            (work / "replacement-statement-pairs.json").write_text(
+                '{"schema_version":1,"statements":[]}'
+            )
         return CommandResult(0)
 
     tools = CratTools(
@@ -1482,7 +1570,10 @@ def test_created_outputs_cannot_be_missing_nonregular_or_stale(
     method = getattr(tools, method_name)
     paths = [work / argument for argument in arguments]
     with pytest.raises(StageFailure, match=operation):
-        method(*paths, output)
+        if operation == "crat-tool replace":
+            method(*paths, output, work / "replacement-statement-pairs.json")
+        else:
+            method(*paths, output)
     assert not output.is_file()
 
 
@@ -1793,7 +1884,7 @@ def test_mechanical_build_failure_is_fatal_without_repair(tmp_path):
 
 def test_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
     class BrokenMechanicalReplacer(FakeTools):
-        def replace(self, current, request, candidate):
+        def replace(self, current, request, candidate, statement_pairs_output):
             raise StageFailure("mechanical replacement rejected")
 
     tools = BrokenMechanicalReplacer(
@@ -1921,7 +2012,7 @@ def test_validator_setup_or_protocol_failure_aborts_without_repair(
 
 def test_replacement_failure_is_not_sent_to_llm(tmp_path):
     class Broken(FakeTools):
-        def replace(self, current, request, candidate):
+        def replace(self, current, request, candidate, statement_pairs_output):
             raise StageFailure("TargetResolution: missing target")
 
     tools = Broken(skeletons=[fn_record(0, "target", "target", [])], validators=[VALID])
@@ -2575,3 +2666,1156 @@ def test_missing_required_paths_fail_before_side_effects(tmp_path, mutation):
     output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
     assert output.status == "failure" and not tools.events
     assert original_files == input_files()
+
+
+def _pointer_metadata(label=0, *, complete=True, variables=None, before=None):
+    return {
+        "label": label,
+        "before_statement": before or f"#[proctor({label})]\n*pointer += 1;",
+        "pointer_variables_complete": complete,
+        "pointer_variables": (
+            [
+                {
+                    "name": "pointer",
+                    "origin": {"kind": "parameter", "index": 0},
+                    "before_type": "*mut i32",
+                    "selected_target_type": "&mut i32",
+                    "before_type_is_inferred": False,
+                }
+            ]
+            if variables is None
+            else variables
+        ),
+    }
+
+
+def test_skeleton_loader_requires_exact_matching_statement_metadata():
+    record = fn_record(
+        7,
+        "module::function",
+        "function",
+        [],
+        transformation_labels=[2],
+        statement_pair_metadata=[
+            _pointer_metadata(
+                2,
+                variables=[
+                    {
+                        "name": "pointer",
+                        "origin": {"kind": "parameter", "index": 0},
+                        "before_type": "Option<\n    *mut i32,\n>",
+                        "selected_target_type": "Option<&mut i32>",
+                        "before_type_is_inferred": False,
+                    },
+                    {
+                        "name": "alias",
+                        "origin": {"kind": "local", "declaration_label": 1},
+                        "before_type": "*mut i32",
+                        "selected_target_type": "&mut i32",
+                        "before_type_is_inferred": True,
+                    },
+                ],
+            )
+        ],
+    )
+    parsed = loaded([record])[0]
+    assert parsed.statement_pair_metadata[0].pointer_variables_complete is True
+    assert parsed.statement_pair_metadata[0].pointer_variables[0].before_type == (
+        "Option<\n    *mut i32,\n>"
+    )
+    assert [
+        row.name for row in parsed.statement_pair_metadata[0].pointer_variables
+    ] == [
+        "pointer",
+        "alias",
+    ]
+
+    malformed_records = []
+    missing = copy.deepcopy(record)
+    del missing["statement_pair_metadata"]
+    malformed_records.append(missing)
+    unknown = copy.deepcopy(record)
+    unknown["statement_pair_metadata"][0]["unknown"] = 1
+    malformed_records.append(unknown)
+    wrong_labels = copy.deepcopy(record)
+    wrong_labels["statement_pair_metadata"][0]["label"] = 3
+    malformed_records.append(wrong_labels)
+    newline = copy.deepcopy(record)
+    newline["statement_pair_metadata"][0]["before_statement"] += "\n"
+    malformed_records.append(newline)
+    non_boolean = copy.deepcopy(record)
+    non_boolean["statement_pair_metadata"][0]["pointer_variables_complete"] = 1
+    malformed_records.append(non_boolean)
+    bad_name = copy.deepcopy(record)
+    bad_name["statement_pair_metadata"][0]["pointer_variables"][0]["name"] = "a\nb"
+    malformed_records.append(bad_name)
+    bad_origin = copy.deepcopy(record)
+    bad_origin["statement_pair_metadata"][0]["pointer_variables"][0]["origin"] = {
+        "kind": "parameter",
+        "declaration_label": 0,
+    }
+    malformed_records.append(bad_origin)
+    duplicate_origin = copy.deepcopy(record)
+    duplicate_origin["statement_pair_metadata"][0]["pointer_variables"][1]["origin"] = {
+        "kind": "parameter",
+        "index": 0,
+    }
+    malformed_records.append(duplicate_origin)
+    empty_type = copy.deepcopy(record)
+    empty_type["statement_pair_metadata"][0]["pointer_variables"][0][
+        "selected_target_type"
+    ] = ""
+    malformed_records.append(empty_type)
+    inferred_integer = copy.deepcopy(record)
+    inferred_integer["statement_pair_metadata"][0]["pointer_variables"][0][
+        "before_type_is_inferred"
+    ] = 0
+    malformed_records.append(inferred_integer)
+    for bad_metadata in (None, {}, "metadata"):
+        malformed = copy.deepcopy(record)
+        malformed["statement_pair_metadata"] = bad_metadata
+        malformed_records.append(malformed)
+    nonobject_statement = copy.deepcopy(record)
+    nonobject_statement["statement_pair_metadata"][0] = []
+    malformed_records.append(nonobject_statement)
+    for bad_label in (True, -1, 2**32):
+        malformed = copy.deepcopy(record)
+        malformed["statement_pair_metadata"][0]["label"] = bad_label
+        malformed_records.append(malformed)
+    empty_before = copy.deepcopy(record)
+    empty_before["statement_pair_metadata"][0]["before_statement"] = ""
+    malformed_records.append(empty_before)
+    wrong_before_type = copy.deepcopy(record)
+    wrong_before_type["statement_pair_metadata"][0]["before_statement"] = 7
+    malformed_records.append(wrong_before_type)
+    carriage_return = copy.deepcopy(record)
+    carriage_return["statement_pair_metadata"][0]["before_statement"] += "\r"
+    malformed_records.append(carriage_return)
+    wrong_variables = copy.deepcopy(record)
+    wrong_variables["statement_pair_metadata"][0]["pointer_variables"] = {}
+    malformed_records.append(wrong_variables)
+    nonobject_variable = copy.deepcopy(record)
+    nonobject_variable["statement_pair_metadata"][0]["pointer_variables"][0] = "row"
+    malformed_records.append(nonobject_variable)
+    missing_variable_key = copy.deepcopy(record)
+    del missing_variable_key["statement_pair_metadata"][0]["pointer_variables"][0][
+        "before_type"
+    ]
+    malformed_records.append(missing_variable_key)
+    unknown_variable_key = copy.deepcopy(record)
+    unknown_variable_key["statement_pair_metadata"][0]["pointer_variables"][0][
+        "unknown"
+    ] = 1
+    malformed_records.append(unknown_variable_key)
+    for field in ("name", "before_type", "selected_target_type"):
+        malformed = copy.deepcopy(record)
+        malformed["statement_pair_metadata"][0]["pointer_variables"][0][field] = ""
+        malformed_records.append(malformed)
+        malformed = copy.deepcopy(record)
+        malformed["statement_pair_metadata"][0]["pointer_variables"][0][field] = 7
+        malformed_records.append(malformed)
+    carriage_name = copy.deepcopy(record)
+    carriage_name["statement_pair_metadata"][0]["pointer_variables"][0]["name"] = (
+        "pointer\rname"
+    )
+    malformed_records.append(carriage_name)
+    for bad_origin in (
+        None,
+        {"kind": "unknown", "index": 0},
+        {"kind": "parameter", "index": True},
+        {"kind": "parameter", "index": 2**32},
+        {"kind": "parameter", "index": 0, "extra": 1},
+        {"kind": "local", "declaration_label": -1},
+        {"kind": "local", "index": 0},
+    ):
+        malformed = copy.deepcopy(record)
+        malformed["statement_pair_metadata"][0]["pointer_variables"][0]["origin"] = (
+            bad_origin
+        )
+        malformed_records.append(malformed)
+    for malformed in malformed_records:
+        with pytest.raises(SkeletonError):
+            loaded([malformed])
+
+    ordered = fn_record(
+        8,
+        "ordered",
+        "ordered",
+        [],
+        transformation_labels=[2, 4],
+        statement_pair_metadata=[
+            _pointer_metadata(2, complete=False),
+            _pointer_metadata(4),
+        ],
+    )
+    parsed_ordered = loaded([ordered])[0]
+    assert [entry.label for entry in parsed_ordered.statement_pair_metadata] == [2, 4]
+    assert parsed_ordered.statement_pair_metadata[0].pointer_variables_complete is False
+    for labels in ([4], [2, 3, 4], [4, 2]):
+        malformed = copy.deepcopy(ordered)
+        by_label = {
+            entry["label"]: entry for entry in malformed["statement_pair_metadata"]
+        }
+        malformed["statement_pair_metadata"] = [
+            by_label.get(label, _pointer_metadata(label)) for label in labels
+        ]
+        with pytest.raises(SkeletonError):
+            loaded([malformed])
+
+
+def test_replacement_sidecar_loader_is_strict_and_cross_checks_the_scc(tmp_path):
+    record = fn_record(
+        7,
+        "module::function",
+        "function",
+        [],
+        transformation_labels=[2, 4],
+        statement_pair_metadata=[_pointer_metadata(2), _pointer_metadata(4)],
+    )
+    records = {7: loaded([record])[0]}
+    path = tmp_path / "pairs.json"
+    valid = {
+        "schema_version": 1,
+        "statements": [
+            {
+                "item_id": 7,
+                "path": "module::function",
+                "label": 2,
+                "after_statement": "#[proctor(2)]\nfirst();",
+            },
+            {
+                "item_id": 7,
+                "path": "module::function",
+                "label": 4,
+                "after_statement": "#[proctor(4)]\nsecond();",
+            },
+        ],
+    }
+    path.write_text(json.dumps(valid))
+    assert [
+        pair.label for pair in _load_replacement_statement_pairs(path, (7,), records)
+    ] == [2, 4]
+
+    malformed_values = []
+    for field, value in (
+        ("schema_version", 2),
+        ("schema_version", True),
+        ("statements", {}),
+    ):
+        malformed = copy.deepcopy(valid)
+        malformed[field] = value
+        malformed_values.append(malformed)
+    unknown = copy.deepcopy(valid)
+    unknown["unknown"] = 0
+    malformed_values.append(unknown)
+    missing_top = copy.deepcopy(valid)
+    del missing_top["statements"]
+    malformed_values.append(missing_top)
+    unknown_statement = copy.deepcopy(valid)
+    unknown_statement["statements"][0]["unknown"] = 0
+    malformed_values.append(unknown_statement)
+    missing_statement_key = copy.deepcopy(valid)
+    del missing_statement_key["statements"][0]["after_statement"]
+    malformed_values.append(missing_statement_key)
+    nonobject_statement = copy.deepcopy(valid)
+    nonobject_statement["statements"][0] = []
+    malformed_values.append(nonobject_statement)
+    unsorted = copy.deepcopy(valid)
+    unsorted["statements"].reverse()
+    malformed_values.append(unsorted)
+    missing = copy.deepcopy(valid)
+    missing["statements"].pop()
+    malformed_values.append(missing)
+    wrong_path = copy.deepcopy(valid)
+    wrong_path["statements"][0]["path"] = "other"
+    malformed_values.append(wrong_path)
+    newline_path = copy.deepcopy(valid)
+    newline_path["statements"][0]["path"] += "\n"
+    malformed_values.append(newline_path)
+    carriage_path = copy.deepcopy(valid)
+    carriage_path["statements"][0]["path"] += "\r"
+    malformed_values.append(carriage_path)
+    trailing = copy.deepcopy(valid)
+    trailing["statements"][0]["after_statement"] += "\n"
+    malformed_values.append(trailing)
+    carriage_after = copy.deepcopy(valid)
+    carriage_after["statements"][0]["after_statement"] = "#[proctor(2)]\r\nfirst();"
+    malformed_values.append(carriage_after)
+    empty_path = copy.deepcopy(valid)
+    empty_path["statements"][0]["path"] = ""
+    malformed_values.append(empty_path)
+    empty_after = copy.deepcopy(valid)
+    empty_after["statements"][0]["after_statement"] = ""
+    malformed_values.append(empty_after)
+    bad_id = copy.deepcopy(valid)
+    bad_id["statements"][0]["item_id"] = 2**64
+    malformed_values.append(bad_id)
+    boolean_id = copy.deepcopy(valid)
+    boolean_id["statements"][0]["item_id"] = True
+    malformed_values.append(boolean_id)
+    string_id = copy.deepcopy(valid)
+    string_id["statements"][0]["item_id"] = "7"
+    malformed_values.append(string_id)
+    bad_label = copy.deepcopy(valid)
+    bad_label["statements"][0]["label"] = -1
+    malformed_values.append(bad_label)
+    boolean_label = copy.deepcopy(valid)
+    boolean_label["statements"][0]["label"] = False
+    malformed_values.append(boolean_label)
+    string_label = copy.deepcopy(valid)
+    string_label["statements"][0]["label"] = "2"
+    malformed_values.append(string_label)
+    oversized_label = copy.deepcopy(valid)
+    oversized_label["statements"][0]["label"] = 2**32
+    malformed_values.append(oversized_label)
+    duplicate = copy.deepcopy(valid)
+    duplicate["statements"][1] = copy.deepcopy(duplicate["statements"][0])
+    malformed_values.append(duplicate)
+    outside_item = copy.deepcopy(valid)
+    outside_item["statements"][0]["item_id"] = 8
+    malformed_values.append(outside_item)
+    wrong_path_type = copy.deepcopy(valid)
+    wrong_path_type["statements"][0]["path"] = 7
+    malformed_values.append(wrong_path_type)
+    wrong_after_type = copy.deepcopy(valid)
+    wrong_after_type["statements"][0]["after_statement"] = []
+    malformed_values.append(wrong_after_type)
+    extra_label = copy.deepcopy(valid)
+    extra_label["statements"].append(
+        {
+            "item_id": 7,
+            "path": "module::function",
+            "label": 5,
+            "after_statement": "#[proctor(5)]\nextra();",
+        }
+    )
+    malformed_values.append(extra_label)
+    for malformed in malformed_values:
+        path.write_text(json.dumps(malformed))
+        with pytest.raises(StageFailure):
+            _load_replacement_statement_pairs(path, (7,), records)
+    path.write_text("{")
+    with pytest.raises(StageFailure, match="malformed JSON"):
+        _load_replacement_statement_pairs(path, (7,), records)
+    path.write_text("[]")
+    with pytest.raises(StageFailure):
+        _load_replacement_statement_pairs(path, (7,), records)
+
+    preserved = loaded(
+        [fn_record(8, "preserved", "preserved", [], needs_transformation=False)]
+    )[0]
+    path.write_text('{"schema_version":1,"statements":[]}')
+    assert _load_replacement_statement_pairs(path, (8,), {8: preserved}) == ()
+
+
+def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
+    candidate = tmp_path / "candidate.rs"
+    sidecar = tmp_path / "pairs.json"
+    request = tmp_path / "request.json"
+    current = tmp_path / "current"
+    current.mkdir()
+    request.write_text("{}")
+    candidate.write_text("stale candidate")
+    sidecar.write_text("stale sidecar")
+    events = []
+
+    def runner(command, *, cwd=None, env=None):
+        assert not candidate.exists() and not sidecar.exists()
+        events.append(command)
+        candidate.write_text("candidate")
+        sidecar.write_text('{"schema_version":1,"statements":[]}')
+        return CommandResult(0)
+
+    tools = CratTools(
+        tmp_path / "log",
+        run_command=runner,
+        environment_factory=lambda path: {},
+    )
+    tools.crat_tool = Path("/tools/crat-tool")
+    tools.replace(current, request, candidate, sidecar)
+    assert events[0][-1] == str(current)
+    assert events[0][events[0].index("--statement-pairs-output") + 1] == str(sidecar)
+
+    for missing in (candidate, sidecar):
+        candidate.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+
+        def incomplete_runner(command, *, cwd=None, env=None):
+            other = sidecar if missing == candidate else candidate
+            other.write_text("output")
+            return CommandResult(0)
+
+        broken = CratTools(
+            tmp_path / f"log-{missing.name}",
+            run_command=incomplete_runner,
+            environment_factory=lambda path: {},
+        )
+        broken.crat_tool = Path("/tools/crat-tool")
+        with pytest.raises(StageFailure):
+            broken.replace(current, request, candidate, sidecar)
+        assert not candidate.exists() and not sidecar.exists()
+
+    for stale in (candidate, sidecar):
+        candidate.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+        stale.mkdir()
+        untouched = stale / "untouched"
+        untouched.write_text("keep")
+        with pytest.raises(StageFailure):
+            tools.replace(current, request, candidate, sidecar)
+        assert untouched.read_text() == "keep"
+        untouched.unlink()
+        stale.rmdir()
+
+    for stale in (candidate, sidecar):
+        candidate.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+        target = tmp_path / f"{stale.name}.stale-target"
+        target.write_text("keep target")
+        stale.symlink_to(target)
+        tools.replace(current, request, candidate, sidecar)
+        assert not stale.is_symlink()
+        assert target.read_text() == "keep target"
+
+    for generated_kind in ("symlink", "directory", "fifo"):
+        for generated in (candidate, sidecar):
+            candidate.unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
+
+            def irregular_runner(command, *, cwd=None, env=None):
+                other = sidecar if generated == candidate else candidate
+                other.write_text("regular")
+                if generated_kind == "symlink":
+                    generated.symlink_to(request)
+                elif generated_kind == "directory":
+                    generated.mkdir()
+                else:
+                    os.mkfifo(generated)
+                return CommandResult(0)
+
+            irregular = CratTools(
+                tmp_path / f"new-{generated_kind}-{generated.name}.log",
+                run_command=irregular_runner,
+                environment_factory=lambda path: {},
+            )
+            irregular.crat_tool = Path("/tools/crat-tool")
+            with pytest.raises(StageFailure):
+                irregular.replace(current, request, candidate, sidecar)
+            assert not (sidecar if generated == candidate else candidate).exists()
+            if generated_kind == "symlink":
+                assert not generated.is_symlink()
+            else:
+                assert generated.exists()
+                if generated_kind == "directory":
+                    generated.rmdir()
+                else:
+                    generated.unlink()
+
+    for stale_kind in ("directory", "fifo"):
+        for stale in (candidate, sidecar):
+            candidate.unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
+            if stale_kind == "directory":
+                stale.mkdir()
+                child = stale / "untouched"
+                child.write_text("keep")
+            else:
+                os.mkfifo(stale)
+            invoked = False
+
+            def must_not_run(command, *, cwd=None, env=None):
+                nonlocal invoked
+                invoked = True
+                return CommandResult(0)
+
+            rejecting = CratTools(
+                tmp_path / f"stale-{stale_kind}-{stale.name}.log",
+                run_command=must_not_run,
+                environment_factory=lambda path: {},
+            )
+            rejecting.crat_tool = Path("/tools/crat-tool")
+            with pytest.raises(StageFailure):
+                rejecting.replace(current, request, candidate, sidecar)
+            assert not invoked
+            if stale_kind == "directory":
+                assert child.read_text() == "keep"
+                child.unlink()
+                stale.rmdir()
+            else:
+                assert stale.exists()
+                stale.unlink()
+
+    def failing_runner(command, *, cwd=None, env=None):
+        candidate.write_text("partial candidate")
+        sidecar.write_text("partial sidecar")
+        return CommandResult(9, "partial stdout", "failed")
+
+    failing = CratTools(
+        tmp_path / "command-failure.log",
+        run_command=failing_runner,
+        environment_factory=lambda path: {},
+    )
+    failing.crat_tool = Path("/tools/crat-tool")
+    with pytest.raises(StageFailure, match="exit code 9"):
+        failing.replace(current, request, candidate, sidecar)
+    assert not candidate.exists() and not sidecar.exists()
+
+
+def test_failed_build_attempt_is_discarded_and_repair_success_is_kept_once(tmp_path):
+    record = fn_record(
+        0,
+        "target",
+        "target",
+        [],
+        statement_pair_metadata=[_pointer_metadata()],
+    )
+    sidecars = [
+        {
+            "schema_version": 1,
+            "statements": [
+                {
+                    "item_id": 0,
+                    "path": "target",
+                    "label": 0,
+                    "after_statement": "#[proctor(0)]\nrejected();",
+                }
+            ],
+        },
+        {
+            "schema_version": 1,
+            "statements": [
+                {
+                    "item_id": 0,
+                    "path": "target",
+                    "label": 0,
+                    "after_statement": "#[proctor(0)]\naccepted();",
+                }
+            ],
+        },
+    ]
+    tools = FakeTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(101), CommandResult(0)],
+        validators=[VALID, VALID],
+        candidates=["rejected source\n", "accepted source\n"],
+        sidecars=sidecars,
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
+    report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
+    assert output.status == "success"
+    assert "accepted();" in report and "rejected();" not in report
+    assert report.count("### Statement 0") == 1
+    assert output.metrics["compilation_failures"] == 1
+    assert output.metrics["repair_calls"] == 1
+    assert output.metrics["cargo_builds"] == 3
+    assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
+
+
+def test_malformed_sidecar_is_fatal_before_candidate_installation(tmp_path):
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        builds=[CommandResult(0)],
+        validators=[VALID],
+        candidates=["must-not-install\n"],
+        sidecars=[{"schema_version": 1, "statements": []}],
+    )
+    client = FakeClient([response()])
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "failure"
+    assert "do not exactly match" in output.error
+    assert (value.framework.workdir / "current/lib.rs").read_text() == "normalized\n"
+    assert len([event for event in tools.events if event[0] == "cargo_build"]) == 1
+    assert len(client.requests) == 1
+    assert not value.outputs.rust_project.exists()
+    assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+
+
+def test_accepted_pairs_sort_by_item_and_label_not_scc_schedule(tmp_path):
+    records = [
+        fn_record(
+            0,
+            "root",
+            "root",
+            [2],
+            transformation_labels=[0, 3],
+            statement_pair_metadata=[_pointer_metadata(0), _pointer_metadata(3)],
+        ),
+        fn_record(1, "independent", "independent", []),
+        fn_record(2, "leaf", "leaf", []),
+    ]
+    tools = FakeTools(
+        skeletons=records,
+        builds=[CommandResult(0)] * 4,
+        validators=[VALID] * 3,
+        candidates=["independent\n", "leaf\n", "root\n"],
+    )
+    value, output = run_fake(
+        tmp_path,
+        tools,
+        FakeClient([response("independent"), response("leaf"), response("root")]),
+    )
+    assert output.status == "success"
+    processed = [
+        event[2]["items"][0]["id"] for event in tools.events if event[0] == "replace"
+    ]
+    assert processed == [1, 2, 0]
+    report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
+    positions = [report.index(f"## Item {item_id}:") for item_id in (0, 1, 2)]
+    assert positions == sorted(positions)
+    assert report.index("### Statement 0") < report.index("### Statement 3")
+    assert report.count("## Item 0:") == 1
+
+
+def test_markdown_renders_origins_completeness_and_escaping_exactly():
+    variables = (
+        PointerVariableMetadata(
+            name="shadow|`\\",
+            origin=PointerVariableOrigin("parameter", 0),
+            before_type=" \tOption<\r\n    &'a mut [core::mem::MaybeUninit<i32>;\f32],\n> ",
+            selected_target_type="&mut [i32]",
+            before_type_is_inferred=False,
+        ),
+        PointerVariableMetadata(
+            name="shadow|`\\",
+            origin=PointerVariableOrigin("local", 3),
+            before_type="*mut i32",
+            selected_target_type="*mut i32",
+            before_type_is_inferred=True,
+        ),
+    )
+    metadata = StatementPairMetadata(
+        label=2,
+        before_statement="#[proctor(2)]\n*pointer += 1;",
+        pointer_variables_complete=False,
+        pointer_variables=variables,
+    )
+    pair = AcceptedStatementPair(
+        item_id=7,
+        path="module<&>|`\\::function",
+        metadata=metadata,
+        after_statement="#[proctor(2)]\n*pointer += 2;",
+    )
+    report = _render_statement_pairs({(7, 2): pair})
+    assert report == (
+        "# Before/After Statement Pairs\n\n"
+        "This report contains build-accepted local-transformation statement pairs.\n\n"
+        "## Item 7: "
+        "<code>module&lt;&amp;&gt;&#124;&#96;&#92;::function</code>\n\n"
+        "### Statement 2\n\n"
+        "#### Before\n\n"
+        "```rust\n"
+        "#[proctor(2)]\n"
+        "*pointer += 1;\n"
+        "```\n\n"
+        "#### After\n\n"
+        "```rust\n"
+        "#[proctor(2)]\n"
+        "*pointer += 2;\n"
+        "```\n\n"
+        "#### Pointer variables\n\n"
+        "> **Warning:** Pointer-variable metadata is incomplete because Crat could "
+        "not\n"
+        "> resolve every possible binding occurrence in this source statement.\n\n"
+        "| Variable | Origin | Before type | Selected target type | "
+        "Before type inferred |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| <code>shadow&#124;&#96;&#92;</code> | <code>parameter 0</code> | "
+        "<code>Option&lt; &amp;'a mut "
+        "[core::mem::MaybeUninit&lt;i32&gt;; 32], &gt;</code> | "
+        "<code>&amp;mut [i32]</code> | no |\n"
+        "| <code>shadow&#124;&#96;&#92;</code> | "
+        "<code>local statement 3</code> | <code>*mut i32</code> | "
+        "<code>*mut i32</code> | yes |\n"
+    )
+    assert (
+        _type_code_value(variables[0].before_type) == "<code>Option&lt; &amp;'a mut "
+        "[core::mem::MaybeUninit&lt;i32&gt;; 32], &gt;</code>"
+    )
+    assert _code_value("&<>|`\\") == ("<code>&amp;&lt;&gt;&#124;&#96;&#92;</code>")
+    with pytest.raises(StageFailure):
+        _code_value("not\nsingle")
+    assert "<code>parameter 0</code>" in report
+    assert "<code>local statement 3</code>" in report
+    assert "| no |" in report and "| yes |" in report
+    assert report.count("<code>shadow&#124;&#96;&#92;</code>") == 2
+    assert "> **Warning:** Pointer-variable metadata is incomplete" in report
+    assert _rust_fence("plain") == "```rust\nplain\n```"
+    assert _rust_fence("a```b") == "````rust\na```b\n````"
+    assert _rust_fence("a`````b") == "``````rust\na`````b\n``````"
+
+    complete_empty = replace(
+        metadata,
+        pointer_variables_complete=True,
+        pointer_variables=(),
+    )
+    incomplete_empty = replace(metadata, pointer_variables=())
+    complete_empty_report = _render_statement_pairs(
+        {(7, 2): replace(pair, metadata=complete_empty)}
+    )
+    empty_report_prefix = (
+        "# Before/After Statement Pairs\n\n"
+        "This report contains build-accepted local-transformation statement pairs.\n\n"
+        "## Item 7: <code>module&lt;&amp;&gt;&#124;&#96;&#92;::function</code>\n\n"
+        "### Statement 2\n\n"
+        "#### Before\n\n"
+        "```rust\n"
+        "#[proctor(2)]\n"
+        "*pointer += 1;\n"
+        "```\n\n"
+        "#### After\n\n"
+        "```rust\n"
+        "#[proctor(2)]\n"
+        "*pointer += 2;\n"
+        "```\n\n"
+        "#### Pointer variables\n\n"
+    )
+    assert complete_empty_report == (
+        empty_report_prefix
+        + "_No existing source raw-pointer parameter or simple local binding appears in\n"
+        "this statement._\n"
+    )
+    incomplete_empty_report = _render_statement_pairs(
+        {(7, 2): replace(pair, metadata=incomplete_empty)}
+    )
+    assert incomplete_empty_report == (
+        empty_report_prefix
+        + "> **Warning:** Pointer-variable metadata is incomplete because Crat could "
+        "not\n"
+        "> resolve every possible binding occurrence in this source statement.\n\n"
+        "_No eligible pointer-variable binding could be resolved for this statement._\n"
+    )
+
+
+def test_markdown_uses_complete_before_and_canonical_after_snippets():
+    parent = AcceptedStatementPair(
+        item_id=4,
+        path="choose",
+        metadata=StatementPairMetadata(
+            0,
+            "#[proctor(0)]\nif flag {\n    #[proctor(1)]\n    *pointer\n}",
+            True,
+            (),
+        ),
+        after_statement=(
+            "#[proctor(0)]\nif flag {\n    #[proctor(1)]\n    changed(pointer)\n}"
+        ),
+    )
+    child = AcceptedStatementPair(
+        item_id=4,
+        path="choose",
+        metadata=StatementPairMetadata(1, "#[proctor(1)]\n*pointer", True, ()),
+        after_statement="#[proctor(1)]\nchanged(pointer)",
+    )
+    expansion = AcceptedStatementPair(
+        item_id=5,
+        path="expansion",
+        metadata=StatementPairMetadata(2, "#[proctor(2)]\n*pointer", True, ()),
+        after_statement=(
+            "#[proctor(2)]\nlet proctor_temp_var_0 = pointer;\n"
+            "#[proctor(2)]\n*proctor_temp_var_0"
+        ),
+    )
+    report = _render_statement_pairs({(4, 0): parent, (4, 1): child, (5, 2): expansion})
+    assert report.count("#[proctor(1)]") == 4
+    assert report.count("#[proctor(2)]") == 3
+    assert "proctor_temp_var_0" in report
+    assert "raw rejected" not in report
+
+
+def test_report_destination_fallback_empty_report_and_stale_path_handling(tmp_path):
+    empty_report = (
+        "# Before/After Statement Pairs\n\n"
+        "This report contains build-accepted local-transformation statement pairs.\n\n"
+        "_No statements required local transformation._\n"
+    )
+    for artifacts in (True, False):
+        case = tmp_path / ("artifacts" if artifacts else "workdir")
+        case.mkdir()
+        tools = FakeTools(builds=[CommandResult(0)])
+        value, output = run_fake(case, tools, FakeClient([]), artifacts=artifacts)
+        assert output.status == "success"
+        report = (
+            value.outputs.artifacts_dir / "statement-pairs.md"
+            if artifacts
+            else value.framework.workdir / "statement-pairs.md"
+        )
+        assert report.read_text() == empty_report
+        assert not (value.outputs.rust_project / "statement-pairs.md").exists()
+        assert output.logs == (("local-transformation.log",) if artifacts else ())
+
+    for stale_kind in ("file", "symlink"):
+        successful_case = tmp_path / f"successful-stale-{stale_kind}"
+        successful_case.mkdir()
+        value = stage_input(successful_case)
+        report = value.outputs.artifacts_dir / "statement-pairs.md"
+        target = successful_case / "stale-target"
+        if stale_kind == "file":
+            report.write_text("stale")
+        else:
+            target.write_text("target stays")
+            report.symlink_to(target)
+        output = run_stage(
+            value,
+            stage_dir=STAGE_DIR,
+            tools=FakeTools(builds=[CommandResult(0)]),
+            llm_client_factory=lambda settings, tracker: FakeClient([]),
+        )
+        assert output.status == "success"
+        assert report.read_text() == empty_report
+        assert not report.is_symlink()
+        if stale_kind == "symlink":
+            assert target.read_text() == "target stays"
+
+    for stale_kind in ("file", "symlink"):
+        stale_case = tmp_path / f"failed-stale-{stale_kind}"
+        stale_case.mkdir()
+        value = stage_input(stale_case)
+        report = value.outputs.artifacts_dir / "statement-pairs.md"
+        target = stale_case / "stale-target"
+        if stale_kind == "file":
+            report.write_text("stale")
+        else:
+            target.write_text("target stays")
+            report.symlink_to(target)
+        output = run_stage(
+            value,
+            stage_dir=STAGE_DIR,
+            tools=FakeTools(builds=[CommandResult(101)]),
+            llm_client_factory=lambda settings, tracker: FakeClient([]),
+        )
+        assert output.status == "failure" and not report.exists()
+        if stale_kind == "symlink":
+            assert target.read_text() == "target stays"
+
+    directory_case = tmp_path / "directory"
+    directory_case.mkdir()
+    value = stage_input(directory_case)
+    report = value.outputs.artifacts_dir / "statement-pairs.md"
+    report.mkdir()
+    sibling = value.outputs.artifacts_dir / "sibling"
+    sibling.write_text("keep")
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert report.is_dir() and sibling.read_text() == "keep" and not tools.events
+
+    fifo_case = tmp_path / "fifo"
+    fifo_case.mkdir()
+    value = stage_input(fifo_case)
+    report = value.outputs.artifacts_dir / "statement-pairs.md"
+    os.mkfifo(report)
+    sibling = value.outputs.artifacts_dir / "sibling"
+    sibling.write_text("keep")
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert report.exists() and sibling.read_text() == "keep" and not tools.events
+
+    for relation in ("equal", "report_descendant", "report_ancestor"):
+        overlap_case = tmp_path / f"overlap-{relation}"
+        overlap_case.mkdir()
+        value = stage_input(overlap_case)
+        artifacts_dir = overlap_case / "new-artifacts"
+        report_path = artifacts_dir / "statement-pairs.md"
+        if relation == "equal":
+            rust_output = report_path
+        elif relation == "report_descendant":
+            rust_output = artifacts_dir
+        else:
+            rust_output = report_path / "rust"
+        value = replace(
+            value,
+            outputs=replace(
+                value.outputs,
+                artifacts_dir=artifacts_dir,
+                rust_project=rust_output,
+            ),
+        )
+        tools = FakeTools()
+        output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+        assert output.status == "failure"
+        assert "report path overlaps" in output.error
+        assert not tools.events
+
+
+def test_final_copy_and_report_publication_cleanup_is_exact(tmp_path, monkeypatch):
+    current = tmp_path / "current"
+    current.mkdir()
+    (current / "lib.rs").write_text("accepted")
+    (current / "target").mkdir()
+    destination = tmp_path / "output"
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    report = artifacts / "statement-pairs.md"
+    sibling = artifacts / "sibling"
+    sibling.write_text("keep")
+    events = []
+    real_copy = stage_module._copy_final
+    real_replace = stage_module.os.replace
+    real_fdopen = stage_module.os.fdopen
+    real_mkstemp = stage_module.tempfile.mkstemp
+    real_remove_output = stage_module._remove_exact_output
+
+    def observed_copy(source, output, mark_destination_created):
+        events.append("copy")
+        real_copy(source, output, mark_destination_created)
+
+    def observed_replace(source, output):
+        events.append("publish")
+        real_replace(source, output)
+
+    monkeypatch.setattr(stage_module, "_copy_final", observed_copy)
+    monkeypatch.setattr(stage_module.os, "replace", observed_replace)
+    _publish_final_outputs(current, destination, report, "report\n")
+    assert events[-1] == "publish"
+    assert report.read_text() == "report\n"
+    assert (destination / "lib.rs").read_text() == "accepted"
+    assert not (destination / "target").exists()
+
+    failure_root = tmp_path / "publication-failure"
+    failure_root.mkdir()
+    failed_destination = failure_root / "output"
+    failed_artifacts = failure_root / "artifacts"
+    failed_artifacts.mkdir()
+    failed_report = failed_artifacts / "statement-pairs.md"
+    failed_sibling = failed_artifacts / "sibling"
+    failed_sibling.write_text("keep")
+
+    def publication_failure(source, output):
+        raise OSError("atomic publication failed")
+
+    monkeypatch.setattr(stage_module, "_copy_final", real_copy)
+    monkeypatch.setattr(stage_module.os, "replace", publication_failure)
+    with pytest.raises(StageFailure, match="atomic publication failed"):
+        _publish_final_outputs(
+            current,
+            failed_destination,
+            failed_report,
+            "report\n",
+        )
+    assert not failed_destination.exists()
+    assert not failed_report.exists()
+    assert not list(failed_artifacts.glob(".statement-pairs.md.*.tmp"))
+    assert failed_sibling.read_text() == "keep"
+
+    ownership_root = tmp_path / "publication-ownership"
+    ownership_root.mkdir()
+    ownership_destination = ownership_root / "output"
+    ownership_artifacts = ownership_root / "artifacts"
+    ownership_artifacts.mkdir()
+    ownership_report = ownership_artifacts / "statement-pairs.md"
+
+    def external_report_then_failure(source, output):
+        ownership_report.write_text("external report")
+        raise OSError("publication raced")
+
+    monkeypatch.setattr(stage_module.os, "replace", external_report_then_failure)
+    with pytest.raises(StageFailure, match="publication raced"):
+        _publish_final_outputs(
+            current,
+            ownership_destination,
+            ownership_report,
+            "our report\n",
+        )
+    assert ownership_report.read_text() == "external report"
+    assert not ownership_destination.exists()
+    assert not list(ownership_artifacts.glob(".statement-pairs.md.*.tmp"))
+
+    for external_kind in ("file", "symlink", "directory"):
+        external_root = tmp_path / f"copy-ownership-{external_kind}"
+        external_root.mkdir()
+        external_destination = external_root / "output"
+        external_report = external_root / "statement-pairs.md"
+        external_target = external_root / "external-target"
+
+        def external_destination_then_failure(source, output, mark_destination_created):
+            if external_kind == "file":
+                output.write_text("external file")
+            elif external_kind == "symlink":
+                external_target.write_text("external target")
+                output.symlink_to(external_target)
+            else:
+                output.mkdir()
+                (output / "external").write_text("external tree")
+            raise OSError(f"copy raced with external {external_kind}")
+
+        monkeypatch.setattr(
+            stage_module,
+            "_copy_final",
+            external_destination_then_failure,
+        )
+        with pytest.raises(StageFailure, match="copy raced with external"):
+            _publish_final_outputs(
+                current,
+                external_destination,
+                external_report,
+                "report\n",
+            )
+        if external_kind == "file":
+            assert external_destination.read_text() == "external file"
+        elif external_kind == "symlink":
+            assert external_destination.is_symlink()
+            assert external_target.read_text() == "external target"
+        else:
+            assert (external_destination / "external").read_text() == "external tree"
+        assert not external_report.exists()
+    monkeypatch.setattr(stage_module, "_copy_final", real_copy)
+
+    temp_failure_root = tmp_path / "temp-write-failure"
+    temp_failure_root.mkdir()
+    temp_destination = temp_failure_root / "output"
+    temp_artifacts = temp_failure_root / "artifacts"
+    temp_artifacts.mkdir()
+    temp_report = temp_artifacts / "statement-pairs.md"
+
+    class FailingWriter:
+        def __init__(self, descriptor):
+            self.output = real_fdopen(descriptor, "w", encoding="utf-8", newline="")
+
+        def __enter__(self):
+            return self
+
+        def write(self, value):
+            self.output.write(value[:4])
+            raise OSError("temporary write failed")
+
+        def __exit__(self, *args):
+            self.output.close()
+
+    monkeypatch.setattr(
+        stage_module.os,
+        "fdopen",
+        lambda descriptor, *args, **kwargs: FailingWriter(descriptor),
+    )
+    monkeypatch.setattr(stage_module.os, "replace", real_replace)
+    with pytest.raises(StageFailure, match="temporary write failed"):
+        _publish_final_outputs(current, temp_destination, temp_report, "report\n")
+    assert not temp_destination.exists() and not temp_report.exists()
+    assert not list(temp_artifacts.glob(".statement-pairs.md.*.tmp"))
+    monkeypatch.setattr(stage_module.os, "fdopen", real_fdopen)
+
+    partial_destination = tmp_path / "partial-output"
+    partial_report = artifacts / "partial-report.md"
+
+    def partial_copy(source, output, mark_destination_created):
+        output.mkdir()
+        mark_destination_created()
+        (output / "partial").write_text("partial")
+        raise OSError("partial copy")
+
+    monkeypatch.setattr(stage_module, "_copy_final", partial_copy)
+    monkeypatch.setattr(stage_module.os, "replace", real_replace)
+    with pytest.raises(StageFailure, match="partial copy"):
+        _publish_final_outputs(current, partial_destination, partial_report, "report\n")
+    assert not partial_destination.exists() and not partial_report.exists()
+    assert sibling.read_text() == "keep"
+
+    cleanup_destination = tmp_path / "cleanup-output"
+    cleanup_report = artifacts / "cleanup-report.md"
+
+    def cleanup_copy(source, output, mark_destination_created):
+        output.mkdir()
+        mark_destination_created()
+        raise OSError("primary copy failure")
+
+    def cleanup_failure(path):
+        real_remove_output(path)
+        raise OSError("reported cleanup failure")
+
+    monkeypatch.setattr(stage_module, "_copy_final", cleanup_copy)
+    monkeypatch.setattr(stage_module, "_remove_exact_output", cleanup_failure)
+    with pytest.raises(StageFailure) as cleanup_error:
+        _publish_final_outputs(current, cleanup_destination, cleanup_report, "report\n")
+    assert "primary copy failure" in str(cleanup_error.value)
+    assert "cleanup failures" in str(cleanup_error.value)
+    assert "reported cleanup failure" in str(cleanup_error.value)
+    assert not cleanup_destination.exists()
+
+    monkeypatch.setattr(stage_module, "_copy_final", real_copy)
+    monkeypatch.setattr(stage_module, "_remove_exact_output", real_remove_output)
+    monkeypatch.setattr(stage_module.tempfile, "mkstemp", real_mkstemp)
+    monkeypatch.setattr(stage_module.os, "replace", real_replace)
+
+    later_case = tmp_path / "later-fatal-scc"
+    later_case.mkdir()
+    later_records = [
+        fn_record(0, "leaf", "leaf", []),
+        fn_record(1, "caller", "caller", [0]),
+    ]
+    valid_leaf_sidecar = {
+        "schema_version": 1,
+        "statements": [
+            {
+                "item_id": 0,
+                "path": "leaf",
+                "label": 0,
+                "after_statement": "#[proctor(0)]\naccepted_leaf();",
+            }
+        ],
+    }
+    tools = FakeTools(
+        skeletons=later_records,
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[VALID, VALID],
+        candidates=["accepted leaf\n", "must not install\n"],
+        sidecars=[valid_leaf_sidecar, {"schema_version": 1, "statements": []}],
+    )
+    value, output = run_fake(
+        later_case,
+        tools,
+        FakeClient([response("leaf"), response("caller")]),
+    )
+    assert output.status == "failure"
+    assert not value.outputs.rust_project.exists()
+    assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+
+    exhausted_case = tmp_path / "exhausted-repair"
+    exhausted_case.mkdir()
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        builds=[CommandResult(0)],
+        validators=[INVALID] * 11,
+    )
+    value, output = run_fake(
+        exhausted_case,
+        tools,
+        FakeClient([response()] * 11),
+    )
+    assert output.status == "failure"
+    assert output.metrics["repair_calls"] == 10
+    assert not value.outputs.rust_project.exists()
+    assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+
+    mutation_case = tmp_path / "last-mutation"
+    mutation_case.mkdir()
+    value = stage_input(mutation_case)
+    report_path = value.outputs.artifacts_dir / "statement-pairs.md"
+    mutations = []
+
+    def run_copy(source, output, mark_destination_created):
+        mutations.append(("copy", output))
+        real_copy(source, output, mark_destination_created)
+
+    def run_mkstemp(*args, **kwargs):
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        mutations.append(("temporary", Path(name)))
+        return descriptor, name
+
+    def run_replace(source, output):
+        real_replace(source, output)
+        if Path(output) == report_path:
+            mutations.append(("publish", Path(output)))
+
+    monkeypatch.setattr(stage_module, "_copy_final", run_copy)
+    monkeypatch.setattr(stage_module.tempfile, "mkstemp", run_mkstemp)
+    monkeypatch.setattr(stage_module.os, "replace", run_replace)
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=FakeTools(builds=[CommandResult(0)]),
+        llm_client_factory=lambda settings, tracker: FakeClient([]),
+    )
+    assert output.status == "success"
+    assert mutations[-1] == ("publish", report_path)
+    assert value.outputs.rust_project.exists() and report_path.exists()
+    assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
