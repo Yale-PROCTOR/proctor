@@ -25,6 +25,10 @@ class ObservationError(ValueError):
     pass
 
 
+class RuleError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class CallableCorrespondence:
     item_id: int
@@ -56,6 +60,11 @@ class ReplacementMetadata:
 @dataclass(frozen=True)
 class ObservationDocument:
     observations: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class RuleDocument:
+    rules: tuple[dict[str, Any], ...]
 
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -299,14 +308,21 @@ def _external_identity(value: Any, where: str) -> None:
         raise ObservationError(f"{where}.path must be a nonempty string array")
 
 
-def _adt_identity(value: Any, where: str) -> None:
+def _adt_identity(
+    value: Any, where: str, expected_local_kind: str | None = None
+) -> None:
     if not isinstance(value, dict):
         raise ObservationError(f"{where} must be an object")
     if value.get("kind") == "external":
         _external_identity(value, where)
     elif value.get("kind") == "local":
         _exact_object(value, {"kind", "id"}, where)
-        _anon(value["id"], {"struct", "enum", "union"}, f"{where}.id")
+        allowed = (
+            {expected_local_kind}
+            if expected_local_kind is not None
+            else {"struct", "enum", "union"}
+        )
+        _anon(value["id"], allowed, f"{where}.id")
     else:
         raise ObservationError(f"{where}.kind is unknown")
 
@@ -355,7 +371,11 @@ def _type_tree(value: Any, where: str) -> None:
     elif kind == "adt":
         _exact_object(value, {"kind", "adt_kind", "identity", "arguments"}, where)
         _enum(value["adt_kind"], {"struct", "enum", "union"}, f"{where}.adt_kind")
-        _adt_identity(value["identity"], f"{where}.identity")
+        _adt_identity(
+            value["identity"],
+            f"{where}.identity",
+            expected_local_kind=value["adt_kind"],
+        )
         if not isinstance(value["arguments"], list):
             raise ObservationError(f"{where}.arguments must be an array")
         for index, argument in enumerate(value["arguments"]):
@@ -731,6 +751,533 @@ def load_observations(text: str) -> ObservationDocument:
             _type_tree(observation[key], f"{where}.{key}")
         _validate_anonymization(observation, where)
     return ObservationDocument(observations=tuple(value["observations"]))
+
+
+_VARIABLE_SORTS = frozenset(
+    {
+        "anchor",
+        "binding",
+        "function",
+        "struct",
+        "enum",
+        "union",
+        "field",
+        "variant",
+        "constant",
+        "static",
+        "method",
+        "expression",
+        "integer_magnitude",
+    }
+)
+
+
+def _rule_variable(value: Any, allowed: set[str], where: str) -> dict[str, Any]:
+    checked: dict[str, Any] = _exact_object(value, {"kind", "sort", "index"}, where)
+    if checked["kind"] != "variable":
+        raise ObservationError(f"{where}.kind must be 'variable'")
+    sort = checked["sort"]
+    if not isinstance(sort, str) or sort not in _VARIABLE_SORTS:
+        raise ObservationError(f"{where}.sort has unknown value {sort!r}")
+    if sort not in allowed:
+        raise ObservationError(f"{where}.sort is not valid at this position")
+    _wire_integer(checked["index"], f"{where}.index")
+    return checked
+
+
+def _rule_adt_identity(value: Any, expected: str | None, where: str) -> None:
+    if isinstance(value, dict) and value.get("kind") == "variable":
+        allowed = {expected} if expected is not None else {"struct", "enum", "union"}
+        _rule_variable(value, allowed, where)
+    elif isinstance(value, dict) and value.get("kind") == "external":
+        _external_identity(value, where)
+    else:
+        raise ObservationError(f"{where} must be an ADT variable or external identity")
+
+
+def _rule_member_identity(value: Any, member_sort: str, where: str) -> None:
+    if not isinstance(value, dict):
+        raise ObservationError(f"{where} must be an object")
+    if value.get("kind") == "external":
+        _external_identity(value, where)
+    elif value.get("kind") == "local":
+        _exact_object(value, {"kind", "owner", "id"}, where)
+        _rule_adt_identity(value["owner"], None, f"{where}.owner")
+        _rule_variable(value["id"], {member_sort}, f"{where}.id")
+    else:
+        raise ObservationError(f"{where}.kind is unknown")
+
+
+def _rule_type_tree(value: Any, where: str) -> None:
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        raise ObservationError(f"{where} must be a tagged object")
+    kind = value["kind"]
+    if kind == "primitive":
+        _exact_object(value, {"kind", "name"}, where)
+        _enum(value["name"], _PRIMITIVES, f"{where}.name")
+    elif kind == "slice":
+        _exact_object(value, {"kind", "element"}, where)
+        _rule_type_tree(value["element"], f"{where}.element")
+    elif kind == "array":
+        _exact_object(value, {"kind", "element", "length"}, where)
+        _rule_type_tree(value["element"], f"{where}.element")
+        _wire_integer(value["length"], f"{where}.length")
+    elif kind in {"raw_pointer", "reference"}:
+        _exact_object(value, {"kind", "mutability", "pointee"}, where)
+        _enum(
+            value["mutability"],
+            {"const", "mut"} if kind == "raw_pointer" else {"shared", "mutable"},
+            f"{where}.mutability",
+        )
+        _rule_type_tree(value["pointee"], f"{where}.pointee")
+    elif kind == "tuple":
+        _exact_object(value, {"kind", "elements"}, where)
+        if not isinstance(value["elements"], list):
+            raise ObservationError(f"{where}.elements must be an array")
+        for index, element in enumerate(value["elements"]):
+            _rule_type_tree(element, f"{where}.elements[{index}]")
+    elif kind == "adt":
+        _exact_object(value, {"kind", "adt_kind", "identity", "arguments"}, where)
+        adt_kind = _enum(
+            value["adt_kind"], {"struct", "enum", "union"}, f"{where}.adt_kind"
+        )
+        _rule_adt_identity(value["identity"], adt_kind, f"{where}.identity")
+        if not isinstance(value["arguments"], list):
+            raise ObservationError(f"{where}.arguments must be an array")
+        for index, argument in enumerate(value["arguments"]):
+            _rule_type_tree(argument, f"{where}.arguments[{index}]")
+    else:
+        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
+
+
+def _rule_value_identity(value: Any, where: str) -> None:
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        raise ObservationError(f"{where} must be a tagged object")
+    kind = value["kind"]
+    if kind == "variable":
+        _rule_variable(
+            value,
+            {"anchor", "binding", "function", "constant", "static", "method"},
+            where,
+        )
+    elif kind == "external":
+        _external_identity(value, where)
+    elif kind in {"foreign_function", "foreign_static"}:
+        _exact_object(value, {"kind", "symbol"}, where)
+        if not isinstance(value["symbol"], str) or not value["symbol"]:
+            raise ObservationError(f"{where}.symbol must be nonempty")
+    elif kind == "constructor":
+        _exact_object(value, {"kind", "adt", "variant"}, where)
+        _rule_adt_identity(value["adt"], None, f"{where}.adt")
+        if value["variant"] is not None:
+            _rule_member_identity(value["variant"], "variant", f"{where}.variant")
+    else:
+        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
+
+
+def _rule_expression(value: Any, where: str) -> None:
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        raise ObservationError(f"{where} must be a tagged expression")
+    kind = value["kind"]
+    if kind == "variable":
+        _rule_variable(value, {"expression"}, where)
+    elif kind in {"array", "tuple"}:
+        _exact_object(value, {"kind", "elements"}, where)
+        if not isinstance(value["elements"], list):
+            raise ObservationError(f"{where}.elements must be an array")
+        for index, child in enumerate(value["elements"]):
+            _rule_expression(child, f"{where}.elements[{index}]")
+    elif kind == "call":
+        _exact_object(value, {"kind", "callee", "arguments"}, where)
+        _rule_expression(value["callee"], f"{where}.callee")
+        if not isinstance(value["arguments"], list):
+            raise ObservationError(f"{where}.arguments must be an array")
+        for index, child in enumerate(value["arguments"]):
+            _rule_expression(child, f"{where}.arguments[{index}]")
+    elif kind == "method_call":
+        _exact_object(value, {"kind", "receiver", "method", "arguments"}, where)
+        _rule_expression(value["receiver"], f"{where}.receiver")
+        _rule_value_identity(value["method"], f"{where}.method")
+        if not isinstance(value["arguments"], list):
+            raise ObservationError(f"{where}.arguments must be an array")
+        for index, child in enumerate(value["arguments"]):
+            _rule_expression(child, f"{where}.arguments[{index}]")
+    elif kind in {"binary", "assign_op"}:
+        _exact_object(value, {"kind", "operator", "left", "right"}, where)
+        _enum(value["operator"], _BINARY, f"{where}.operator")
+        _rule_expression(value["left"], f"{where}.left")
+        _rule_expression(value["right"], f"{where}.right")
+    elif kind == "unary":
+        _exact_object(value, {"kind", "operator", "operand"}, where)
+        _enum(value["operator"], {"deref", "not", "negate"}, f"{where}.operator")
+        _rule_expression(value["operand"], f"{where}.operand")
+    elif kind == "path":
+        _exact_object(value, {"kind", "value"}, where)
+        _rule_value_identity(value["value"], f"{where}.value")
+    elif kind == "cast":
+        _exact_object(value, {"kind", "expression", "type"}, where)
+        _rule_expression(value["expression"], f"{where}.expression")
+        _rule_type_tree(value["type"], f"{where}.type")
+    elif kind in {"assign", "index"}:
+        keys = (
+            {"kind", "left", "right"} if kind == "assign" else {"kind", "base", "index"}
+        )
+        _exact_object(value, keys, where)
+        for key in ("left", "right") if kind == "assign" else ("base", "index"):
+            _rule_expression(value[key], f"{where}.{key}")
+    elif kind == "field":
+        _exact_object(value, {"kind", "base", "field"}, where)
+        _rule_expression(value["base"], f"{where}.base")
+        _rule_member_identity(value["field"], "field", f"{where}.field")
+    elif kind == "range":
+        _exact_object(value, {"kind", "start", "end", "limits"}, where)
+        _enum(value["limits"], {"half_open", "closed"}, f"{where}.limits")
+        for key in ("start", "end"):
+            if value[key] is not None:
+                _rule_expression(value[key], f"{where}.{key}")
+    elif kind == "if":
+        _exact_object(value, {"kind", "condition", "then", "else"}, where)
+        _rule_expression(value["condition"], f"{where}.condition")
+        _rule_block(value["then"], f"{where}.then")
+        if value["else"] is not None:
+            _rule_expression(value["else"], f"{where}.else")
+    elif kind == "while":
+        _exact_object(value, {"kind", "condition", "body"}, where)
+        _rule_expression(value["condition"], f"{where}.condition")
+        _rule_block(value["body"], f"{where}.body")
+    elif kind == "loop":
+        _exact_object(value, {"kind", "body"}, where)
+        _rule_block(value["body"], f"{where}.body")
+    elif kind == "struct":
+        _exact_object(value, {"kind", "adt", "variant", "fields", "rest"}, where)
+        _rule_adt_identity(value["adt"], None, f"{where}.adt")
+        if value["variant"] is not None:
+            _rule_member_identity(value["variant"], "variant", f"{where}.variant")
+        if not isinstance(value["fields"], list):
+            raise ObservationError(f"{where}.fields must be an array")
+        seen_fields: set[str] = set()
+        for index, field in enumerate(value["fields"]):
+            field_where = f"{where}.fields[{index}]"
+            field = _exact_object(field, {"field", "value"}, field_where)
+            _rule_member_identity(field["field"], "field", f"{field_where}.field")
+            field_key = json.dumps(field["field"], sort_keys=True)
+            if field_key in seen_fields:
+                raise ObservationError(f"{where}.fields contains a duplicate field")
+            seen_fields.add(field_key)
+            _rule_expression(field["value"], f"{field_where}.value")
+        if value["rest"] is not None:
+            _rule_expression(value["rest"], f"{where}.rest")
+    elif kind == "literal":
+        _exact_object(value, {"kind", "value"}, where)
+        _rule_literal(value["value"], f"{where}.value")
+    elif kind == "address_of":
+        _exact_object(value, {"kind", "borrow", "mutability", "expression"}, where)
+        _enum(value["borrow"], {"reference", "raw"}, f"{where}.borrow")
+        _enum(value["mutability"], {"const", "mut"}, f"{where}.mutability")
+        _rule_expression(value["expression"], f"{where}.expression")
+    elif kind in {"return", "break"}:
+        _exact_object(value, {"kind", "value"}, where)
+        if value["value"] is not None:
+            _rule_expression(value["value"], f"{where}.value")
+    elif kind == "continue":
+        _exact_object(value, {"kind"}, where)
+    elif kind == "repeat":
+        _exact_object(value, {"kind", "value", "count"}, where)
+        _rule_expression(value["value"], f"{where}.value")
+        _rule_expression(value["count"], f"{where}.count")
+    elif kind == "block":
+        _exact_object(value, {"kind", "block"}, where)
+        _rule_block(value["block"], f"{where}.block")
+    else:
+        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
+
+
+def _rule_literal(value: Any, where: str) -> None:
+    if isinstance(value, dict) and value.get("kind") == "integer":
+        value = _exact_object(value, {"kind", "value", "type"}, where)
+        if isinstance(value["value"], dict):
+            _rule_variable(value["value"], {"integer_magnitude"}, f"{where}.value")
+            concrete = dict(value)
+            concrete["value"] = "0"
+            _literal(concrete, where)
+        else:
+            _literal(value, where)
+    else:
+        _literal(value, where)
+
+
+def _rule_block(value: Any, where: str) -> None:
+    value = _exact_object(value, {"statements"}, where)
+    if not isinstance(value["statements"], list):
+        raise ObservationError(f"{where}.statements must be an array")
+    for index, statement in enumerate(value["statements"]):
+        statement_where = f"{where}.statements[{index}]"
+        if not isinstance(statement, dict):
+            raise ObservationError(f"{statement_where} must be an object")
+        if statement.get("kind") == "expression":
+            _exact_object(
+                statement, {"kind", "expression", "semicolon"}, statement_where
+            )
+            if not isinstance(statement["semicolon"], bool):
+                raise ObservationError(f"{statement_where}.semicolon must be a Boolean")
+            _rule_expression(statement["expression"], f"{statement_where}.expression")
+        elif statement.get("kind") == "let":
+            _exact_object(
+                statement, {"kind", "pattern", "type", "initializer"}, statement_where
+            )
+            _rule_pattern(statement["pattern"], f"{statement_where}.pattern")
+            if statement["type"] is not None:
+                _rule_type_tree(statement["type"], f"{statement_where}.type")
+            if statement["initializer"] is not None:
+                _rule_expression(
+                    statement["initializer"], f"{statement_where}.initializer"
+                )
+        else:
+            raise ObservationError(f"{statement_where}.kind is unknown")
+
+
+def _rule_pattern(value: Any, where: str) -> None:
+    if not isinstance(value, dict):
+        raise ObservationError(f"{where} must be an object")
+    if value.get("kind") == "wildcard":
+        _exact_object(value, {"kind"}, where)
+    elif value.get("kind") == "binding":
+        _exact_object(value, {"kind", "id", "mutability", "by_ref"}, where)
+        _rule_variable(value["id"], {"anchor", "binding"}, f"{where}.id")
+        _enum(value["mutability"], {"immutable", "mutable"}, f"{where}.mutability")
+        _enum(value["by_ref"], {"no", "shared", "mutable"}, f"{where}.by_ref")
+    else:
+        raise ObservationError(f"{where}.kind is unknown")
+
+
+_RULE_KEY_ORDERS = {
+    frozenset({"kind", "sort", "index"}): ("kind", "sort", "index"),
+    frozenset({"kind", "name"}): ("kind", "name"),
+    frozenset({"kind", "element"}): ("kind", "element"),
+    frozenset({"kind", "element", "length"}): ("kind", "element", "length"),
+    frozenset({"kind", "mutability", "pointee"}): ("kind", "mutability", "pointee"),
+    frozenset({"kind", "elements"}): ("kind", "elements"),
+    frozenset({"kind", "adt_kind", "identity", "arguments"}): (
+        "kind",
+        "adt_kind",
+        "identity",
+        "arguments",
+    ),
+    frozenset({"kind", "crate", "path"}): ("kind", "crate", "path"),
+    frozenset({"kind", "symbol"}): ("kind", "symbol"),
+    frozenset({"kind", "owner", "id"}): ("kind", "owner", "id"),
+    frozenset({"kind", "adt", "variant"}): ("kind", "adt", "variant"),
+    frozenset({"kind", "callee", "arguments"}): ("kind", "callee", "arguments"),
+    frozenset({"kind", "receiver", "method", "arguments"}): (
+        "kind",
+        "receiver",
+        "method",
+        "arguments",
+    ),
+    frozenset({"kind", "operator", "left", "right"}): (
+        "kind",
+        "operator",
+        "left",
+        "right",
+    ),
+    frozenset({"kind", "operator", "operand"}): ("kind", "operator", "operand"),
+    frozenset({"kind", "value"}): ("kind", "value"),
+    frozenset({"kind", "expression", "type"}): ("kind", "expression", "type"),
+    frozenset({"kind", "left", "right"}): ("kind", "left", "right"),
+    frozenset({"kind", "base", "index"}): ("kind", "base", "index"),
+    frozenset({"kind", "base", "field"}): ("kind", "base", "field"),
+    frozenset({"kind", "start", "end", "limits"}): ("kind", "start", "end", "limits"),
+    frozenset({"kind", "condition", "then", "else"}): (
+        "kind",
+        "condition",
+        "then",
+        "else",
+    ),
+    frozenset({"kind", "condition", "body"}): ("kind", "condition", "body"),
+    frozenset({"kind", "body"}): ("kind", "body"),
+    frozenset({"kind", "adt", "variant", "fields", "rest"}): (
+        "kind",
+        "adt",
+        "variant",
+        "fields",
+        "rest",
+    ),
+    frozenset({"field", "value"}): ("field", "value"),
+    frozenset({"kind", "borrow", "mutability", "expression"}): (
+        "kind",
+        "borrow",
+        "mutability",
+        "expression",
+    ),
+    frozenset({"kind"}): ("kind",),
+    frozenset({"kind", "value", "count"}): ("kind", "value", "count"),
+    frozenset({"kind", "block"}): ("kind", "block"),
+    frozenset({"statements"}): ("statements",),
+    frozenset({"kind", "expression", "semicolon"}): ("kind", "expression", "semicolon"),
+    frozenset({"kind", "pattern", "type", "initializer"}): (
+        "kind",
+        "pattern",
+        "type",
+        "initializer",
+    ),
+    frozenset({"kind", "id", "mutability", "by_ref"}): (
+        "kind",
+        "id",
+        "mutability",
+        "by_ref",
+    ),
+    frozenset({"kind", "value", "type"}): ("kind", "value", "type"),
+    frozenset({"kind", "bits", "type"}): ("kind", "bits", "type"),
+}
+
+
+def _visit_rule_variables(value: Any, visit: Any) -> None:
+    if isinstance(value, dict):
+        if value.get("kind") == "variable":
+            visit(value)
+            return
+        order = _RULE_KEY_ORDERS.get(frozenset(value))
+        if order is None:
+            raise ObservationError("rule contains an unrecognized object shape")
+        for key in order:
+            _visit_rule_variables(value[key], visit)
+    elif isinstance(value, list):
+        for child in value:
+            _visit_rule_variables(child, visit)
+
+
+def _validate_rule_invariants(rule: dict[str, Any], where: str) -> None:
+    anchors = rule["pointer_anchors"]
+    if not anchors:
+        raise ObservationError(f"{where}.pointer_anchors must be nonempty")
+    anchor_variables: list[tuple[str, int]] = []
+    for index, anchor in enumerate(anchors):
+        anchor_where = f"{where}.pointer_anchors[{index}]"
+        anchor = _exact_object(
+            anchor, {"id", "source_type", "target_type"}, anchor_where
+        )
+        variable = _rule_variable(anchor["id"], {"anchor"}, f"{anchor_where}.id")
+        anchor_variables.append((variable["sort"], variable["index"]))
+        _rule_type_tree(anchor["source_type"], f"{anchor_where}.source_type")
+        _rule_type_tree(anchor["target_type"], f"{anchor_where}.target_type")
+        if anchor["source_type"].get("kind") != "raw_pointer":
+            raise ObservationError(
+                f"{anchor_where}.source_type must have outer kind raw_pointer"
+            )
+    if len(set(anchor_variables)) != len(anchor_variables):
+        raise ObservationError(
+            f"{where}.pointer_anchors has a duplicate anchor variable"
+        )
+
+    counters: dict[str, int] = {}
+    seen: set[tuple[str, int]] = set()
+
+    def record(variable: dict[str, Any]) -> None:
+        key = (variable["sort"], variable["index"])
+        if key not in seen:
+            expected = counters.get(variable["sort"], 0)
+            if variable["index"] != expected:
+                raise ObservationError(
+                    f"{where} variable indices must follow canonical first-occurrence order"
+                )
+            counters[variable["sort"]] = expected + 1
+            seen.add(key)
+
+    for anchor in anchors:
+        _visit_rule_variables(anchor["id"], record)
+        _visit_rule_variables(anchor["source_type"], record)
+        _visit_rule_variables(anchor["target_type"], record)
+    for key in (
+        "source_type",
+        "source_adjusted_type",
+        "target_type",
+        "target_adjusted_type",
+    ):
+        _visit_rule_variables(rule[key], record)
+    _visit_rule_variables(rule["source_pattern"], record)
+    available = set(seen)
+
+    def target_record(variable: dict[str, Any]) -> None:
+        key = (variable["sort"], variable["index"])
+        record(variable)
+        if key not in available:
+            raise ObservationError(
+                f"{where}.target_pattern contains unavailable variable"
+            )
+
+    _visit_rule_variables(rule["target_pattern"], target_record)
+    declared_anchors = set(anchor_variables)
+    if any(
+        sort == "anchor" and key not in declared_anchors
+        for key in seen
+        for sort in [key[0]]
+    ):
+        raise ObservationError(f"{where} uses an undeclared anchor variable")
+
+
+def _rule_document_value(document: RuleDocument) -> dict[str, Any]:
+    return {"schema_version": 1, "rules": list(document.rules)}
+
+
+def _load_rule_value(value: Any) -> RuleDocument:
+    value = _exact_object(value, {"schema_version", "rules"}, "rule document")
+    if isinstance(value["schema_version"], bool) or value["schema_version"] != 1:
+        raise ObservationError(
+            f"unsupported rule schema_version {value['schema_version']!r}"
+        )
+    if not isinstance(value["rules"], list):
+        raise ObservationError("rule document rules must be an array")
+    rules: list[dict[str, Any]] = []
+    for index, rule in enumerate(value["rules"]):
+        where = f"rules[{index}]"
+        rule = _exact_object(
+            rule,
+            {
+                "source_pattern",
+                "target_pattern",
+                "pointer_anchors",
+                "source_type",
+                "source_adjusted_type",
+                "target_type",
+                "target_adjusted_type",
+            },
+            where,
+        )
+        _rule_expression(rule["source_pattern"], f"{where}.source_pattern")
+        _rule_expression(rule["target_pattern"], f"{where}.target_pattern")
+        if not isinstance(rule["pointer_anchors"], list):
+            raise ObservationError(f"{where}.pointer_anchors must be an array")
+        for key in (
+            "source_type",
+            "source_adjusted_type",
+            "target_type",
+            "target_adjusted_type",
+        ):
+            _rule_type_tree(rule[key], f"{where}.{key}")
+        _validate_rule_invariants(rule, where)
+        rules.append(rule)
+    return RuleDocument(rules=tuple(rules))
+
+
+def load_rules(text: str) -> RuleDocument:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuleError(f"rule JSON decode failure: {exc}") from exc
+    try:
+        return _load_rule_value(value)
+    except ObservationError as exc:
+        raise RuleError(str(exc)) from exc
+
+
+def rules_to_json(document: RuleDocument) -> str:
+    try:
+        validated = _load_rule_value(_rule_document_value(document))
+    except ObservationError as exc:
+        raise RuleError(str(exc)) from exc
+    return (
+        json.dumps(_rule_document_value(validated), indent=2, ensure_ascii=False) + "\n"
+    )
 
 
 @dataclass(frozen=True)
