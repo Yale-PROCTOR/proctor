@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from model import ItemRecord
+from model import CallableCorrespondence, ItemRecord
 
 from proctor.llm.types import Message, Request, RequestMetadata
 from proctor.prompts.library import PromptLibrary, RenderedPrompt
@@ -84,6 +84,7 @@ def replacement_request(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
     transformation: str,
+    accepted_correspondence: tuple[CallableCorrespondence, ...] = (),
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -101,6 +102,15 @@ def replacement_request(
             for item_id in sorted(members)
         ],
         "transformation": transformation,
+        "accepted_correspondence": [
+            {
+                "item_id": record.item_id,
+                "logical_path": record.logical_path,
+                "implementation_path": record.implementation_path,
+                "wrapper_path": record.wrapper_path,
+            }
+            for record in accepted_correspondence
+        ],
     }
 
 
@@ -190,6 +200,8 @@ def replace_command(
     request: Path,
     output: Path,
     statement_pairs_output: Path,
+    observation_source_output: Path,
+    observation_metadata_output: Path,
 ) -> list[str]:
     return [
         str(crat_tool),
@@ -200,5 +212,26 @@ def replace_command(
         str(output),
         "--statement-pairs-output",
         str(statement_pairs_output),
+        "--observation-source-output",
+        str(observation_source_output),
+        "--observation-metadata-output",
+        str(observation_metadata_output),
         str(current_project),
+    ]
+
+
+def extract_observations_command(
+    crat_tool: Path,
+    observation_source: Path,
+    metadata: Path,
+    output: Path,
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "extract-observations",
+        "--metadata",
+        str(metadata),
+        "--output",
+        str(output),
+        str(observation_source),
     ]

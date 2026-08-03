@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from protocol import (
+    extract_observations_command,
     make_skeleton_command,
     normalize_safety_command,
     replace_command,
@@ -242,10 +243,28 @@ class CratTools:
         request: Path,
         output: Path,
         statement_pairs_output: Path,
+        observation_source_output: Path | None = None,
+        observation_metadata_output: Path | None = None,
     ) -> None:
         assert self.crat_tool is not None
-        self._clear_replace_output(output)
-        self._clear_replace_output(statement_pairs_output)
+        observation_source_output = observation_source_output or output.with_name(
+            "replacement-observation.rs"
+        )
+        observation_metadata_output = observation_metadata_output or output.with_name(
+            "replacement-observation-metadata.json"
+        )
+        paths = (
+            output,
+            statement_pairs_output,
+            observation_source_output,
+            observation_metadata_output,
+        )
+        if len(set(paths)) != len(paths):
+            raise StageFailure(
+                "crat-tool replace output paths must be pairwise distinct"
+            )
+        for path in paths:
+            self._clear_replace_output(path)
         try:
             self._run(
                 "crat-tool replace",
@@ -255,6 +274,8 @@ class CratTools:
                     request,
                     output,
                     statement_pairs_output,
+                    observation_source_output,
+                    observation_metadata_output,
                 ),
                 env=self.environment,
             )
@@ -262,10 +283,43 @@ class CratTools:
             self._require_regular_output(
                 "crat-tool replace statement pairs", statement_pairs_output
             )
+            self._require_regular_output(
+                "crat-tool replace observation source", observation_source_output
+            )
+            self._require_regular_output(
+                "crat-tool replace observation metadata", observation_metadata_output
+            )
         except Exception:
-            for path in (output, statement_pairs_output):
+            for path in paths:
                 if path.is_symlink() or path.is_file():
                     path.unlink()
+            raise
+
+    def extract_observations(
+        self,
+        observation_source: Path,
+        metadata: Path,
+        output: Path,
+    ) -> None:
+        assert self.crat_tool is not None
+        paths = (observation_source, metadata, output)
+        if len(set(paths)) != len(paths):
+            raise StageFailure(
+                "crat-tool extract-observations paths must be pairwise distinct"
+            )
+        self._clear_replace_output(output)
+        try:
+            self._run(
+                "crat-tool extract-observations",
+                extract_observations_command(
+                    self.crat_tool, observation_source, metadata, output
+                ),
+                env=self.environment,
+            )
+            self._require_regular_output("crat-tool extract-observations", output)
+        except Exception:
+            if output.is_symlink() or output.is_file():
+                output.unlink()
             raise
 
     def cargo_build(self, current_project: Path) -> CommandResult:

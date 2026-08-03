@@ -26,6 +26,7 @@ from proctor.llm.types import (
 
 from model import (
     ContextOverflow,
+    ObservationError,
     PointerVariableMetadata,
     PointerVariableOrigin,
     SkeletonError,
@@ -33,6 +34,8 @@ from model import (
     dependency_context,
     function_graph,
     leaf_schedule,
+    load_observations,
+    load_replacement_metadata,
     load_skeletons,
     render_dependency_entry,
     render_transformation_targets,
@@ -42,6 +45,7 @@ from protocol import (
     NO_FENCE_DIAGNOSTIC,
     PromptRenderInput,
     extract_code_block,
+    extract_observations_command,
     llm_request,
     make_skeleton_command,
     normalize_safety_command,
@@ -56,6 +60,7 @@ from stage import (
     AcceptedStatementPair,
     _code_value,
     _load_replacement_statement_pairs,
+    _load_and_validate_replacement_metadata,
     _publish_final_outputs,
     _render_statement_pairs,
     _rust_fence,
@@ -1141,7 +1146,12 @@ def test_replacement_request_is_exact_and_member_ordered():
         "needs_transformation",
         "statements_requiring_transformation",
     ]
-    assert set(request) == {"schema_version", "items", "transformation"}
+    assert set(request) == {
+        "schema_version",
+        "items",
+        "transformation",
+        "accepted_correspondence",
+    }
 
 
 def test_foreign_metadata_does_not_change_graph_or_tool_requests():
@@ -1180,7 +1190,7 @@ def test_foreign_metadata_does_not_change_graph_or_tool_requests():
     ]
 
 
-def test_replacement_api_cli_and_fake_tools_require_the_sidecar_output():
+def test_command_builders_use_exact_four_output_and_extract_argv():
     tool = Path("/tools/crat-tool")
     assert make_skeleton_command(
         tool, Path("/work/current"), Path("/work/skeletons.json")
@@ -1218,6 +1228,8 @@ def test_replacement_api_cli_and_fake_tools_require_the_sidecar_output():
         Path("/work/replacement-request.json"),
         Path("/work/candidate.rs"),
         Path("/work/replacement-statement-pairs.json"),
+        Path("/work/replacement-observation.rs"),
+        Path("/work/replacement-observation-metadata.json"),
     ) == [
         "/tools/crat-tool",
         "replace",
@@ -1227,7 +1239,25 @@ def test_replacement_api_cli_and_fake_tools_require_the_sidecar_output():
         "/work/candidate.rs",
         "--statement-pairs-output",
         "/work/replacement-statement-pairs.json",
+        "--observation-source-output",
+        "/work/replacement-observation.rs",
+        "--observation-metadata-output",
+        "/work/replacement-observation-metadata.json",
         "/work/current",
+    ]
+    assert extract_observations_command(
+        tool,
+        Path("/work/replacement-observation.rs"),
+        Path("/work/replacement-observation-metadata.json"),
+        Path("/work/extracted-observations.json"),
+    ) == [
+        "/tools/crat-tool",
+        "extract-observations",
+        "--metadata",
+        "/work/replacement-observation-metadata.json",
+        "--output",
+        "/work/extracted-observations.json",
+        "/work/replacement-observation.rs",
     ]
 
 
@@ -1251,6 +1281,513 @@ INVALID = {
 }
 
 
+def _valid_observation_document():
+    raw_pointer = {
+        "kind": "raw_pointer",
+        "mutability": "const",
+        "pointee": {"kind": "primitive", "name": "i32"},
+    }
+    reference = {
+        "kind": "reference",
+        "mutability": "shared",
+        "pointee": {"kind": "primitive", "name": "i32"},
+    }
+    binding = {"kind": "path", "value": {"kind": "binding", "id": "<id0>"}}
+    return {
+        "schema_version": 1,
+        "observations": [
+            {
+                "source_expression": binding,
+                "target_expression": copy.deepcopy(binding),
+                "pointer_anchors": [
+                    {
+                        "id": "<id0>",
+                        "source_type": raw_pointer,
+                        "target_type": reference,
+                    }
+                ],
+                "source_type": copy.deepcopy(raw_pointer),
+                "source_adjusted_type": copy.deepcopy(raw_pointer),
+                "target_type": copy.deepcopy(reference),
+                "target_adjusted_type": copy.deepcopy(reference),
+            }
+        ],
+    }
+
+
+def test_strict_observation_loader_uses_exact_valid_base_document():
+    value = _valid_observation_document()
+    loaded_value = load_observations(json.dumps(value))
+    assert loaded_value.observations == tuple(value["observations"])
+
+    mutations = []
+    unknown = copy.deepcopy(value)
+    unknown["extra"] = True
+    mutations.append(unknown)
+    unknown_observation = copy.deepcopy(value)
+    unknown_observation["observations"][0]["extra"] = True
+    mutations.append(unknown_observation)
+    unknown_expression = copy.deepcopy(value)
+    unknown_expression["observations"][0]["source_expression"]["extra"] = True
+    mutations.append(unknown_expression)
+    unknown_identity = copy.deepcopy(value)
+    unknown_identity["observations"][0]["source_expression"]["value"]["extra"] = True
+    mutations.append(unknown_identity)
+    unknown_anchor = copy.deepcopy(value)
+    unknown_anchor["observations"][0]["pointer_anchors"][0]["extra"] = True
+    mutations.append(unknown_anchor)
+    unknown_nested_type = copy.deepcopy(value)
+    unknown_nested_type["observations"][0]["source_type"]["pointee"]["extra"] = True
+    mutations.append(unknown_nested_type)
+    boolean_version = copy.deepcopy(value)
+    boolean_version["schema_version"] = True
+    mutations.append(boolean_version)
+    target_only = copy.deepcopy(value)
+    target_only["observations"][0]["target_expression"]["value"]["id"] = "<id1>"
+    with pytest.raises(ObservationError, match="target-only anonymized ID <id1>"):
+        load_observations(json.dumps(target_only))
+    noncontiguous = copy.deepcopy(value)
+    noncontiguous["observations"][0]["source_expression"]["value"]["id"] = "<id2>"
+    noncontiguous["observations"][0]["target_expression"]["value"]["id"] = "<id2>"
+    noncontiguous["observations"][0]["pointer_anchors"][0]["id"] = "<id2>"
+    mutations.append(noncontiguous)
+    unknown_type = copy.deepcopy(value)
+    unknown_type["observations"][0]["source_type"]["kind"] = "pointer"
+    mutations.append(unknown_type)
+    empty_anchors = copy.deepcopy(value)
+    empty_anchors["observations"][0]["pointer_anchors"] = []
+    mutations.append(empty_anchors)
+    nonraw_anchor = copy.deepcopy(value)
+    nonraw_anchor["observations"][0]["pointer_anchors"][0]["source_type"] = {
+        "kind": "reference",
+        "mutability": "shared",
+        "pointee": {"kind": "primitive", "name": "i32"},
+    }
+    mutations.append(nonraw_anchor)
+    invalid_mutability = copy.deepcopy(value)
+    invalid_mutability["observations"][0]["pointer_anchors"][0]["source_type"][
+        "mutability"
+    ] = "shared"
+    mutations.append(invalid_mutability)
+    invalid_id = copy.deepcopy(value)
+    invalid_id["observations"][0]["source_expression"]["value"]["id"] = "id0"
+    mutations.append(invalid_id)
+    duplicate_anchor = copy.deepcopy(value)
+    duplicate_anchor["observations"][0]["pointer_anchors"].append(
+        copy.deepcopy(duplicate_anchor["observations"][0]["pointer_anchors"][0])
+    )
+    mutations.append(duplicate_anchor)
+    for mutation in mutations:
+        with pytest.raises(ObservationError):
+            load_observations(json.dumps(mutation))
+    with pytest.raises(ObservationError):
+        load_observations(json.dumps(value) + " trailing")
+
+
+def test_replacement_metadata_paths_use_canonical_rust_identifier_segments():
+    base = {
+        "schema_version": 1,
+        "candidate_sha256": "0" * 64,
+        "statement_pairs_sha256": "0" * 64,
+        "observation_source_sha256": "0" * 64,
+        "accepted_correspondence": [],
+        "new_correspondence": [
+            {
+                "item_id": 1,
+                "logical_path": "módulo::r#type",
+                "implementation_path": "módulo::r#type",
+                "wrapper_path": None,
+            }
+        ],
+        "current_items": [
+            {
+                "item_id": 1,
+                "logical_path": "módulo::r#type",
+                "source_copy_path": "módulo::__copy",
+                "implementation_path": "módulo::r#type",
+                "wrapper_path": None,
+                "transform_labels": [0],
+            }
+        ],
+    }
+    load_replacement_metadata(json.dumps(base))
+    for invalid in (
+        "fn",
+        "_",
+        "r#_",
+        "r#self",
+        "crate::f",
+        "::f",
+        "f::",
+        "a::::b",
+    ):
+        malformed = copy.deepcopy(base)
+        malformed["new_correspondence"][0]["logical_path"] = invalid
+        with pytest.raises(ObservationError, match="canonical"):
+            load_replacement_metadata(json.dumps(malformed))
+
+
+def test_observation_loader_enforces_namespace_order_float_widths_and_target_only_policy():
+    value = _valid_observation_document()
+    binding0 = copy.deepcopy(value["observations"][0]["source_expression"])
+    binding1 = copy.deepcopy(binding0)
+    binding1["value"]["id"] = "<id1>"
+
+    reordered = copy.deepcopy(value)
+    reordered_expression = {
+        "kind": "tuple",
+        "elements": [binding1, copy.deepcopy(binding0)],
+    }
+    reordered["observations"][0]["source_expression"] = reordered_expression
+    reordered["observations"][0]["target_expression"] = copy.deepcopy(
+        reordered_expression
+    )
+    with pytest.raises(ObservationError, match="first-occurrence order"):
+        load_observations(json.dumps(reordered))
+
+    target_nonbinding = copy.deepcopy(value)
+    target_nonbinding["observations"][0]["target_expression"] = {
+        "kind": "tuple",
+        "elements": [
+            copy.deepcopy(binding0),
+            {
+                "kind": "path",
+                "value": {
+                    "kind": "constructor",
+                    "adt": {"kind": "local", "id": "<struct0>"},
+                    "variant": None,
+                },
+            },
+        ],
+    }
+    load_observations(json.dumps(target_nonbinding))
+
+    target_function = copy.deepcopy(value)
+    target_function["observations"][0]["target_expression"] = {
+        "kind": "tuple",
+        "elements": [
+            copy.deepcopy(binding0),
+            {"kind": "path", "value": {"kind": "function", "id": "<fn0>"}},
+        ],
+    }
+    with pytest.raises(ObservationError, match="target-only anonymized ID <fn0>"):
+        load_observations(json.dumps(target_function))
+
+    for float_type, width in (("f16", 4), ("f32", 8), ("f64", 16), ("f128", 32)):
+        floating = copy.deepcopy(value)
+        expression = {
+            "kind": "tuple",
+            "elements": [
+                copy.deepcopy(binding0),
+                {
+                    "kind": "literal",
+                    "value": {
+                        "kind": "float",
+                        "bits": "0" * width,
+                        "type": float_type,
+                    },
+                },
+            ],
+        }
+        floating["observations"][0]["source_expression"] = expression
+        floating["observations"][0]["target_expression"] = copy.deepcopy(expression)
+        load_observations(json.dumps(floating))
+        for invalid_bits in ("0" * (width - 1), "0" * (width + 1), "A" * width):
+            malformed = copy.deepcopy(floating)
+            malformed["observations"][0]["source_expression"]["elements"][1]["value"][
+                "bits"
+            ] = invalid_bits
+            with pytest.raises(ObservationError, match="exactly"):
+                load_observations(json.dumps(malformed))
+
+    for invalid_length in (True, -1, 2**64):
+        malformed = copy.deepcopy(value)
+        malformed["observations"][0]["source_type"] = {
+            "kind": "array",
+            "element": {"kind": "primitive", "name": "u8"},
+            "length": invalid_length,
+        }
+        with pytest.raises(ObservationError):
+            load_observations(json.dumps(malformed))
+
+
+def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
+    candidate = tmp_path / "candidate.rs"
+    statement_pairs = tmp_path / "pairs.json"
+    observation_source = tmp_path / "observation.rs"
+    metadata_path = tmp_path / "metadata.json"
+    candidate.write_text("pub unsafe fn read(mut pointer: &i32) -> i32 { *pointer }\n")
+    statement_pairs.write_text(
+        '{"schema_version":1,"statements":[{"item_id":7,"path":"read",'
+        '"label":0,"after_statement":"*pointer"}]}\n'
+    )
+    observation_source.write_text(
+        "unsafe fn __proctor_source_read(mut pointer: *const i32) -> i32 { "
+        "#[proctor(0)] *pointer }\n"
+        "unsafe fn read(mut pointer: &i32) -> i32 { #[proctor(0)] *pointer }\n"
+        "pub unsafe fn __proctor_wrapper_read(mut pointer: *const i32) -> i32 {\n"
+        "    let __proctor_result = crate::read(&*(pointer as *const i32));\n"
+        "    __proctor_result\n"
+        "}\n"
+    )
+    correspondence = {
+        "item_id": 7,
+        "logical_path": "read",
+        "implementation_path": "read",
+        "wrapper_path": "__proctor_wrapper_read",
+    }
+    valid = {
+        "schema_version": 1,
+        "candidate_sha256": "6c3ea56d9debffcf25243e9a41d58805af269772d266088c83d19053f7ccebf1",
+        "statement_pairs_sha256": "2b8e6af47f728734179fa6d023e74d812a888e65d4f111e8ff4a6c01f75c823b",
+        "observation_source_sha256": "5d00cc190ae11801bb4ae2af09f7eacb12c2fee35f8645b1aef611a12cf09fd0",
+        "accepted_correspondence": [],
+        "new_correspondence": [correspondence],
+        "current_items": [
+            {
+                **correspondence,
+                "source_copy_path": "__proctor_source_read",
+                "transform_labels": [0],
+            }
+        ],
+    }
+    metadata_path.write_text(json.dumps(valid))
+    assert (
+        hashlib.sha256(candidate.read_bytes()).hexdigest() == valid["candidate_sha256"]
+    )
+    assert (
+        hashlib.sha256(statement_pairs.read_bytes()).hexdigest()
+        == valid["statement_pairs_sha256"]
+    )
+    assert (
+        hashlib.sha256(observation_source.read_bytes()).hexdigest()
+        == valid["observation_source_sha256"]
+    )
+    record = loaded(
+        [
+            fn_record(
+                7,
+                "read",
+                "read",
+                [],
+                transformation_labels=[0],
+                statement_pair_metadata=[_pointer_metadata(0)],
+            )
+        ]
+    )[0]
+    parsed = _load_and_validate_replacement_metadata(
+        metadata_path,
+        candidate,
+        statement_pairs,
+        observation_source,
+        (7,),
+        {7: record},
+        (),
+    )
+    assert parsed.current_items[0].source_copy_path == "__proctor_source_read"
+
+    for field, message in (
+        ("candidate_sha256", "does not match candidate bytes"),
+        ("statement_pairs_sha256", "does not match statement-pairs sidecar bytes"),
+        ("observation_source_sha256", "does not match observation source bytes"),
+    ):
+        mutated = copy.deepcopy(valid)
+        mutated[field] = "0" * 64
+        metadata_path.write_text(json.dumps(mutated))
+        with pytest.raises(StageFailure, match=message):
+            _load_and_validate_replacement_metadata(
+                metadata_path,
+                candidate,
+                statement_pairs,
+                observation_source,
+                (7,),
+                {7: record},
+                (),
+            )
+
+    mutated = copy.deepcopy(valid)
+    mutated["accepted_correspondence"] = [correspondence]
+    metadata_path.write_text(json.dumps(mutated))
+    with pytest.raises(StageFailure, match="does not equal the request"):
+        _load_and_validate_replacement_metadata(
+            metadata_path,
+            candidate,
+            statement_pairs,
+            observation_source,
+            (7,),
+            {7: record},
+            (),
+        )
+
+    for field in ("item_id", "logical_path", "implementation_path", "wrapper_path"):
+        mutated = copy.deepcopy(valid)
+        replacement = 8 if field == "item_id" else f"different_{field}"
+        mutated["current_items"][0][field] = replacement
+        metadata_path.write_text(json.dumps(mutated))
+        with pytest.raises(
+            StageFailure,
+            match=rf"current_items\[0\]\.{field} disagrees with new_correspondence\[0\]\.{field}",
+        ):
+            _load_and_validate_replacement_metadata(
+                metadata_path,
+                candidate,
+                statement_pairs,
+                observation_source,
+                (7,),
+                {7: record},
+                (),
+            )
+
+    mutated = copy.deepcopy(valid)
+    mutated["current_items"][0]["transform_labels"] = [1]
+    metadata_path.write_text(json.dumps(mutated))
+    with pytest.raises(
+        StageFailure,
+        match=r"current_items\[0\]\.transform_labels does not equal \[0\]",
+    ):
+        _load_and_validate_replacement_metadata(
+            metadata_path,
+            candidate,
+            statement_pairs,
+            observation_source,
+            (7,),
+            {7: record},
+            (),
+        )
+
+    absent = copy.deepcopy(valid)
+    absent["new_correspondence"][0]["wrapper_path"] = None
+    absent["current_items"][0]["wrapper_path"] = None
+    metadata_path.write_text(json.dumps(absent))
+    _load_and_validate_replacement_metadata(
+        metadata_path,
+        candidate,
+        statement_pairs,
+        observation_source,
+        (7,),
+        {7: record},
+        (),
+    )
+
+    second_record = loaded(
+        [
+            fn_record(
+                8,
+                "other",
+                "other",
+                [],
+                transformation_labels=[0],
+                statement_pair_metadata=[_pointer_metadata(0)],
+            )
+        ]
+    )[0]
+    two = copy.deepcopy(valid)
+    two["new_correspondence"].append(
+        {
+            "item_id": 8,
+            "logical_path": "other",
+            "implementation_path": "other",
+            "wrapper_path": "__proctor_wrapper_other",
+        }
+    )
+    two["current_items"].append(
+        {
+            **two["new_correspondence"][1],
+            "source_copy_path": "__proctor_source_other",
+            "transform_labels": [0],
+        }
+    )
+    records = {7: record, 8: second_record}
+    metadata_path.write_text(json.dumps(two))
+    _load_and_validate_replacement_metadata(
+        metadata_path,
+        candidate,
+        statement_pairs,
+        observation_source,
+        (7, 8),
+        records,
+        (),
+    )
+
+    reordered = copy.deepcopy(two)
+    reordered["new_correspondence"].reverse()
+    reordered["current_items"].reverse()
+    metadata_path.write_text(json.dumps(reordered))
+    with pytest.raises(StageFailure, match="records do not preserve request order"):
+        _load_and_validate_replacement_metadata(
+            metadata_path,
+            candidate,
+            statement_pairs,
+            observation_source,
+            (7, 8),
+            records,
+            (),
+        )
+
+    for field, expected in (
+        ("item_id", "duplicate item_id 7"),
+        ("logical_path", "duplicate logical_path read"),
+        ("implementation_path", "duplicate implementation_path read"),
+        ("wrapper_path", "duplicate wrapper_path __proctor_wrapper_read"),
+    ):
+        duplicated = copy.deepcopy(valid)
+        accepted_record = {
+            "item_id": 6,
+            "logical_path": "accepted",
+            "implementation_path": "accepted",
+            "wrapper_path": "__proctor_wrapper_accepted",
+        }
+        accepted_record[field] = duplicated["new_correspondence"][0][field]
+        duplicated["accepted_correspondence"] = [accepted_record]
+        metadata_path.write_text(json.dumps(duplicated))
+        accepted_value = load_replacement_metadata(
+            json.dumps(duplicated)
+        ).accepted_correspondence
+        with pytest.raises(StageFailure, match=expected):
+            _load_and_validate_replacement_metadata(
+                metadata_path,
+                candidate,
+                statement_pairs,
+                observation_source,
+                (7,),
+                {7: record},
+                accepted_value,
+            )
+
+    duplicated = copy.deepcopy(two)
+    duplicated["current_items"][1]["source_copy_path"] = "__proctor_source_read"
+    metadata_path.write_text(json.dumps(duplicated))
+    with pytest.raises(
+        StageFailure, match="duplicate source_copy_path __proctor_source_read"
+    ):
+        _load_and_validate_replacement_metadata(
+            metadata_path,
+            candidate,
+            statement_pairs,
+            observation_source,
+            (7, 8),
+            records,
+            (),
+        )
+
+    collision = copy.deepcopy(two)
+    collision["current_items"][1]["source_copy_path"] = "read"
+    metadata_path.write_text(json.dumps(collision))
+    with pytest.raises(
+        StageFailure,
+        match="path read is used as both logical_path and source_copy_path",
+    ):
+        _load_and_validate_replacement_metadata(
+            metadata_path,
+            candidate,
+            statement_pairs,
+            observation_source,
+            (7, 8),
+            records,
+            (),
+        )
+
+
 class FakeTools:
     def __init__(
         self,
@@ -1260,6 +1797,7 @@ class FakeTools:
         validators=None,
         candidates=None,
         sidecars=None,
+        observations=None,
     ):
         self.skeletons = [] if skeletons is None else skeletons
         self.normalized = normalized
@@ -1267,6 +1805,7 @@ class FakeTools:
         self.validators = list(validators or [])
         self.candidates = list(candidates or [])
         self.sidecars = None if sidecars is None else list(sidecars)
+        self.observations = None if observations is None else list(observations)
         self.events = []
 
     def build_tools(self, crat_dir):
@@ -1296,7 +1835,15 @@ class FakeTools:
         response.write_text(raw, encoding="utf-8")
         return raw, parsed
 
-    def replace(self, current, request, candidate, statement_pairs_output):
+    def replace(
+        self,
+        current,
+        request,
+        candidate,
+        statement_pairs_output,
+        observation_source_output,
+        observation_metadata_output,
+    ):
         request_value = json.loads(request.read_text())
         self.events.append(
             (
@@ -1306,6 +1853,8 @@ class FakeTools:
                 (current / "lib.rs").read_text(),
                 candidate,
                 statement_pairs_output,
+                observation_source_output,
+                observation_metadata_output,
             )
         )
         candidate.write_text(self.candidates.pop(0), encoding="utf-8")
@@ -1326,6 +1875,64 @@ class FakeTools:
         statement_pairs_output.write_text(
             sidecar if isinstance(sidecar, str) else json.dumps(sidecar),
             encoding="utf-8",
+        )
+        observation_source_output.write_text(
+            "// observation source\n", encoding="utf-8"
+        )
+        new_correspondence = []
+        current_items = []
+        for item in request_value["items"]:
+            prefix, _, name = item["path"].rpartition("::")
+            source_copy = f"__proctor_source_{name.removeprefix('r#')}"
+            source_copy_path = f"{prefix}::{source_copy}" if prefix else source_copy
+            record = {
+                "item_id": item["id"],
+                "logical_path": item["path"],
+                "implementation_path": item["path"],
+                "wrapper_path": None,
+            }
+            new_correspondence.append(record)
+            current_items.append(
+                {
+                    **record,
+                    "source_copy_path": source_copy_path,
+                    "transform_labels": item["statements_requiring_transformation"],
+                }
+            )
+        observation_metadata_output.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "candidate_sha256": hashlib.sha256(
+                        candidate.read_bytes()
+                    ).hexdigest(),
+                    "statement_pairs_sha256": hashlib.sha256(
+                        statement_pairs_output.read_bytes()
+                    ).hexdigest(),
+                    "observation_source_sha256": hashlib.sha256(
+                        observation_source_output.read_bytes()
+                    ).hexdigest(),
+                    "accepted_correspondence": request_value["accepted_correspondence"],
+                    "new_correspondence": new_correspondence,
+                    "current_items": current_items,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def extract_observations(self, observation_source, metadata, output):
+        self.events.append(
+            ("extract_observations", observation_source, metadata, output)
+        )
+        value = (
+            {"schema_version": 1, "observations": []}
+            if self.observations is None
+            else self.observations.pop(0)
+        )
+        if isinstance(value, Exception):
+            raise value
+        output.write_text(
+            value if isinstance(value, str) else json.dumps(value), encoding="utf-8"
         )
 
 
@@ -1884,7 +2491,9 @@ def test_mechanical_build_failure_is_fatal_without_repair(tmp_path):
 
 def test_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
     class BrokenMechanicalReplacer(FakeTools):
-        def replace(self, current, request, candidate, statement_pairs_output):
+        def replace(
+            self, current, request, candidate, statement_pairs_output, *outputs
+        ):
             raise StageFailure("mechanical replacement rejected")
 
     tools = BrokenMechanicalReplacer(
@@ -2012,7 +2621,9 @@ def test_validator_setup_or_protocol_failure_aborts_without_repair(
 
 def test_replacement_failure_is_not_sent_to_llm(tmp_path):
     class Broken(FakeTools):
-        def replace(self, current, request, candidate, statement_pairs_output):
+        def replace(
+            self, current, request, candidate, statement_pairs_output, *outputs
+        ):
             raise StageFailure("TargetResolution: missing target")
 
     tools = Broken(skeletons=[fn_record(0, "target", "target", [])], validators=[VALID])
@@ -2668,6 +3279,26 @@ def test_missing_required_paths_fail_before_side_effects(tmp_path, mutation):
     assert original_files == input_files()
 
 
+@pytest.mark.parametrize("relation", ["equal", "ancestor", "descendant"])
+def test_artifact_destination_must_not_overlap_current_workspace(tmp_path, relation):
+    value = stage_input(tmp_path)
+    current = value.framework.workdir / "current"
+    artifacts = {
+        "equal": current,
+        "ancestor": value.framework.workdir,
+        "descendant": current / "artifacts",
+    }[relation]
+    value = replace(
+        value,
+        outputs=replace(value.outputs, artifacts_dir=artifacts),
+    )
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "overlaps working Rust project" in output.error
+    assert not tools.events
+
+
 def _pointer_metadata(label=0, *, complete=True, variables=None, before=None):
     return {
         "label": label,
@@ -3011,6 +3642,8 @@ def test_replacement_sidecar_loader_is_strict_and_cross_checks_the_scc(tmp_path)
 def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
     candidate = tmp_path / "candidate.rs"
     sidecar = tmp_path / "pairs.json"
+    observation_source = tmp_path / "observation.rs"
+    observation_metadata = tmp_path / "metadata.json"
     request = tmp_path / "request.json"
     current = tmp_path / "current"
     current.mkdir()
@@ -3024,6 +3657,8 @@ def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
         events.append(command)
         candidate.write_text("candidate")
         sidecar.write_text('{"schema_version":1,"statements":[]}')
+        observation_source.write_text("observation")
+        observation_metadata.write_text("{}")
         return CommandResult(0)
 
     tools = CratTools(
@@ -3032,7 +3667,14 @@ def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
         environment_factory=lambda path: {},
     )
     tools.crat_tool = Path("/tools/crat-tool")
-    tools.replace(current, request, candidate, sidecar)
+    tools.replace(
+        current,
+        request,
+        candidate,
+        sidecar,
+        observation_source,
+        observation_metadata,
+    )
     assert events[0][-1] == str(current)
     assert events[0][events[0].index("--statement-pairs-output") + 1] == str(sidecar)
 
@@ -3052,7 +3694,14 @@ def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
         )
         broken.crat_tool = Path("/tools/crat-tool")
         with pytest.raises(StageFailure):
-            broken.replace(current, request, candidate, sidecar)
+            broken.replace(
+                current,
+                request,
+                candidate,
+                sidecar,
+                observation_source,
+                observation_metadata,
+            )
         assert not candidate.exists() and not sidecar.exists()
 
     for stale in (candidate, sidecar):
@@ -3062,7 +3711,14 @@ def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
         untouched = stale / "untouched"
         untouched.write_text("keep")
         with pytest.raises(StageFailure):
-            tools.replace(current, request, candidate, sidecar)
+            tools.replace(
+                current,
+                request,
+                candidate,
+                sidecar,
+                observation_source,
+                observation_metadata,
+            )
         assert untouched.read_text() == "keep"
         untouched.unlink()
         stale.rmdir()
@@ -3073,7 +3729,14 @@ def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
         target = tmp_path / f"{stale.name}.stale-target"
         target.write_text("keep target")
         stale.symlink_to(target)
-        tools.replace(current, request, candidate, sidecar)
+        tools.replace(
+            current,
+            request,
+            candidate,
+            sidecar,
+            observation_source,
+            observation_metadata,
+        )
         assert not stale.is_symlink()
         assert target.read_text() == "keep target"
 
@@ -3100,7 +3763,14 @@ def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
             )
             irregular.crat_tool = Path("/tools/crat-tool")
             with pytest.raises(StageFailure):
-                irregular.replace(current, request, candidate, sidecar)
+                irregular.replace(
+                    current,
+                    request,
+                    candidate,
+                    sidecar,
+                    observation_source,
+                    observation_metadata,
+                )
             assert not (sidecar if generated == candidate else candidate).exists()
             if generated_kind == "symlink":
                 assert not generated.is_symlink()
@@ -3135,7 +3805,14 @@ def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
             )
             rejecting.crat_tool = Path("/tools/crat-tool")
             with pytest.raises(StageFailure):
-                rejecting.replace(current, request, candidate, sidecar)
+                rejecting.replace(
+                    current,
+                    request,
+                    candidate,
+                    sidecar,
+                    observation_source,
+                    observation_metadata,
+                )
             assert not invoked
             if stale_kind == "directory":
                 assert child.read_text() == "keep"
@@ -3157,11 +3834,110 @@ def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
     )
     failing.crat_tool = Path("/tools/crat-tool")
     with pytest.raises(StageFailure, match="exit code 9"):
-        failing.replace(current, request, candidate, sidecar)
+        failing.replace(
+            current,
+            request,
+            candidate,
+            sidecar,
+            observation_source,
+            observation_metadata,
+        )
     assert not candidate.exists() and not sidecar.exists()
 
 
-def test_failed_build_attempt_is_discarded_and_repair_success_is_kept_once(tmp_path):
+def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
+    outputs = (
+        tmp_path / "candidate.rs",
+        tmp_path / "pairs.json",
+        tmp_path / "observation.rs",
+        tmp_path / "metadata.json",
+    )
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    current = tmp_path / "current"
+    current.mkdir()
+
+    def make_tools(name, runner):
+        tools = CratTools(
+            tmp_path / f"{name}.log",
+            run_command=runner,
+            environment_factory=lambda path: {},
+        )
+        tools.crat_tool = Path("/tools/crat-tool")
+        return tools
+
+    for output in outputs:
+        output.write_text("stale")
+
+    def complete(command, *, cwd=None, env=None):
+        assert all(not output.exists() for output in outputs)
+        for output in outputs:
+            output.write_text("fresh")
+        return CommandResult(0)
+
+    make_tools("complete", complete).replace(current, request, *outputs)
+    assert all(output.read_text() == "fresh" for output in outputs)
+
+    for missing in outputs:
+        for output in outputs:
+            output.unlink(missing_ok=True)
+
+        def incomplete(command, *, cwd=None, env=None, missing=missing):
+            for output in outputs:
+                if output != missing:
+                    output.write_text("partial")
+            return CommandResult(0)
+
+        with pytest.raises(StageFailure):
+            make_tools(f"missing-{missing.name}", incomplete).replace(
+                current, request, *outputs
+            )
+        assert all(not output.exists() for output in outputs)
+
+    for stale in outputs:
+        stale.mkdir()
+        invoked = False
+
+        def must_not_run(command, *, cwd=None, env=None):
+            nonlocal invoked
+            invoked = True
+            return CommandResult(0)
+
+        with pytest.raises(StageFailure):
+            make_tools(f"stale-{stale.name}", must_not_run).replace(
+                current, request, *outputs
+            )
+        assert not invoked
+        stale.rmdir()
+
+    extracted = tmp_path / "extracted.json"
+    source, metadata = outputs[2], outputs[3]
+    source.write_text("source")
+    metadata.write_text("metadata")
+    extracted.write_text("stale")
+
+    def extract_complete(command, *, cwd=None, env=None):
+        assert not extracted.exists()
+        extracted.write_text("result")
+        return CommandResult(0)
+
+    make_tools("extract", extract_complete).extract_observations(
+        source, metadata, extracted
+    )
+    assert extracted.read_text() == "result"
+
+    def extract_partial(command, *, cwd=None, env=None):
+        extracted.write_text("partial")
+        return CommandResult(9, stderr="failed")
+
+    with pytest.raises(StageFailure):
+        make_tools("extract-fail", extract_partial).extract_observations(
+            source, metadata, extracted
+        )
+    assert not extracted.exists()
+
+
+def test_extraction_runs_only_after_successful_build(tmp_path):
     record = fn_record(
         0,
         "target",
@@ -3208,7 +3984,144 @@ def test_failed_build_attempt_is_discarded_and_repair_success_is_kept_once(tmp_p
     assert output.metrics["compilation_failures"] == 1
     assert output.metrics["repair_calls"] == 1
     assert output.metrics["cargo_builds"] == 3
+    operations = [event[0] for event in tools.events]
+    assert operations.count("extract_observations") == 1
+    assert operations.index("extract_observations") > max(
+        index
+        for index, operation in enumerate(operations)
+        if operation == "cargo_build"
+    )
     assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [StageFailure("extract failed"), "{ malformed"],
+)
+def test_post_acceptance_extraction_failure_is_fatal_not_repairable(tmp_path, failure):
+    tools = FakeTools(
+        skeletons=[
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                statement_pair_metadata=[_pointer_metadata()],
+            )
+        ],
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[VALID],
+        candidates=["accepted source\n"],
+        observations=[failure],
+    )
+    client = FakeClient([response()])
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "failure"
+    assert len(client.requests) == 1
+    assert len([event for event in tools.events if event[0] == "replace"]) == 1
+    assert (
+        len([event for event in tools.events if event[0] == "extract_observations"])
+        == 1
+    )
+    assert not value.outputs.rust_project.exists()
+    assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+    assert not (value.outputs.artifacts_dir / "observations.json").exists()
+    for name in (
+        "candidate.rs",
+        "replacement-statement-pairs.json",
+        "replacement-observation.rs",
+        "replacement-observation-metadata.json",
+        "extracted-observations.json",
+    ):
+        assert not (value.framework.workdir / name).exists()
+
+
+def test_accepted_correspondence_promotes_after_extraction(tmp_path):
+    records = [
+        fn_record(0, "leaf", "leaf", []),
+        fn_record(1, "root", "root", [0]),
+    ]
+    tools = FakeTools(
+        skeletons=records,
+        builds=[CommandResult(0), CommandResult(0), CommandResult(0)],
+        validators=[VALID, VALID],
+        candidates=["leaf accepted\n", "root accepted\n"],
+    )
+    _, output = run_fake(
+        tmp_path,
+        tools,
+        FakeClient([response("leaf"), response("root")]),
+    )
+    assert output.status == "success"
+    replacements = [event for event in tools.events if event[0] == "replace"]
+    assert replacements[0][2]["accepted_correspondence"] == []
+    assert replacements[1][2]["accepted_correspondence"] == [
+        {
+            "item_id": 0,
+            "logical_path": "leaf",
+            "implementation_path": "leaf",
+            "wrapper_path": None,
+        }
+    ]
+    assert (
+        len([event for event in tools.events if event[0] == "extract_observations"])
+        == 2
+    )
+
+
+def test_mechanical_scc_promotes_correspondence_without_extracting(tmp_path):
+    records = [
+        fn_record(0, "leaf", "leaf", [], needs_transformation=False),
+        fn_record(1, "root", "root", [0]),
+    ]
+    tools = FakeTools(
+        skeletons=records,
+        builds=[CommandResult(0), CommandResult(0), CommandResult(0)],
+        validators=[VALID],
+        candidates=["leaf mechanical\n", "root accepted\n"],
+    )
+    _, output = run_fake(tmp_path, tools, FakeClient([response("root")]))
+    assert output.status == "success"
+    replacements = [event for event in tools.events if event[0] == "replace"]
+    assert replacements[1][2]["accepted_correspondence"][0]["logical_path"] == "leaf"
+    assert (
+        len([event for event in tools.events if event[0] == "extract_observations"])
+        == 1
+    )
+
+
+def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
+    records = [
+        fn_record(0, "leaf", "leaf", []),
+        fn_record(1, "root", "root", [0]),
+    ]
+    base = _valid_observation_document()["observations"][0]
+    leaf = copy.deepcopy(base)
+    root0 = copy.deepcopy(base)
+    root1 = copy.deepcopy(base)
+    leaf["source_type"] = {"kind": "primitive", "name": "u8"}
+    root0["source_type"] = {"kind": "primitive", "name": "u16"}
+    root1["source_type"] = {"kind": "primitive", "name": "u32"}
+    tools = FakeTools(
+        skeletons=records,
+        builds=[CommandResult(0), CommandResult(0), CommandResult(0)],
+        validators=[VALID, VALID],
+        candidates=["leaf accepted\n", "root accepted\n"],
+        observations=[
+            {"schema_version": 1, "observations": [leaf, copy.deepcopy(leaf)]},
+            {"schema_version": 1, "observations": [root0, root1]},
+        ],
+    )
+    value, output = run_fake(
+        tmp_path,
+        tools,
+        FakeClient([response("leaf"), response("root")]),
+    )
+    assert output.status == "success"
+    published = json.loads(
+        (value.outputs.artifacts_dir / "observations.json").read_text()
+    )
+    assert published["observations"] == [leaf, leaf, root0, root1]
 
 
 def test_malformed_sidecar_is_fatal_before_candidate_installation(tmp_path):
@@ -3228,6 +4141,13 @@ def test_malformed_sidecar_is_fatal_before_candidate_installation(tmp_path):
     assert len(client.requests) == 1
     assert not value.outputs.rust_project.exists()
     assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+    for name in (
+        "candidate.rs",
+        "replacement-statement-pairs.json",
+        "replacement-observation.rs",
+        "replacement-observation-metadata.json",
+    ):
+        assert not (value.framework.workdir / name).exists()
 
 
 def test_accepted_pairs_sort_by_item_and_label_not_scc_schedule(tmp_path):
@@ -3422,7 +4342,29 @@ def test_markdown_uses_complete_before_and_canonical_after_snippets():
     assert "raw rejected" not in report
 
 
-def test_report_destination_fallback_empty_report_and_stale_path_handling(tmp_path):
+def test_nonempty_artifact_is_pretty_deterministic_and_data_only(tmp_path):
+    observation = _valid_observation_document()["observations"][0]
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[VALID],
+        candidates=["accepted source\n"],
+        observations=[{"schema_version": 1, "observations": [observation]}],
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([response()]))
+    assert output.status == "success"
+    path = value.outputs.artifacts_dir / "observations.json"
+    expected = (
+        json.dumps({"schema_version": 1, "observations": [observation]}, indent=2)
+        + "\n"
+    )
+    assert path.read_text() == expected
+    assert not (value.outputs.rust_project / "observations.json").exists()
+    assert "observations.json" not in output.logs
+    assert "proctor" not in path.read_text().lower()
+
+
+def test_empty_document_is_always_published_beside_statement_pairs(tmp_path):
     empty_report = (
         "# Before/After Statement Pairs\n\n"
         "This report contains build-accepted local-transformation statement pairs.\n\n"
@@ -3440,7 +4382,12 @@ def test_report_destination_fallback_empty_report_and_stale_path_handling(tmp_pa
             else value.framework.workdir / "statement-pairs.md"
         )
         assert report.read_text() == empty_report
+        observations = report.with_name("observations.json")
+        assert observations.read_text() == (
+            '{\n  "schema_version": 1,\n  "observations": []\n}\n'
+        )
         assert not (value.outputs.rust_project / "statement-pairs.md").exists()
+        assert not (value.outputs.rust_project / "observations.json").exists()
         assert output.logs == (("local-transformation.log",) if artifacts else ())
 
     for stale_kind in ("file", "symlink"):
@@ -3538,7 +4485,9 @@ def test_report_destination_fallback_empty_report_and_stale_path_handling(tmp_pa
         assert not tools.events
 
 
-def test_final_copy_and_report_publication_cleanup_is_exact(tmp_path, monkeypatch):
+def test_project_markdown_json_publish_as_one_cleanup_transaction(
+    tmp_path, monkeypatch
+):
     current = tmp_path / "current"
     current.mkdir()
     (current / "lib.rs").write_text("accepted")
@@ -3790,6 +4739,7 @@ def test_final_copy_and_report_publication_cleanup_is_exact(tmp_path, monkeypatc
     mutation_case.mkdir()
     value = stage_input(mutation_case)
     report_path = value.outputs.artifacts_dir / "statement-pairs.md"
+    observations_path = value.outputs.artifacts_dir / "observations.json"
     mutations = []
 
     def run_copy(source, output, mark_destination_created):
@@ -3803,7 +4753,7 @@ def test_final_copy_and_report_publication_cleanup_is_exact(tmp_path, monkeypatc
 
     def run_replace(source, output):
         real_replace(source, output)
-        if Path(output) == report_path:
+        if Path(output) in (report_path, observations_path):
             mutations.append(("publish", Path(output)))
 
     monkeypatch.setattr(stage_module, "_copy_final", run_copy)
@@ -3816,6 +4766,13 @@ def test_final_copy_and_report_publication_cleanup_is_exact(tmp_path, monkeypatc
         llm_client_factory=lambda settings, tracker: FakeClient([]),
     )
     assert output.status == "success"
-    assert mutations[-1] == ("publish", report_path)
-    assert value.outputs.rust_project.exists() and report_path.exists()
+    assert mutations[-2:] == [
+        ("publish", report_path),
+        ("publish", observations_path),
+    ]
+    assert (
+        value.outputs.rust_project.exists()
+        and report_path.exists()
+        and observations_path.exists()
+    )
     assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
