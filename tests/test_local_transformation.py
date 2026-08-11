@@ -969,6 +969,36 @@ def test_dual_view_loader_enforces_cross_view_disposition_transitions():
     with pytest.raises(SkeletonError, match="preserves transformable"):
         loaded([preserved_transform])
 
+    preserved_shell = nested_view_record()
+    for view_name in ("baseline", "applied"):
+        preserved_shell[view_name]["statement_dispositions"][0][
+            "disposition"
+        ] = "preserve_shell"
+        preserved_shell[view_name]["statement_pair_metadata"] = [
+            entry
+            for entry in preserved_shell[view_name]["statement_pair_metadata"]
+            if entry["label"] != 0
+        ]
+    parsed = loaded([preserved_shell])[0]
+    assert parsed.baseline.statement_dispositions[0].disposition == "preserve_shell"
+    assert parsed.applied.transform_labels == (1, 2)
+
+    changed_shell = copy.deepcopy(preserved_shell)
+    changed_shell["applied"]["statement_dispositions"][0][
+        "disposition"
+    ] = "transform"
+    changed_shell["applied"]["statement_pair_metadata"].insert(
+        0,
+        {
+            "label": 0,
+            "before_statement": "#[proctor(0)]\nif ready { todo!() }",
+            "pointer_variables_complete": True,
+            "pointer_variables": [],
+        },
+    )
+    with pytest.raises(SkeletonError, match="changes preserved-shell"):
+        loaded([changed_shell])
+
 
 @pytest.mark.parametrize(
     ("outer", "first_child"),

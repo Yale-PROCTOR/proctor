@@ -561,10 +561,15 @@ def _statement_dispositions(
                 raise SkeletonError(f"{where} has duplicate label {label}")
             seen.add(label)
             disposition = item["disposition"]
-            if disposition not in {"preserve", "transform", "rule_applied"}:
+            if disposition not in {
+                "preserve",
+                "preserve_shell",
+                "transform",
+                "rule_applied",
+            }:
                 raise SkeletonError(
-                    f"{item_where}.disposition must be 'preserve', 'transform', "
-                    "or 'rule_applied'"
+                    f"{item_where}.disposition must be 'preserve', "
+                    "'preserve_shell', 'transform', or 'rule_applied'"
                 )
             children = load_nodes(item["children"], f"{item_where}.children")
             if disposition == "preserve" and any(
@@ -1189,11 +1194,22 @@ def _validate_cross_view_invariants(
             raise SkeletonError(
                 f"record {record_id} applied view changes preserved label {before.label}"
             )
+        if (
+            before.disposition == "preserve_shell"
+            and after.disposition != "preserve_shell"
+        ):
+            raise SkeletonError(
+                f"record {record_id} applied view changes preserved-shell label "
+                f"{before.label}"
+            )
         if after.disposition == "rule_applied" and before.disposition != "transform":
             raise SkeletonError(
                 f"record {record_id} rule-applied label {after.label} was not transformable"
             )
-        if before.disposition == "transform" and after.disposition == "preserve":
+        if before.disposition == "transform" and after.disposition in {
+            "preserve",
+            "preserve_shell",
+        }:
             raise SkeletonError(
                 f"record {record_id} applied view preserves transformable label "
                 f"{after.label}"
