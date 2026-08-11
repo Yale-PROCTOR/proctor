@@ -5,7 +5,7 @@
 #     --input-c <c-project>
 
 [run]
-provides = ["c_project"]
+provides = ["c_project", "rule_set"]
 
 [llm]
 provider = "openai"

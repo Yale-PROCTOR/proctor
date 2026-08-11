@@ -19,6 +19,7 @@ from model import (
     ItemRecord,
     PointerVariableMetadata,
     ReplacementMetadata,
+    StatementDisposition,
     StatementPairMetadata,
     SkeletonView,
     SkeletonError,
@@ -100,6 +101,7 @@ class RunState:
     )
     accepted_correspondence: list[CallableCorrespondence] = field(default_factory=list)
     accepted_observation_documents: list[Path] = field(default_factory=list)
+    accepted_views: dict[int, SkeletonView] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -172,7 +174,7 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 
 def _validate_boundaries(
     stage_input: StageInput, stage_dir: Path
-) -> tuple[Path, Path, Path, Path, Path, Path, Path | None, dict[str, Any]]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path | None, dict[str, Any]]:
     config = _effective_config(stage_input.config, stage_dir)
     source = stage_input.inputs.rust_project
     destination = stage_input.outputs.rust_project
@@ -221,6 +223,11 @@ def _validate_boundaries(
         if stage_input.outputs.artifacts_dir is not None
         else workdir / "observations.json"
     )
+    statistics_path = (
+        stage_input.outputs.artifacts_dir / "statistics.json"
+        if stage_input.outputs.artifacts_dir is not None
+        else workdir / "statistics.json"
+    )
     report_resolved = report_path.resolve()
     destination_resolved = destination.resolve()
     if (
@@ -244,10 +251,22 @@ def _validate_boundaries(
         )
     if observations_resolved == report_resolved:
         raise StageFailure("statement-pairs and observations artifact paths overlap")
+    statistics_resolved = statistics_path.resolve()
+    if _paths_overlap(statistics_resolved, destination_resolved):
+        raise StageFailure(
+            "statistics artifact path overlaps output Rust project: "
+            f"{statistics_resolved}"
+        )
+    if any(
+        _paths_overlap(statistics_resolved, path)
+        for path in (report_resolved, observations_resolved)
+    ):
+        raise StageFailure("statistics and another artifact path overlap")
     current_resolved = (workdir / "current").resolve()
     current_sensitive_paths = {
         "statement-pairs report": report_resolved,
         "observations artifact": observations_resolved,
+        "statistics artifact": statistics_resolved,
     }
     if stage_input.outputs.artifacts_dir is not None:
         current_sensitive_paths["artifacts directory"] = (
@@ -270,6 +289,7 @@ def _validate_boundaries(
             "output Rust project": destination_resolved,
             "statement report": report_resolved,
             "observations artifact": observations_resolved,
+            "statistics artifact": statistics_resolved,
             "configured Crat checkout": Path(config["crat_dir"]).resolve(),
         }
         if stage_input.outputs.artifacts_dir is not None:
@@ -291,18 +311,18 @@ def _validate_boundaries(
         library_relative,
         report_path,
         observations_path,
+        statistics_path,
         rule_set,
         config,
     )
 
 
-def _clear_stale_report(path: Path) -> None:
+def _clear_stale_artifact(path: Path, name: str) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink()
     elif path.exists():
         raise StageFailure(
-            f"statement-pairs report destination is not a regular file or symlink: "
-            f"{path}"
+            f"{name} destination is not a regular file or symlink: {path}"
         )
 
 
@@ -888,6 +908,50 @@ def _remove_exact_report(path: Path) -> None:
         raise OSError(f"cannot clean up unexpected report node: {path}")
 
 
+def _remove_published_artifact_if_owned(
+    path: Path, identity: tuple[int, int] | None
+) -> None:
+    if identity is None:
+        return
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) == identity:
+        _remove_exact_report(path)
+
+
+def _statistics_json(state: RunState) -> str:
+    counts = {
+        "preserve": 0,
+        "preserve_shell": 0,
+        "rule_applied": 0,
+        "transform": 0,
+    }
+
+    def count(nodes: tuple[StatementDisposition, ...]) -> None:
+        for node in nodes:
+            counts[node.disposition] += 1
+            count(node.children)
+
+    for view in state.accepted_views.values():
+        count(view.statement_dispositions)
+
+    statistics = {
+        "schema_version": 1,
+        "function_scc_count": state.metrics.scc_count,
+        "llm_transformation_calls": (
+            state.metrics.llm_generation_calls - state.metrics.repair_calls
+        ),
+        "llm_repair_calls": state.metrics.repair_calls,
+        "statements": {
+            "total": sum(counts.values()),
+            **counts,
+        },
+    }
+    return json.dumps(statistics, indent=2) + "\n"
+
+
 def _publish_final_outputs(
     current: Path,
     destination: Path,
@@ -895,13 +959,27 @@ def _publish_final_outputs(
     report: str,
     observations_path: Path | None = None,
     observations: str | Path = '{\n  "schema_version": 1,\n  "observations": []\n}\n',
+    statistics_path: Path | None = None,
+    statistics: str = (
+        '{\n  "schema_version": 1,\n  "function_scc_count": 0,\n'
+        '  "llm_transformation_calls": 0,\n  "llm_repair_calls": 0,\n'
+        '  "statements": {\n    "total": 0,\n    "preserve": 0,\n'
+        '    "preserve_shell": 0,\n    "rule_applied": 0,\n'
+        '    "transform": 0\n  }\n}\n'
+    ),
 ) -> None:
     observations_path = observations_path or report_path.with_name("observations.json")
+    statistics_path = statistics_path or report_path.with_name("statistics.json")
     report_temporary: Path | None = None
     observations_temporary: Path | None = None
+    statistics_temporary: Path | None = None
     destination_created = False
     report_published = False
     observations_published = False
+    statistics_published = False
+    report_identity: tuple[int, int] | None = None
+    observations_identity: tuple[int, int] | None = None
+    statistics_identity: tuple[int, int] | None = None
 
     def mark_destination_created() -> None:
         nonlocal destination_created
@@ -930,23 +1008,65 @@ def _publish_final_outputs(
         else:
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
                 output.write(observations)
+        statistics_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=statistics_path.parent,
+            prefix=f".{statistics_path.name}.",
+            suffix=".tmp",
+        )
+        statistics_temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            output.write(statistics)
         _copy_final(current, destination, mark_destination_created)
+        temporary_stat = os.lstat(report_temporary)
+        report_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
         os.replace(report_temporary, report_path)
         report_temporary = None
         report_published = True
+        temporary_stat = os.lstat(observations_temporary)
+        observations_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
         os.replace(observations_temporary, observations_path)
         observations_temporary = None
         observations_published = True
+        temporary_stat = os.lstat(statistics_temporary)
+        statistics_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        os.replace(statistics_temporary, statistics_path)
+        statistics_temporary = None
+        statistics_published = True
     except Exception as primary:
         cleanup_errors: list[str] = []
         cleanup_targets = [
             (report_temporary, _remove_exact_report),
             (observations_temporary, _remove_exact_report),
+            (statistics_temporary, _remove_exact_report),
         ]
+        if statistics_published:
+            cleanup_targets.append(
+                (
+                    statistics_path,
+                    lambda path: _remove_published_artifact_if_owned(
+                        path, statistics_identity
+                    ),
+                )
+            )
         if observations_published:
-            cleanup_targets.append((observations_path, _remove_exact_report))
+            cleanup_targets.append(
+                (
+                    observations_path,
+                    lambda path: _remove_published_artifact_if_owned(
+                        path, observations_identity
+                    ),
+                )
+            )
         if report_published:
-            cleanup_targets.append((report_path, _remove_exact_report))
+            cleanup_targets.append(
+                (
+                    report_path,
+                    lambda path: _remove_published_artifact_if_owned(
+                        path, report_identity
+                    ),
+                )
+            )
         if destination_created:
             cleanup_targets.append((destination, _remove_exact_output))
         for path, remover in cleanup_targets:
@@ -1184,6 +1304,9 @@ def _process_scc(
                 state.statement_pairs = accepted_pairs
                 state.accepted_observation_documents = accepted_documents
                 state.accepted_correspondence.extend(metadata.new_correspondence)
+                accepted_views = dict(state.accepted_views)
+                accepted_views.update(active_views)
+                state.accepted_views = accepted_views
                 return
 
         state.metrics.compilation_failures += 1
@@ -1233,11 +1356,13 @@ def run_stage(
             library_relative,
             report_path,
             observations_path,
+            statistics_path,
             rule_set,
             config,
         ) = _validate_boundaries(stage_input, stage_dir)
-        _clear_stale_report(report_path)
-        _clear_stale_report(observations_path)
+        _clear_stale_artifact(report_path, "statement-pairs report")
+        _clear_stale_artifact(observations_path, "observations artifact")
+        _clear_stale_artifact(statistics_path, "statistics artifact")
         state.config_used = config
         artifacts = stage_input.outputs.artifacts_dir
         log_path = (
@@ -1338,6 +1463,8 @@ def run_stage(
             report,
             observations_path,
             merged_observations,
+            statistics_path,
+            _statistics_json(state),
         )
         return _output("success", state, destination=destination)
     except (

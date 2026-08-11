@@ -2759,6 +2759,77 @@ def test_failed_applied_build_falls_back_once_to_baseline_with_shared_budget(tmp
     assert output.metrics["repair_calls"] == 1
     assert output.metrics["compilation_failures"] == 1
     assert (value.outputs.rust_project / "lib.rs").read_text() == "good baseline\n"
+    assert json.loads(
+        (value.outputs.artifacts_dir / "statistics.json").read_text()
+    ) == {
+        "schema_version": 1,
+        "function_scc_count": 1,
+        "llm_transformation_calls": 0,
+        "llm_repair_calls": 1,
+        "statements": {
+            "total": 1,
+            "preserve": 0,
+            "preserve_shell": 0,
+            "rule_applied": 0,
+            "transform": 1,
+        },
+    }
+
+
+def test_statistics_count_recursive_final_views_across_all_functions(tmp_path):
+    nested = nested_view_record()
+    for view_name in ("baseline", "applied"):
+        nested[view_name]["statement_dispositions"][0]["disposition"] = "preserve_shell"
+        nested[view_name]["statement_pair_metadata"] = [
+            entry
+            for entry in nested[view_name]["statement_pair_metadata"]
+            if entry["label"] != 0
+        ]
+    nested["applied"]["statement_dispositions"][0]["children"][0]["disposition"] = (
+        "rule_applied"
+    )
+    nested["applied"]["statement_pair_metadata"] = [
+        entry
+        for entry in nested["applied"]["statement_pair_metadata"]
+        if entry["label"] == 2
+    ]
+    preserved = fn_record(
+        1,
+        "preserved",
+        "preserved",
+        [],
+        needs_transformation=False,
+    )
+    tools = FakeTools(
+        skeletons=[nested, preserved],
+        builds=[CommandResult(0), CommandResult(0), CommandResult(0)],
+        validators=[VALID],
+        candidates=["nested candidate\n", "preserved candidate\n"],
+    )
+    value, output = run_fake(
+        tmp_path,
+        tools,
+        FakeClient([response("nested")]),
+    )
+    assert output.status == "success"
+    path = value.outputs.artifacts_dir / "statistics.json"
+    expected = {
+        "schema_version": 1,
+        "function_scc_count": 2,
+        "llm_transformation_calls": 1,
+        "llm_repair_calls": 0,
+        "statements": {
+            "total": 4,
+            "preserve": 1,
+            "preserve_shell": 1,
+            "rule_applied": 1,
+            "transform": 1,
+        },
+    }
+    assert json.loads(path.read_text()) == expected
+    assert path.read_text() == json.dumps(expected, indent=2) + "\n"
+    assert not (value.outputs.rust_project / "statistics.json").exists()
+    assert "statistics.json" not in output.logs
 
 
 def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_path):
@@ -3639,6 +3710,11 @@ def test_provider_retry_success_counts_attempts_but_one_generation(tmp_path):
     assert output.status == "success"
     assert output.usage.calls == 2
     assert output.metrics["llm_generation_calls"] == 1
+    statistics = json.loads(
+        (value.outputs.artifacts_dir / "statistics.json").read_text()
+    )
+    assert statistics["llm_transformation_calls"] == 1
+    assert statistics["llm_repair_calls"] == 0
 
 
 @pytest.mark.parametrize(
@@ -4996,6 +5072,7 @@ def test_merge_failure_prevents_all_final_publication(tmp_path):
     assert not value.outputs.rust_project.exists()
     assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
     assert not (value.outputs.artifacts_dir / "observations.json").exists()
+    assert not (value.outputs.artifacts_dir / "statistics.json").exists()
 
 
 def test_empty_document_is_always_published_beside_statement_pairs(tmp_path):
@@ -5020,8 +5097,23 @@ def test_empty_document_is_always_published_beside_statement_pairs(tmp_path):
         assert observations.read_text() == (
             '{\n  "schema_version": 1,\n  "observations": []\n}\n'
         )
+        statistics = report.with_name("statistics.json")
+        assert json.loads(statistics.read_text()) == {
+            "schema_version": 1,
+            "function_scc_count": 0,
+            "llm_transformation_calls": 0,
+            "llm_repair_calls": 0,
+            "statements": {
+                "total": 0,
+                "preserve": 0,
+                "preserve_shell": 0,
+                "rule_applied": 0,
+                "transform": 0,
+            },
+        }
         assert not (value.outputs.rust_project / "statement-pairs.md").exists()
         assert not (value.outputs.rust_project / "observations.json").exists()
+        assert not (value.outputs.rust_project / "statistics.json").exists()
         assert output.logs == (("local-transformation.log",) if artifacts else ())
 
     for stale_kind in ("file", "symlink"):
@@ -5119,6 +5211,42 @@ def test_empty_document_is_always_published_beside_statement_pairs(tmp_path):
         assert not tools.events
 
 
+@pytest.mark.parametrize("stale_kind", ["file", "symlink", "directory", "fifo"])
+def test_statistics_destination_handles_stale_and_nonregular_nodes(
+    tmp_path, stale_kind
+):
+    value = stage_input(tmp_path)
+    statistics = value.outputs.artifacts_dir / "statistics.json"
+    target = tmp_path / "statistics-target"
+    if stale_kind == "file":
+        statistics.write_text("stale")
+    elif stale_kind == "symlink":
+        target.write_text("target stays")
+        statistics.symlink_to(target)
+    elif stale_kind == "directory":
+        statistics.mkdir()
+    else:
+        os.mkfifo(statistics)
+    tools = FakeTools(builds=[CommandResult(0)])
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=lambda settings, tracker: FakeClient([]),
+    )
+    if stale_kind in {"file", "symlink"}:
+        assert output.status == "success"
+        assert json.loads(statistics.read_text())["schema_version"] == 1
+        assert not statistics.is_symlink()
+        if stale_kind == "symlink":
+            assert target.read_text() == "target stays"
+    else:
+        assert output.status == "failure"
+        assert "statistics artifact destination" in output.error
+        assert statistics.exists()
+        assert not tools.events
+
+
 def test_project_markdown_json_publish_as_one_cleanup_transaction(
     tmp_path, monkeypatch
 ):
@@ -5152,8 +5280,119 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
     _publish_final_outputs(current, destination, report, "report\n")
     assert events[-1] == "publish"
     assert report.read_text() == "report\n"
+    assert (artifacts / "statistics.json").is_file()
     assert (destination / "lib.rs").read_text() == "accepted"
     assert not (destination / "target").exists()
+
+    late_failure_root = tmp_path / "statistics-publication-failure"
+    late_failure_root.mkdir()
+    late_destination = late_failure_root / "output"
+    late_artifacts = late_failure_root / "artifacts"
+    late_artifacts.mkdir()
+    late_report = late_artifacts / "statement-pairs.md"
+    late_observations = late_artifacts / "observations.json"
+    late_statistics = late_artifacts / "statistics.json"
+    external_report_source = late_failure_root / "external-report"
+    external_observations_source = late_failure_root / "external-observations"
+    external_observations_target = late_failure_root / "external-target"
+
+    def statistics_publication_failure(source, output):
+        if Path(output) == late_report:
+            real_replace(source, output)
+            external_report_source.write_text("external report")
+            real_replace(external_report_source, output)
+            return
+        if Path(output) == late_observations:
+            real_replace(source, output)
+            external_observations_target.write_text("external observations")
+            external_observations_source.symlink_to(external_observations_target)
+            real_replace(external_observations_source, output)
+            return
+        if Path(output) == late_statistics:
+            raise OSError("statistics publication failed")
+        real_replace(source, output)
+
+    monkeypatch.setattr(stage_module.os, "replace", statistics_publication_failure)
+    with pytest.raises(StageFailure, match="statistics publication failed"):
+        _publish_final_outputs(current, late_destination, late_report, "report\n")
+    assert not late_destination.exists()
+    assert late_report.read_text() == "external report"
+    assert late_observations.is_symlink()
+    assert late_observations.read_text() == "external observations"
+    assert not late_statistics.exists()
+    assert not list(late_artifacts.glob(".*.tmp"))
+
+    observations_failure_root = tmp_path / "observations-publication-failure"
+    observations_failure_root.mkdir()
+    observations_failure_destination = observations_failure_root / "output"
+    observations_failure_artifacts = observations_failure_root / "artifacts"
+    observations_failure_artifacts.mkdir()
+    observations_failure_report = observations_failure_artifacts / "statement-pairs.md"
+    observations_failure_path = observations_failure_artifacts / "observations.json"
+
+    def observations_publication_failure(source, output):
+        if Path(output) == observations_failure_path:
+            raise OSError("observations publication failed")
+        real_replace(source, output)
+
+    monkeypatch.setattr(stage_module.os, "replace", observations_publication_failure)
+    with pytest.raises(StageFailure, match="observations publication failed"):
+        _publish_final_outputs(
+            current,
+            observations_failure_destination,
+            observations_failure_report,
+            "report\n",
+        )
+    assert not observations_failure_destination.exists()
+    assert not observations_failure_report.exists()
+    assert not observations_failure_path.exists()
+    assert not (observations_failure_artifacts / "statistics.json").exists()
+    assert not list(observations_failure_artifacts.glob(".*.tmp"))
+
+    statistics_write_root = tmp_path / "statistics-write-failure"
+    statistics_write_root.mkdir()
+    statistics_write_destination = statistics_write_root / "output"
+    statistics_write_artifacts = statistics_write_root / "artifacts"
+    statistics_write_artifacts.mkdir()
+    statistics_write_report = statistics_write_artifacts / "statement-pairs.md"
+    fdopen_calls = 0
+
+    class FailingStatisticsWriter:
+        def __init__(self, descriptor):
+            self.output = real_fdopen(descriptor, "w", encoding="utf-8", newline="")
+
+        def __enter__(self):
+            return self
+
+        def write(self, value):
+            self.output.write(value[:4])
+            raise OSError("statistics temporary write failed")
+
+        def __exit__(self, *args):
+            self.output.close()
+
+    def fail_third_fdopen(descriptor, *args, **kwargs):
+        nonlocal fdopen_calls
+        fdopen_calls += 1
+        if fdopen_calls == 3:
+            return FailingStatisticsWriter(descriptor)
+        return real_fdopen(descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(stage_module.os, "replace", real_replace)
+    monkeypatch.setattr(stage_module.os, "fdopen", fail_third_fdopen)
+    with pytest.raises(StageFailure, match="statistics temporary write failed"):
+        _publish_final_outputs(
+            current,
+            statistics_write_destination,
+            statistics_write_report,
+            "report\n",
+        )
+    assert not statistics_write_destination.exists()
+    assert not statistics_write_report.exists()
+    assert not (statistics_write_artifacts / "observations.json").exists()
+    assert not (statistics_write_artifacts / "statistics.json").exists()
+    assert not list(statistics_write_artifacts.glob(".*.tmp"))
+    monkeypatch.setattr(stage_module.os, "fdopen", real_fdopen)
 
     failure_root = tmp_path / "publication-failure"
     failure_root.mkdir()
@@ -5178,6 +5417,7 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
         )
     assert not failed_destination.exists()
     assert not failed_report.exists()
+    assert not (failed_artifacts / "statistics.json").exists()
     assert not list(failed_artifacts.glob(".statement-pairs.md.*.tmp"))
     assert failed_sibling.read_text() == "keep"
 
@@ -5202,6 +5442,7 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
         )
     assert ownership_report.read_text() == "external report"
     assert not ownership_destination.exists()
+    assert not (ownership_artifacts / "statistics.json").exists()
     assert not list(ownership_artifacts.glob(".statement-pairs.md.*.tmp"))
 
     for external_kind in ("file", "symlink", "directory"):
@@ -5351,6 +5592,7 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
     assert output.status == "failure"
     assert not value.outputs.rust_project.exists()
     assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+    assert not (value.outputs.artifacts_dir / "statistics.json").exists()
 
     exhausted_case = tmp_path / "exhausted-repair"
     exhausted_case.mkdir()
@@ -5368,12 +5610,14 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
     assert output.metrics["repair_calls"] == 10
     assert not value.outputs.rust_project.exists()
     assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+    assert not (value.outputs.artifacts_dir / "statistics.json").exists()
 
     mutation_case = tmp_path / "last-mutation"
     mutation_case.mkdir()
     value = stage_input(mutation_case)
     report_path = value.outputs.artifacts_dir / "statement-pairs.md"
     observations_path = value.outputs.artifacts_dir / "observations.json"
+    statistics_path = value.outputs.artifacts_dir / "statistics.json"
     mutations = []
 
     def run_copy(source, output, mark_destination_created):
@@ -5387,7 +5631,7 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
 
     def run_replace(source, output):
         real_replace(source, output)
-        if Path(output) in (report_path, observations_path):
+        if Path(output) in (report_path, observations_path, statistics_path):
             mutations.append(("publish", Path(output)))
 
     monkeypatch.setattr(stage_module, "_copy_final", run_copy)
@@ -5400,13 +5644,15 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
         llm_client_factory=lambda settings, tracker: FakeClient([]),
     )
     assert output.status == "success"
-    assert mutations[-2:] == [
+    assert mutations[-3:] == [
         ("publish", report_path),
         ("publish", observations_path),
+        ("publish", statistics_path),
     ]
     assert (
         value.outputs.rust_project.exists()
         and report_path.exists()
         and observations_path.exists()
+        and statistics_path.exists()
     )
     assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
