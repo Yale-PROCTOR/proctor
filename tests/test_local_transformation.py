@@ -26,7 +26,6 @@ from proctor.llm.types import (
 
 from model import (
     ContextOverflow,
-    ObservationError,
     PointerVariableMetadata,
     PointerVariableOrigin,
     SkeletonError,
@@ -34,24 +33,11 @@ from model import (
     dependency_context,
     function_graph,
     leaf_schedule,
-    load_observations,
-    load_rules,
     load_replacement_metadata,
     load_skeletons,
     render_dependency_entry,
     render_transformation_targets,
     strongly_connected_components,
-    RuleDocument,
-    RuleError,
-    rules_to_json,
-)
-from extract_rules import main as extract_rules_main
-import extract_rules as extract_rules_module
-from rule_synthesis import (
-    PairRejection,
-    canonicalize_rule,
-    synthesize_pair,
-    synthesize_rules,
 )
 from protocol import (
     NO_FENCE_DIAGNOSTIC,
@@ -60,6 +46,7 @@ from protocol import (
     extract_observations_command,
     llm_request,
     make_skeleton_command,
+    merge_observations_command,
     normalize_safety_command,
     render_prompt,
     replace_command,
@@ -92,6 +79,39 @@ PROMPT_GOLDEN = (
     Path(__file__).parent / "fixtures" / "local_transformation_prompt_golden.md"
 )
 
+_load_and_validate_replacement_metadata_impl = _load_and_validate_replacement_metadata
+_load_replacement_statement_pairs_impl = _load_replacement_statement_pairs
+
+
+def _load_and_validate_replacement_metadata(
+    path,
+    candidate,
+    statement_pairs,
+    observation_source,
+    members,
+    records_by_id,
+    accepted,
+):
+    return _load_and_validate_replacement_metadata_impl(
+        path,
+        candidate,
+        statement_pairs,
+        observation_source,
+        members,
+        records_by_id,
+        {item_id: record.baseline for item_id, record in records_by_id.items()},
+        accepted,
+    )
+
+
+def _load_replacement_statement_pairs(path, members, records_by_id):
+    return _load_replacement_statement_pairs_impl(
+        path,
+        members,
+        records_by_id,
+        {item_id: record.baseline for item_id, record in records_by_id.items()},
+    )
+
 
 def fn_record(
     item_id: int,
@@ -110,33 +130,49 @@ def fn_record(
         if transformation_labels is None
         else transformation_labels
     )
-    body = "todo!()" if needs_transformation else "()"
+    skeleton_labels = labels or [0]
+    body = "\n".join(
+        f"    #[proctor({label})]\n    "
+        f"{'todo!()' if label in labels else '()'}"
+        f"{';' if index + 1 < len(skeleton_labels) else ''}"
+        for index, label in enumerate(skeleton_labels)
+    )
+    metadata = (
+        [
+            {
+                "label": label,
+                "before_statement": f"#[proctor({label})]\n()",
+                "pointer_variables_complete": True,
+                "pointer_variables": [],
+            }
+            for label in labels
+        ]
+        if statement_pair_metadata is None
+        else statement_pair_metadata
+    )
+    view = {
+        "skeleton": f"unsafe fn {name}() {{\n{body}\n}}",
+        "needs_transformation": needs_transformation,
+        "statement_dispositions": [
+            {
+                "label": label,
+                "disposition": "transform" if label in labels else "preserve",
+                "children": [],
+            }
+            for label in skeleton_labels
+        ],
+        "statement_pair_metadata": metadata,
+    }
     return {
         "id": item_id,
         "path": path,
         "kind": "Fn",
         "name": name,
         "annotated_source": (f"unsafe fn {name}() {{\n    #[proctor(0)]\n    ()\n}}"),
-        "annotated_skeleton": (
-            f"unsafe fn {name}() {{\n    #[proctor(0)]\n    {body}\n}}"
-        ),
+        "baseline": view,
+        "applied": view,
         "source_signature": f"unsafe fn {name}()",
         "target_signature": f"unsafe fn {name}()",
-        "needs_transformation": needs_transformation,
-        "statements_requiring_transformation": labels,
-        "statement_pair_metadata": (
-            [
-                {
-                    "label": label,
-                    "before_statement": f"#[proctor({label})]\n()",
-                    "pointer_variables_complete": True,
-                    "pointer_variables": [],
-                }
-                for label in labels
-            ]
-            if statement_pair_metadata is None
-            else statement_pair_metadata
-        ),
         "foreign_function_names": (
             [] if foreign_function_names is None else foreign_function_names
         ),
@@ -145,6 +181,33 @@ def fn_record(
         ),
         "dependencies": dependencies,
     }
+
+
+def apply_rules(
+    record: dict[str, object],
+    *,
+    rule_labels: list[int],
+    transform_labels: list[int],
+) -> dict[str, object]:
+    applied = copy.deepcopy(record["baseline"])
+    applied["skeleton"] = applied["skeleton"].replace("todo!()", "rule_fixed()")
+    applied["needs_transformation"] = bool(transform_labels)
+    applied["statement_dispositions"] = [
+        {
+            "label": label,
+            "disposition": ("rule_applied" if label in rule_labels else "transform"),
+            "children": [],
+        }
+        for label in sorted(rule_labels + transform_labels)
+    ]
+    baseline_metadata = {
+        value["label"]: value for value in record["baseline"]["statement_pair_metadata"]
+    }
+    applied["statement_pair_metadata"] = [
+        baseline_metadata[label] for label in transform_labels
+    ]
+    record["applied"] = applied
+    return record
 
 
 def type_record(
@@ -198,9 +261,6 @@ CONTEXT_RECORDS = [
             "unsafe fn target(mut p: *const S) -> i32 {\n"
             "    #[proctor(0)]\n    callee(p.cast()) + GLOBAL\n}"
         ),
-        "annotated_skeleton": (
-            "unsafe fn target(mut p: &S) -> i32 {\n    #[proctor(0)]\n    todo!()\n}"
-        ),
         "source_signature": "unsafe fn target(mut p: *const S) -> i32",
         "target_signature": "unsafe fn target(mut p: &S) -> i32",
     },
@@ -222,6 +282,9 @@ CONTEXT_RECORDS = [
     type_record(28, "X", "Struct", "struct X;", []),
     type_record(29, "E", "Enum", "enum E { A }", []),
 ]
+CONTEXT_RECORDS[0]["baseline"]["skeleton"] = (
+    "unsafe fn target(mut p: &S) -> i32 {\n    #[proctor(0)]\n    todo!()\n}"
+)
 
 SCALAR_SOURCE = """pub unsafe fn scalar(value: i32) -> i32 {
     value + 1
@@ -311,7 +374,7 @@ def scalar_records():
         "    (value + 1)\n"
         "}"
     )
-    record["annotated_skeleton"] = record["annotated_source"]
+    record["baseline"]["skeleton"] = record["annotated_source"]
     record["source_signature"] = "pub unsafe fn scalar(mut value: i32) -> i32"
     record["target_signature"] = record["source_signature"]
     return loaded([record])
@@ -332,7 +395,7 @@ def foreign_function_records():
         "    transitive_foreign(value)\n"
         "}"
     )
-    local_abi["annotated_skeleton"] = (
+    local_abi["baseline"]["skeleton"] = (
         "pub unsafe fn local_abi(mut value: i32) -> i32 {\n"
         "    #[proctor(0)]\n"
         "    todo!()\n"
@@ -366,7 +429,7 @@ def foreign_function_records():
         "    (first + second + core::mem::size_of::<usize>())\n"
         "}"
     )
-    scan["annotated_skeleton"] = (
+    scan["baseline"]["skeleton"] = (
         "pub unsafe fn scan(mut pointer: *mut core::ffi::c_void, mut text: &[i8])\n"
         "    -> usize {\n"
         "    #[proctor(0)]\n"
@@ -393,8 +456,15 @@ def foreign_function_records():
         "pub unsafe fn scan(mut pointer: *mut core::ffi::c_void, mut text: &[i8])\n"
         "-> usize"
     )
-    scan["statements_requiring_transformation"] = [0, 1, 2, 4]
-    scan["statement_pair_metadata"] = [
+    scan["baseline"]["statement_dispositions"] = [
+        {
+            "label": label,
+            "disposition": "transform" if label in {0, 1, 2, 4} else "preserve",
+            "children": [],
+        }
+        for label in range(7)
+    ]
+    scan["baseline"]["statement_pair_metadata"] = [
         {
             "label": label,
             "before_statement": f"#[proctor({label})]\n()",
@@ -419,7 +489,7 @@ def foreign_function_records():
         "    crate::free(pointer);\n"
         "}"
     )
-    release["annotated_skeleton"] = (
+    release["baseline"]["skeleton"] = (
         "pub unsafe fn release(mut pointer: *mut core::ffi::c_void) {\n"
         "    #[proctor(0)]\n"
         "    todo!();\n"
@@ -444,7 +514,7 @@ def foreign_function_records():
         "    crate::local_abi(value)\n"
         "}"
     )
-    scalar["annotated_skeleton"] = scalar["annotated_source"]
+    scalar["baseline"]["skeleton"] = scalar["annotated_source"]
     scalar["source_signature"] = "pub unsafe fn scalar(mut value: i32) -> i32"
     scalar["target_signature"] = scalar["source_signature"]
     return loaded([local_abi, scan, release, scalar])
@@ -459,7 +529,7 @@ def item_kind_records():
         "    point.value\n"
         "}"
     )
-    helper["annotated_skeleton"] = helper["annotated_source"]
+    helper["baseline"]["skeleton"] = helper["annotated_source"]
     helper["source_signature"] = "pub unsafe fn helper(mut point: Point) -> i32"
     helper["target_signature"] = helper["source_signature"]
     target = fn_record(
@@ -476,7 +546,7 @@ def item_kind_records():
         "    (helper(point) + LIMIT + STEP)\n"
         "}"
     )
-    target["annotated_skeleton"] = target["annotated_source"]
+    target["baseline"]["skeleton"] = target["annotated_source"]
     target["source_signature"] = "pub unsafe fn target(mut point: Point) -> i32"
     target["target_signature"] = target["source_signature"]
     return loaded(
@@ -511,7 +581,7 @@ def duplicate_name_records():
         "    (value + 1)\n"
         "}"
     )
-    left["annotated_skeleton"] = left["annotated_source"]
+    left["baseline"]["skeleton"] = left["annotated_source"]
     left["source_signature"] = "pub unsafe fn parse(mut value: i32) -> i32"
     left["target_signature"] = left["source_signature"]
     right = copy.deepcopy(left)
@@ -520,7 +590,7 @@ def duplicate_name_records():
     right["annotated_source"] = str(right["annotated_source"]).replace(
         "(value + 1)", "(value - 1)"
     )
-    right["annotated_skeleton"] = right["annotated_source"]
+    right["baseline"]["skeleton"] = right["annotated_source"]
     target = fn_record(2, "target", "target", [0, 1], needs_transformation=False)
     target["annotated_source"] = (
         "pub unsafe fn target(mut value: i32) -> i32 {\n"
@@ -528,7 +598,7 @@ def duplicate_name_records():
         "    (outer::left::parse(value) + outer::right::parse(value))\n"
         "}"
     )
-    target["annotated_skeleton"] = target["annotated_source"]
+    target["baseline"]["skeleton"] = target["annotated_source"]
     target["source_signature"] = "pub unsafe fn target(mut value: i32) -> i32"
     target["target_signature"] = target["source_signature"]
     return loaded(
@@ -561,7 +631,7 @@ def test_top_level_and_kind_shapes_fail_clearly():
     for text in ("[", "{}", '[{"id":0,"path":"f","kind":"Module"}]'):
         with pytest.raises(SkeletonError):
             load_skeletons(text)
-    with pytest.raises(SkeletonError, match="missing required fields"):
+    with pytest.raises(SkeletonError, match="must contain exactly"):
         load_skeletons('[{"id":0,"path":"f","kind":"Fn","name":"f"}]')
 
 
@@ -575,32 +645,366 @@ def test_loader_requires_and_preserves_function_disposition():
         transformation_labels=[1, 3],
     )
     parsed = loaded([record])[0]
-    assert parsed.needs_transformation is True
-    assert parsed.statements_requiring_transformation == (1, 3)
-    for field in ("needs_transformation", "statements_requiring_transformation"):
+    assert parsed.baseline.needs_transformation is True
+    assert parsed.baseline.transform_labels == (1, 3)
+    for field in ("needs_transformation", "statement_dispositions"):
         malformed = copy.deepcopy(record)
-        del malformed[field]
-        with pytest.raises(SkeletonError, match="missing required fields"):
+        del malformed["baseline"][field]
+        with pytest.raises(SkeletonError):
             loaded([malformed])
     for labels in ([3, 1], [1, 1], [-1], [2**32], [True]):
         malformed = copy.deepcopy(record)
-        malformed["statements_requiring_transformation"] = labels
+        malformed["baseline"]["statement_dispositions"] = [
+            {"label": label, "disposition": "transform", "children": []}
+            for label in labels
+        ]
         with pytest.raises(SkeletonError):
             loaded([malformed])
     for value in (0, 1, "true", None):
         malformed = copy.deepcopy(record)
-        malformed["needs_transformation"] = value
+        malformed["baseline"]["needs_transformation"] = value
         with pytest.raises(SkeletonError):
             loaded([malformed])
     for value in (None, 1, "1,3", {"labels": [1, 3]}):
         malformed = copy.deepcopy(record)
-        malformed["statements_requiring_transformation"] = value
+        malformed["baseline"]["statement_dispositions"] = value
         with pytest.raises(SkeletonError):
             loaded([malformed])
     malformed = copy.deepcopy(record)
-    malformed["needs_transformation"] = False
+    malformed["baseline"]["needs_transformation"] = False
     with pytest.raises(SkeletonError, match="inconsistent"):
         loaded([malformed])
+
+
+def nested_view_record() -> dict[str, object]:
+    record = fn_record(
+        0,
+        "nested",
+        "nested",
+        [],
+        needs_transformation=True,
+        transformation_labels=[0, 1, 2],
+    )
+    record["baseline"]["skeleton"] = (
+        "unsafe fn nested(mut p: *mut i32) -> i32 {\n"
+        "    #[proctor(0)]\n"
+        "    if p.is_null() {\n"
+        "        #[proctor(1)]\n"
+        "        let mut value: i32 = todo!();\n"
+        "    } else {\n"
+        "        #[proctor(2)]\n"
+        "        value = todo!();\n"
+        "    };\n"
+        "    0\n"
+        "}"
+    )
+    record["baseline"]["statement_dispositions"] = [
+        {
+            "label": 0,
+            "disposition": "transform",
+            "children": [
+                {"label": 1, "disposition": "transform", "children": []},
+                {"label": 2, "disposition": "transform", "children": []},
+            ],
+        }
+    ]
+    record["applied"] = copy.deepcopy(record["baseline"])
+    record["applied"]["skeleton"] = (
+        record["applied"]["skeleton"]
+        .replace("p.is_null()", "ready(p)")
+        .replace("todo!()", "fixed()")
+    )
+    record["source_signature"] = "unsafe fn nested(mut p: *mut i32) -> i32"
+    record["target_signature"] = record["source_signature"]
+    return record
+
+
+def test_dual_view_loader_checks_lexical_structure_not_header_whitespace():
+    record = nested_view_record()
+    record["applied"]["skeleton"] = record["applied"]["skeleton"].replace(
+        "unsafe fn nested", "unsafe  /* normalized */ fn\n nested"
+    )
+    parsed = loaded([record])[0]
+    assert parsed.baseline.transform_labels == (0, 1, 2)
+
+    mutations = {
+        "signature": lambda text: text.replace("fn nested", "fn renamed", 1),
+        "declaration": lambda text: text.replace(
+            "let mut value: i32", "let value: i32", 1
+        ),
+        "control": lambda text: text.replace("if ready(p)", "while ready(p)", 1),
+        "label order": lambda text: (
+            text.replace("#[proctor(1)]", "#[proctor(99)]", 1)
+            .replace("#[proctor(2)]", "#[proctor(1)]", 1)
+            .replace("#[proctor(99)]", "#[proctor(2)]", 1)
+        ),
+    }
+    for mutation in mutations.values():
+        malformed = nested_view_record()
+        malformed["applied"]["skeleton"] = mutation(malformed["applied"]["skeleton"])
+        with pytest.raises(SkeletonError):
+            loaded([malformed])
+
+
+def test_dual_view_loader_keeps_tail_children_in_their_control_branch():
+    record = nested_view_record()
+    for view_name in ("baseline", "applied"):
+        skeleton = record[view_name]["skeleton"]
+        replacement = (
+            "branch_value()" if view_name == "baseline" else "fixed_branch_value()"
+        )
+        record[view_name]["skeleton"] = skeleton.replace(
+            "let mut value: i32 = todo!();"
+            if view_name == "baseline"
+            else "let mut value: i32 = fixed();",
+            replacement,
+            1,
+        )
+    parsed = loaded([record])[0]
+    assert parsed.applied.transform_labels == (0, 1, 2)
+
+
+@pytest.mark.parametrize("declaration", ["let value: i32;", "let pointer: *mut i32;"])
+def test_dual_view_loader_accepts_initializerless_local_declarations(declaration):
+    record = fn_record(0, "declaration", "declaration", [])
+    skeleton = (
+        "unsafe fn declaration() {\n"
+        f"    #[proctor(0)]\n    {declaration}\n"
+        "}"
+    )
+    record["baseline"]["skeleton"] = skeleton
+    record["applied"] = copy.deepcopy(record["baseline"])
+    assert loaded([record])[0].baseline.transform_labels == (0,)
+
+    malformed = copy.deepcopy(record)
+    malformed["applied"]["skeleton"] = malformed["applied"]["skeleton"].replace(
+        "let ", "let mut ", 1
+    )
+    with pytest.raises(SkeletonError, match="declaration topology"):
+        loaded([malformed])
+
+
+def test_dual_view_loader_tracks_let_else_child_slots():
+    record = fn_record(
+        0,
+        "choose",
+        "choose",
+        [],
+        transformation_labels=[0, 1, 2],
+    )
+    record["baseline"]["skeleton"] = (
+        "unsafe fn choose(input: Option<i32>) {\n"
+        "    #[proctor(0)]\n"
+        "    let Some(value) = input else {\n"
+        "        #[proctor(1)]\n"
+        "        return;\n"
+        "    };\n"
+        "    #[proctor(2)]\n"
+        "    consume(value);\n"
+        "}"
+    )
+    record["baseline"]["statement_dispositions"] = [
+        {
+            "label": 0,
+            "disposition": "transform",
+            "children": [
+                {"label": 1, "disposition": "transform", "children": []}
+            ],
+        },
+        {"label": 2, "disposition": "transform", "children": []},
+    ]
+    record["applied"] = copy.deepcopy(record["baseline"])
+    assert loaded([record])[0].baseline.transform_labels == (0, 1, 2)
+
+    moved = copy.deepcopy(record)
+    moved["applied"]["skeleton"] = (
+        "unsafe fn choose(input: Option<i32>) {\n"
+        "    #[proctor(0)]\n"
+        "    let Some(value) = {\n"
+        "        #[proctor(1)]\n"
+        "        input\n"
+        "    } else {};\n"
+        "    #[proctor(2)]\n"
+        "    consume(value);\n"
+        "}"
+    )
+    with pytest.raises(SkeletonError, match="control child slots"):
+        loaded([moved])
+
+
+def test_dual_view_loader_ends_brace_macro_before_following_sibling():
+    record = fn_record(
+        0,
+        "macros",
+        "macros",
+        [],
+        transformation_labels=[0, 1],
+    )
+    record["baseline"]["skeleton"] = (
+        "unsafe fn macros() {\n"
+        "    #[proctor(0)]\n"
+        "    crate::tokens! { #[proctor(99)] anything }\n"
+        "    #[proctor(1)]\n"
+        "    consume();\n"
+        "}"
+    )
+    record["applied"] = copy.deepcopy(record["baseline"])
+    assert loaded([record])[0].baseline.transform_labels == (0, 1)
+
+
+def test_dual_view_loader_distinguishes_tail_and_semicolon_expression_shells():
+    record = fn_record(0, "value", "value", [])
+    record["baseline"]["skeleton"] = (
+        "unsafe fn value() -> i32 {\n    #[proctor(0)]\n    1\n}"
+    )
+    record["applied"] = copy.deepcopy(record["baseline"])
+    record["applied"]["skeleton"] = record["applied"]["skeleton"].replace(
+        "    1\n}", "    1;\n}"
+    )
+    with pytest.raises(SkeletonError, match="control topology"):
+        loaded([record])
+
+
+@pytest.mark.parametrize("jump", ["return", "break"])
+def test_dual_view_loader_distinguishes_expression_and_jump_payloads(jump):
+    record = fn_record(
+        0,
+        "control",
+        "control",
+        [],
+        transformation_labels=[0, 1],
+    )
+    record["baseline"]["skeleton"] = (
+        "unsafe fn control() {\n"
+        "    #[proctor(0)]\n"
+        "    loop {\n"
+        "        #[proctor(1)]\n"
+        "        consume();\n"
+        "    }\n"
+        "}"
+    )
+    record["baseline"]["statement_dispositions"] = [
+        {
+            "label": 0,
+            "disposition": "transform",
+            "children": [
+                {"label": 1, "disposition": "transform", "children": []}
+            ],
+        }
+    ]
+    record["applied"] = copy.deepcopy(record["baseline"])
+    record["applied"]["skeleton"] = record["applied"]["skeleton"].replace(
+        "consume();", f"{jump};"
+    )
+    with pytest.raises(SkeletonError, match="control topology"):
+        loaded([record])
+
+
+def test_dual_view_loader_checks_forest_correspondence_and_control_slots():
+    missing = nested_view_record()
+    missing["baseline"]["skeleton"] = missing["baseline"]["skeleton"].replace(
+        "#[proctor(2)]\n", "", 1
+    )
+    with pytest.raises(SkeletonError, match="disposition topology"):
+        loaded([missing])
+
+    moved = nested_view_record()
+    moved["applied"]["skeleton"] = moved["applied"]["skeleton"].replace(
+        "    } else {\n        #[proctor(2)]\n        value = fixed();\n",
+        "        #[proctor(2)]\n        value = fixed();\n    } else {\n",
+        1,
+    )
+    with pytest.raises(SkeletonError, match="control child slots"):
+        loaded([moved])
+
+    reordered_forest = nested_view_record()
+    children = reordered_forest["baseline"]["statement_dispositions"][0]["children"]
+    reordered_forest["baseline"]["statement_dispositions"][0]["children"] = list(
+        reversed(children)
+    )
+    metadata = reordered_forest["baseline"]["statement_pair_metadata"]
+    reordered_forest["baseline"]["statement_pair_metadata"] = [
+        metadata[0],
+        metadata[2],
+        metadata[1],
+    ]
+    reordered_forest["applied"] = copy.deepcopy(reordered_forest["baseline"])
+    with pytest.raises(SkeletonError, match="out-of-order"):
+        loaded([reordered_forest])
+
+
+def test_dual_view_loader_enforces_cross_view_disposition_transitions():
+    preserved = fn_record(0, "stable", "stable", [], needs_transformation=False)
+    for disposition in ("transform", "rule_applied"):
+        malformed = copy.deepcopy(preserved)
+        malformed["applied"] = copy.deepcopy(malformed["baseline"])
+        malformed["applied"]["statement_dispositions"][0]["disposition"] = disposition
+        malformed["applied"]["needs_transformation"] = disposition == "transform"
+        if disposition == "transform":
+            malformed["applied"]["statement_pair_metadata"] = [
+                {
+                    "label": 0,
+                    "before_statement": "#[proctor(0)]\n()",
+                    "pointer_variables_complete": True,
+                    "pointer_variables": [],
+                }
+            ]
+        with pytest.raises(SkeletonError):
+            loaded([malformed])
+
+    transformed = fn_record(0, "open", "open", [])
+    transformed["applied"] = copy.deepcopy(transformed["baseline"])
+    transformed["applied"]["statement_dispositions"][0]["disposition"] = "rule_applied"
+    transformed["applied"]["needs_transformation"] = False
+    transformed["applied"]["statement_pair_metadata"] = []
+    assert loaded([transformed])[0].applied.contains_rule_application
+
+    preserved_transform = fn_record(0, "open", "open", [])
+    preserved_transform["applied"] = copy.deepcopy(preserved_transform["baseline"])
+    preserved_transform["applied"]["statement_dispositions"][0][
+        "disposition"
+    ] = "preserve"
+    preserved_transform["applied"]["needs_transformation"] = False
+    preserved_transform["applied"]["statement_pair_metadata"] = []
+    with pytest.raises(SkeletonError, match="preserves transformable"):
+        loaded([preserved_transform])
+
+
+@pytest.mark.parametrize(
+    ("outer", "first_child"),
+    [
+        ("transform", "transform"),
+        ("rule_applied", "transform"),
+        ("transform", "rule_applied"),
+    ],
+)
+def test_dual_view_loader_accepts_nested_transform_and_rule_transitions(
+    outer, first_child
+):
+    record = nested_view_record()
+    applied = record["applied"]
+    applied["statement_dispositions"][0]["disposition"] = outer
+    applied["statement_dispositions"][0]["children"][0][
+        "disposition"
+    ] = first_child
+    metadata_by_label = {
+        entry["label"]: entry for entry in applied["statement_pair_metadata"]
+    }
+    transform_labels = [
+        label
+        for label, disposition in (
+            (0, outer),
+            (1, first_child),
+            (2, "transform"),
+        )
+        if disposition == "transform"
+    ]
+    applied["statement_pair_metadata"] = [
+        metadata_by_label[label] for label in transform_labels
+    ]
+    applied["needs_transformation"] = bool(transform_labels)
+    parsed = loaded([record])[0]
+    assert parsed.applied.transform_labels == tuple(transform_labels)
 
 
 def test_function_records_and_python_helpers_add_statement_pair_metadata():
@@ -611,17 +1015,15 @@ def test_function_records_and_python_helpers_add_statement_pair_metadata():
         "kind",
         "name",
         "annotated_source",
-        "annotated_skeleton",
+        "baseline",
+        "applied",
         "source_signature",
         "target_signature",
-        "needs_transformation",
-        "statements_requiring_transformation",
-        "statement_pair_metadata",
         "foreign_function_names",
         "signature_dependencies",
         "dependencies",
     ]
-    assert plain["statement_pair_metadata"]
+    assert plain["baseline"]["statement_pair_metadata"]
     assert plain["foreign_function_names"] == []
     assert scalar_records()[0].foreign_function_names == ()
     assert foreign_function_records()[1].foreign_function_names == ("free", "strlen")
@@ -1135,28 +1537,36 @@ def test_missing_fence_is_repairable_with_raw_failed_text(text):
 
 
 def test_validation_request_is_exact_and_member_ordered():
-    request = validation_request((3, 0), record_map(), "code")
+    records = record_map()
+    request = validation_request(
+        (3, 0),
+        records,
+        {item_id: record.baseline for item_id, record in records.items()},
+        "code",
+    )
     assert [value["id"] for value in request["expected_functions"]] == [0, 3]
     assert list(request["expected_functions"][0]) == [
         "id",
         "name",
-        "skeleton",
-        "needs_transformation",
-        "statements_requiring_transformation",
+        "view",
     ]
     assert request["transformation"] == "code"
 
 
 def test_replacement_request_is_exact_and_member_ordered():
-    request = replacement_request((3, 0), record_map(), "code")
+    records = record_map()
+    request = replacement_request(
+        (3, 0),
+        records,
+        {item_id: record.baseline for item_id, record in records.items()},
+        "code",
+    )
     assert [value["id"] for value in request["items"]] == [0, 3]
     assert list(request["items"][0]) == [
         "id",
         "path",
         "name",
-        "skeleton",
-        "needs_transformation",
-        "statements_requiring_transformation",
+        "view",
     ]
     assert set(request) == {
         "schema_version",
@@ -1179,8 +1589,9 @@ def test_foreign_metadata_does_not_change_graph_or_tool_requests():
         "    crate::free(pointer);\n"
         "}"
     )
-    validation = validation_request((2,), records_by_id, transformation)
-    replacement = replacement_request((2,), records_by_id, transformation)
+    views = {item_id: record.baseline for item_id, record in records_by_id.items()}
+    validation = validation_request((2,), records_by_id, views, transformation)
+    replacement = replacement_request((2,), records_by_id, views, transformation)
     assert validation["transformation"] == transformation
     assert replacement["transformation"] == transformation
     assert "foreign_function_names" not in validation["expected_functions"][0]
@@ -1188,17 +1599,13 @@ def test_foreign_metadata_does_not_change_graph_or_tool_requests():
     assert list(validation["expected_functions"][0]) == [
         "id",
         "name",
-        "skeleton",
-        "needs_transformation",
-        "statements_requiring_transformation",
+        "view",
     ]
     assert list(replacement["items"][0]) == [
         "id",
         "path",
         "name",
-        "skeleton",
-        "needs_transformation",
-        "statements_requiring_transformation",
+        "view",
     ]
 
 
@@ -1212,6 +1619,32 @@ def test_command_builders_use_exact_four_output_and_extract_argv():
         "--output",
         "/work/skeletons.json",
         "/work/current",
+    ]
+    assert make_skeleton_command(
+        tool,
+        Path("/work/current"),
+        Path("/work/skeletons.json"),
+        Path("/inputs/rules.json"),
+    ) == [
+        "/tools/crat-tool",
+        "make-skeleton",
+        "--output",
+        "/work/skeletons.json",
+        "--rules",
+        "/inputs/rules.json",
+        "/work/current",
+    ]
+    assert merge_observations_command(
+        tool,
+        Path("/work/merged.json"),
+        (Path("/work/000.json"), Path("/work/001.json")),
+    ) == [
+        "/tools/crat-tool",
+        "merge-observations",
+        "--output",
+        "/work/merged.json",
+        "/work/000.json",
+        "/work/001.json",
     ]
     assert normalize_safety_command(
         tool, Path("/work/current/lib.rs"), Path("/work/normalized.rs")
@@ -1291,236 +1724,6 @@ INVALID = {
         }
     ],
 }
-
-
-def _valid_observation_document():
-    raw_pointer = {
-        "kind": "raw_pointer",
-        "mutability": "const",
-        "pointee": {"kind": "primitive", "name": "i32"},
-    }
-    reference = {
-        "kind": "reference",
-        "mutability": "shared",
-        "pointee": {"kind": "primitive", "name": "i32"},
-    }
-    binding = {"kind": "path", "value": {"kind": "binding", "id": "<id0>"}}
-    return {
-        "schema_version": 1,
-        "observations": [
-            {
-                "source_expression": binding,
-                "target_expression": copy.deepcopy(binding),
-                "pointer_anchors": [
-                    {
-                        "id": "<id0>",
-                        "source_type": raw_pointer,
-                        "target_type": reference,
-                    }
-                ],
-                "source_type": copy.deepcopy(raw_pointer),
-                "source_adjusted_type": copy.deepcopy(raw_pointer),
-                "target_type": copy.deepcopy(reference),
-                "target_adjusted_type": copy.deepcopy(reference),
-            }
-        ],
-    }
-
-
-def test_strict_observation_loader_uses_exact_valid_base_document():
-    value = _valid_observation_document()
-    loaded_value = load_observations(json.dumps(value))
-    assert loaded_value.observations == tuple(value["observations"])
-
-    mutations = []
-    unknown = copy.deepcopy(value)
-    unknown["extra"] = True
-    mutations.append(unknown)
-    unknown_observation = copy.deepcopy(value)
-    unknown_observation["observations"][0]["extra"] = True
-    mutations.append(unknown_observation)
-    unknown_expression = copy.deepcopy(value)
-    unknown_expression["observations"][0]["source_expression"]["extra"] = True
-    mutations.append(unknown_expression)
-    unknown_identity = copy.deepcopy(value)
-    unknown_identity["observations"][0]["source_expression"]["value"]["extra"] = True
-    mutations.append(unknown_identity)
-    unknown_anchor = copy.deepcopy(value)
-    unknown_anchor["observations"][0]["pointer_anchors"][0]["extra"] = True
-    mutations.append(unknown_anchor)
-    unknown_nested_type = copy.deepcopy(value)
-    unknown_nested_type["observations"][0]["source_type"]["pointee"]["extra"] = True
-    mutations.append(unknown_nested_type)
-    boolean_version = copy.deepcopy(value)
-    boolean_version["schema_version"] = True
-    mutations.append(boolean_version)
-    target_only = copy.deepcopy(value)
-    target_only["observations"][0]["target_expression"]["value"]["id"] = "<id1>"
-    with pytest.raises(ObservationError, match="target-only anonymized ID <id1>"):
-        load_observations(json.dumps(target_only))
-    noncontiguous = copy.deepcopy(value)
-    noncontiguous["observations"][0]["source_expression"]["value"]["id"] = "<id2>"
-    noncontiguous["observations"][0]["target_expression"]["value"]["id"] = "<id2>"
-    noncontiguous["observations"][0]["pointer_anchors"][0]["id"] = "<id2>"
-    mutations.append(noncontiguous)
-    unknown_type = copy.deepcopy(value)
-    unknown_type["observations"][0]["source_type"]["kind"] = "pointer"
-    mutations.append(unknown_type)
-    empty_anchors = copy.deepcopy(value)
-    empty_anchors["observations"][0]["pointer_anchors"] = []
-    mutations.append(empty_anchors)
-    nonraw_anchor = copy.deepcopy(value)
-    nonraw_anchor["observations"][0]["pointer_anchors"][0]["source_type"] = {
-        "kind": "reference",
-        "mutability": "shared",
-        "pointee": {"kind": "primitive", "name": "i32"},
-    }
-    mutations.append(nonraw_anchor)
-    invalid_mutability = copy.deepcopy(value)
-    invalid_mutability["observations"][0]["pointer_anchors"][0]["source_type"][
-        "mutability"
-    ] = "shared"
-    mutations.append(invalid_mutability)
-    invalid_id = copy.deepcopy(value)
-    invalid_id["observations"][0]["source_expression"]["value"]["id"] = "id0"
-    mutations.append(invalid_id)
-    duplicate_anchor = copy.deepcopy(value)
-    duplicate_anchor["observations"][0]["pointer_anchors"].append(
-        copy.deepcopy(duplicate_anchor["observations"][0]["pointer_anchors"][0])
-    )
-    mutations.append(duplicate_anchor)
-    for mutation in mutations:
-        with pytest.raises(ObservationError):
-            load_observations(json.dumps(mutation))
-    with pytest.raises(ObservationError):
-        load_observations(json.dumps(value) + " trailing")
-
-
-def test_replacement_metadata_paths_use_canonical_rust_identifier_segments():
-    base = {
-        "schema_version": 1,
-        "candidate_sha256": "0" * 64,
-        "statement_pairs_sha256": "0" * 64,
-        "observation_source_sha256": "0" * 64,
-        "accepted_correspondence": [],
-        "new_correspondence": [
-            {
-                "item_id": 1,
-                "logical_path": "módulo::r#type",
-                "implementation_path": "módulo::r#type",
-                "wrapper_path": None,
-            }
-        ],
-        "current_items": [
-            {
-                "item_id": 1,
-                "logical_path": "módulo::r#type",
-                "source_copy_path": "módulo::__copy",
-                "implementation_path": "módulo::r#type",
-                "wrapper_path": None,
-                "transform_labels": [0],
-            }
-        ],
-    }
-    load_replacement_metadata(json.dumps(base))
-    for invalid in (
-        "fn",
-        "_",
-        "r#_",
-        "r#self",
-        "crate::f",
-        "::f",
-        "f::",
-        "a::::b",
-    ):
-        malformed = copy.deepcopy(base)
-        malformed["new_correspondence"][0]["logical_path"] = invalid
-        with pytest.raises(ObservationError, match="canonical"):
-            load_replacement_metadata(json.dumps(malformed))
-
-
-def test_observation_loader_enforces_namespace_order_float_widths_and_target_only_policy():
-    value = _valid_observation_document()
-    binding0 = copy.deepcopy(value["observations"][0]["source_expression"])
-    binding1 = copy.deepcopy(binding0)
-    binding1["value"]["id"] = "<id1>"
-
-    reordered = copy.deepcopy(value)
-    reordered_expression = {
-        "kind": "tuple",
-        "elements": [binding1, copy.deepcopy(binding0)],
-    }
-    reordered["observations"][0]["source_expression"] = reordered_expression
-    reordered["observations"][0]["target_expression"] = copy.deepcopy(
-        reordered_expression
-    )
-    with pytest.raises(ObservationError, match="first-occurrence order"):
-        load_observations(json.dumps(reordered))
-
-    target_nonbinding = copy.deepcopy(value)
-    target_nonbinding["observations"][0]["target_expression"] = {
-        "kind": "tuple",
-        "elements": [
-            copy.deepcopy(binding0),
-            {
-                "kind": "path",
-                "value": {
-                    "kind": "constructor",
-                    "adt": {"kind": "local", "id": "<struct0>"},
-                    "variant": None,
-                },
-            },
-        ],
-    }
-    load_observations(json.dumps(target_nonbinding))
-
-    target_function = copy.deepcopy(value)
-    target_function["observations"][0]["target_expression"] = {
-        "kind": "tuple",
-        "elements": [
-            copy.deepcopy(binding0),
-            {"kind": "path", "value": {"kind": "function", "id": "<fn0>"}},
-        ],
-    }
-    with pytest.raises(ObservationError, match="target-only anonymized ID <fn0>"):
-        load_observations(json.dumps(target_function))
-
-    for float_type, width in (("f16", 4), ("f32", 8), ("f64", 16), ("f128", 32)):
-        floating = copy.deepcopy(value)
-        expression = {
-            "kind": "tuple",
-            "elements": [
-                copy.deepcopy(binding0),
-                {
-                    "kind": "literal",
-                    "value": {
-                        "kind": "float",
-                        "bits": "0" * width,
-                        "type": float_type,
-                    },
-                },
-            ],
-        }
-        floating["observations"][0]["source_expression"] = expression
-        floating["observations"][0]["target_expression"] = copy.deepcopy(expression)
-        load_observations(json.dumps(floating))
-        for invalid_bits in ("0" * (width - 1), "0" * (width + 1), "A" * width):
-            malformed = copy.deepcopy(floating)
-            malformed["observations"][0]["source_expression"]["elements"][1]["value"][
-                "bits"
-            ] = invalid_bits
-            with pytest.raises(ObservationError, match="exactly"):
-                load_observations(json.dumps(malformed))
-
-    for invalid_length in (True, -1, 2**64):
-        malformed = copy.deepcopy(value)
-        malformed["observations"][0]["source_type"] = {
-            "kind": "array",
-            "element": {"kind": "primitive", "name": "u8"},
-            "length": invalid_length,
-        }
-        with pytest.raises(ObservationError):
-            load_observations(json.dumps(malformed))
 
 
 def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
@@ -1800,6 +2003,21 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
         )
 
 
+def _transform_labels(dispositions):
+    return [
+        label
+        for disposition in dispositions
+        for label in (
+            (
+                [disposition["label"]]
+                if disposition["disposition"] == "transform"
+                else []
+            )
+            + _transform_labels(disposition["children"])
+        )
+    ]
+
+
 class FakeTools:
     def __init__(
         self,
@@ -1810,6 +2028,7 @@ class FakeTools:
         candidates=None,
         sidecars=None,
         observations=None,
+        merged_observations=None,
     ):
         self.skeletons = [] if skeletons is None else skeletons
         self.normalized = normalized
@@ -1818,6 +2037,7 @@ class FakeTools:
         self.candidates = list(candidates or [])
         self.sidecars = None if sidecars is None else list(sidecars)
         self.observations = None if observations is None else list(observations)
+        self.merged_observations = merged_observations
         self.events = []
 
     def build_tools(self, crat_dir):
@@ -1827,9 +2047,25 @@ class FakeTools:
     def prepare(self, current, passes, use_print):
         self.events.append(("prepare", current, passes, use_print))
 
-    def make_skeleton(self, current, output):
-        self.events.append(("make_skeleton", current, output))
+    def make_skeleton(self, current, output, rule_set=None):
+        self.events.append(("make_skeleton", current, output, rule_set))
         output.write_text(json.dumps(self.skeletons), encoding="utf-8")
+
+    def merge_observations(self, inputs, output):
+        self.events.append(("merge_observations", inputs, output))
+        if isinstance(self.merged_observations, Exception):
+            raise self.merged_observations
+        if isinstance(self.merged_observations, str):
+            output.write_text(self.merged_observations, encoding="utf-8")
+            return
+        observations = []
+        for path in inputs:
+            observations.extend(json.loads(path.read_text())["observations"])
+        output.write_text(
+            json.dumps({"schema_version": 1, "observations": observations}, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
 
     def normalize(self, library, output):
         self.events.append(("normalize", library, output))
@@ -1879,7 +2115,7 @@ class FakeTools:
                     "after_statement": f"#[proctor({label})]\n()",
                 }
                 for item in request_value["items"]
-                for label in item["statements_requiring_transformation"]
+                for label in _transform_labels(item["view"]["statement_dispositions"])
             ]
             sidecar = {"schema_version": 1, "statements": statements}
         else:
@@ -1908,7 +2144,9 @@ class FakeTools:
                 {
                     **record,
                     "source_copy_path": source_copy_path,
-                    "transform_labels": item["statements_requiring_transformation"],
+                    "transform_labels": _transform_labels(
+                        item["view"]["statement_dispositions"]
+                    ),
                 }
             )
         observation_metadata_output.write_text(
@@ -1972,7 +2210,7 @@ def response(name="target"):
     return f"```rust\nunsafe fn {name}() {{\n    #[proctor(0)]\n    ()\n}}\n```"
 
 
-def stage_input(tmp_path, *, artifacts=True, config=None, llm=None):
+def stage_input(tmp_path, *, artifacts=True, config=None, llm=None, rule_set=None):
     source = tmp_path / "input"
     source.mkdir()
     (source / "Cargo.toml").write_text('[lib]\npath = "lib.rs"\n', encoding="utf-8")
@@ -1989,7 +2227,7 @@ def stage_input(tmp_path, *, artifacts=True, config=None, llm=None):
         run_id="local-transformation-run",
         stage_id="local_transformation",
         stage_index=0,
-        inputs=InputArtifacts(rust_project=source),
+        inputs=InputArtifacts(rust_project=source, rule_set=rule_set),
         outputs=OutputDestinations(
             rust_project=tmp_path / "output", artifacts_dir=artifact_dir
         ),
@@ -2252,6 +2490,7 @@ def test_preparation_and_initialization_event_order_is_exact(
             "make_skeleton",
             value.framework.workdir / "current",
             value.framework.workdir / "skeletons.json",
+            None,
         ),
         (
             "normalize",
@@ -2259,6 +2498,11 @@ def test_preparation_and_initialization_event_order_is_exact(
             value.framework.workdir / "normalized.rs",
         ),
         ("cargo_build", value.framework.workdir / "current", "pub struct S;\n"),
+        (
+            "merge_observations",
+            (),
+            value.framework.workdir / "merged-observations.json",
+        ),
     ]
     assert output.metrics == {
         "function_count": 0,
@@ -2335,6 +2579,307 @@ def test_valid_initial_generation_validates_replaces_and_builds_once(tmp_path):
     assert output.metrics["cargo_builds"] == 2
 
 
+def test_optional_rule_set_is_forwarded_only_to_skeleton_generation(tmp_path):
+    rule_set = tmp_path / "input-rules.json"
+    rule_set.write_text('{"schema_version":1,"rules":[]}\n')
+    tools = FakeTools(builds=[CommandResult(0)])
+    value, output = run_fake(
+        tmp_path,
+        tools,
+        FakeClient([]),
+        rule_set=rule_set,
+    )
+    assert output.status == "success"
+    assert next(event for event in tools.events if event[0] == "make_skeleton") == (
+        "make_skeleton",
+        value.framework.workdir / "current",
+        value.framework.workdir / "skeletons.json",
+        rule_set,
+    )
+    assert all(rule_set not in event[1:] for event in tools.events[3:])
+
+
+def test_rule_set_path_is_redacted_when_command_runner_raises(tmp_path):
+    rule_set = tmp_path / "sensitive-rule-name.json"
+    rule_set.write_text('{"schema_version":1,"rules":[]}\n')
+    value = stage_input(tmp_path, rule_set=rule_set)
+    log_path = value.outputs.artifacts_dir / "local-transformation.log"
+
+    def raising_runner(command, *, cwd=None, env=None):
+        raise RuntimeError(f"runner rejected argv {command!r} including {rule_set}")
+
+    class ReadyCratTools(CratTools):
+        def build_tools(self, crat_dir):
+            self.crat = Path("/tools/crat")
+            self.crat_tool = Path("/tools/crat-tool")
+            self.environment = {}
+            return self.crat, self.crat_tool
+
+        def prepare(self, current_project, passes, use_print):
+            return None
+
+    tools = ReadyCratTools(
+        log_path,
+        run_command=raising_runner,
+        environment_factory=lambda path: {},
+    )
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert str(rule_set) not in output.error
+    assert "<rule-set>" in output.error
+    log = log_path.read_text()
+    assert str(rule_set) not in log
+    assert "<rule-set>" in log
+
+
+def test_rule_set_rejects_symlinks_and_overlapping_input_paths(tmp_path):
+    target = tmp_path / "real-rules.json"
+    target.write_text("{}")
+    link = tmp_path / "rules-link.json"
+    link.symlink_to(target)
+    tools = FakeTools()
+    symlink_case = tmp_path / "symlink"
+    symlink_case.mkdir()
+    _, output = run_fake(symlink_case, tools, FakeClient([]), rule_set=link)
+    assert output.status == "failure"
+    assert "regular nonsymlink file" in output.error
+    assert tools.events == []
+
+    case = tmp_path / "overlap"
+    case.mkdir()
+    value = stage_input(case)
+    overlapping = value.inputs.rust_project / "rules.json"
+    overlapping.write_text("{}")
+    value = replace(
+        value,
+        inputs=InputArtifacts(
+            rust_project=value.inputs.rust_project,
+            rule_set=overlapping,
+        ),
+    )
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "overlaps input Rust project" in output.error
+    assert tools.events == []
+
+
+def test_applied_view_projection_is_consistent_across_tool_requests():
+    raw = apply_rules(
+        fn_record(0, "target", "target", [], transformation_labels=[0, 1]),
+        rule_labels=[0],
+        transform_labels=[1],
+    )
+    record = loaded([raw])[0]
+    records = {0: record}
+    views = {0: record.applied}
+    validation = validation_request((0,), records, views, "generated")
+    replacement = replacement_request((0,), records, views, "generated")
+    assert (
+        validation["expected_functions"][0]["view"] == replacement["items"][0]["view"]
+    )
+    assert validation["expected_functions"][0]["view"]["statement_dispositions"] == [
+        {"label": 0, "disposition": "rule_applied", "children": []},
+        {"label": 1, "disposition": "transform", "children": []},
+    ]
+
+
+def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_path):
+    record = apply_rules(
+        fn_record(0, "target", "target", []),
+        rule_labels=[0],
+        transform_labels=[],
+    )
+    tools = FakeTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(0)],
+        candidates=["mechanically fixed\n"],
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([]))
+    assert output.status == "success"
+    replacement = next(event for event in tools.events if event[0] == "replace")
+    assert replacement[2]["items"][0]["view"] == record["applied"]
+    assert replacement[2]["transformation"] == record["applied"]["skeleton"]
+    assert not [event for event in tools.events if event[0] == "validate"]
+    assert not [event for event in tools.events if event[0] == "extract_observations"]
+    assert (value.outputs.rust_project / "lib.rs").read_text() == "mechanically fixed\n"
+
+
+def test_failed_applied_build_falls_back_once_to_baseline_with_shared_budget(tmp_path):
+    record = apply_rules(
+        fn_record(0, "target", "target", []),
+        rule_labels=[0],
+        transform_labels=[],
+    )
+    tools = FakeTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(101, "out0", "err0"), CommandResult(0)],
+        validators=[VALID],
+        candidates=["bad applied\n", "good baseline\n"],
+    )
+    client = FakeClient([response()])
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success"
+    replacements = [event for event in tools.events if event[0] == "replace"]
+    assert replacements[0][2]["items"][0]["view"] == record["applied"]
+    assert replacements[1][2]["items"][0]["view"] == record["baseline"]
+    assert len(client.requests) == 1
+    assert "out0" in client.requests[0].messages[0].content
+    assert "err0" in client.requests[0].messages[0].content
+    assert output.metrics["repair_calls"] == 1
+    assert output.metrics["compilation_failures"] == 1
+    assert (value.outputs.rust_project / "lib.rs").read_text() == "good baseline\n"
+
+
+def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_path):
+    first = apply_rules(
+        fn_record(0, "first", "first", [1]),
+        rule_labels=[0],
+        transform_labels=[],
+    )
+    second = fn_record(1, "second", "second", [0])
+    tools = FakeTools(
+        skeletons=[first, second],
+        builds=[CommandResult(0), CommandResult(101, "out0", "err0"), CommandResult(0)],
+        validators=[VALID, VALID],
+        candidates=["bad mixed applied\n", "good whole baseline\n"],
+    )
+    client = FakeClient([response(), response()])
+    _, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success"
+    replacements = [event for event in tools.events if event[0] == "replace"]
+    assert [item["view"] for item in replacements[0][2]["items"]] == [
+        first["applied"],
+        second["applied"],
+    ]
+    assert [item["view"] for item in replacements[1][2]["items"]] == [
+        first["baseline"],
+        second["baseline"],
+    ]
+    assert "unsafe fn target()" in client.requests[1].messages[0].content
+    assert "out0" in client.requests[1].messages[0].content
+    assert "err0" in client.requests[1].messages[0].content
+    assert output.metrics == {
+        "function_count": 2,
+        "scc_count": 1,
+        "llm_generation_calls": 2,
+        "repair_calls": 1,
+        "structural_failures": 0,
+        "compilation_failures": 1,
+        "cargo_builds": 3,
+    }
+
+
+def test_repairs_before_applied_build_failure_are_not_reset_on_fallback(tmp_path):
+    record = apply_rules(
+        fn_record(
+            0,
+            "target",
+            "target",
+            [],
+            transformation_labels=[0, 1],
+        ),
+        rule_labels=[0],
+        transform_labels=[1],
+    )
+    tools = FakeTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(101, "out2", "err2"), CommandResult(0)],
+        validators=[INVALID, VALID, VALID],
+        candidates=["bad applied repair two\n", "good baseline repair three\n"],
+    )
+    client = FakeClient(["missing fence", response(), response(), response()])
+    _, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success"
+    validations = [event for event in tools.events if event[0] == "validate"]
+    assert [entry[1]["expected_functions"][0]["view"] for entry in validations] == [
+        record["applied"],
+        record["applied"],
+        record["baseline"],
+    ]
+    assert "unsafe fn target()" in client.requests[3].messages[0].content
+    assert output.metrics == {
+        "function_count": 1,
+        "scc_count": 1,
+        "llm_generation_calls": 4,
+        "repair_calls": 3,
+        "structural_failures": 2,
+        "compilation_failures": 1,
+        "cargo_builds": 3,
+    }
+
+
+@pytest.mark.parametrize("mechanical_entry", [False, True])
+def test_applied_fallback_and_baseline_repairs_share_ten_repair_limit(
+    tmp_path, mechanical_entry
+):
+    if mechanical_entry:
+        record = apply_rules(
+            fn_record(0, "target", "target", []),
+            rule_labels=[0],
+            transform_labels=[],
+        )
+        response_count = 10
+    else:
+        record = apply_rules(
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                transformation_labels=[0, 1],
+            ),
+            rule_labels=[0],
+            transform_labels=[1],
+        )
+        response_count = 11
+    failed_builds = [
+        CommandResult(101, f"out{index}", f"err{index}") for index in range(11)
+    ]
+    tools = FakeTools(
+        skeletons=[record],
+        builds=[CommandResult(0), *failed_builds],
+        validators=[VALID] * response_count,
+        candidates=[f"candidate {index}\n" for index in range(11)],
+    )
+    client = FakeClient([response()] * response_count)
+    _, output = run_fake(tmp_path, tools, client)
+    assert output.status == "failure"
+    assert len(client.requests) == response_count
+    assert output.metrics == {
+        "function_count": 1,
+        "scc_count": 1,
+        "llm_generation_calls": response_count,
+        "repair_calls": 10,
+        "structural_failures": 0,
+        "compilation_failures": 11,
+        "cargo_builds": 12,
+    }
+    replacements = [event for event in tools.events if event[0] == "replace"]
+    assert replacements[0][2]["items"][0]["view"] == record["applied"]
+    assert all(
+        event[2]["items"][0]["view"] == record["baseline"] for event in replacements[1:]
+    )
+
+
+def test_build_failure_without_rule_application_repairs_in_same_view(tmp_path):
+    record = fn_record(0, "target", "target", [])
+    tools = FakeTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(101, "out", "err"), CommandResult(0)],
+        validators=[VALID, VALID],
+        candidates=["bad ordinary\n", "good ordinary\n"],
+    )
+    _, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
+    assert output.status == "success"
+    replacements = [event for event in tools.events if event[0] == "replace"]
+    assert all(
+        event[2]["items"][0]["view"] == record["applied"] for event in replacements
+    )
+    assert output.metrics["repair_calls"] == 1
+    assert output.metrics["compilation_failures"] == 1
+
+
 def test_all_preserved_singleton_skips_llm_and_validator(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
@@ -2409,7 +2954,7 @@ def test_mixed_scc_still_uses_one_llm_request(tmp_path):
     assert len(client.requests) == 1
     replacement = next(event for event in tools.events if event[0] == "replace")
     items = replacement[2]["items"]
-    assert [item["needs_transformation"] for item in items] == [False, True]
+    assert [item["view"]["needs_transformation"] for item in items] == [False, True]
     emitted = (value.outputs.rust_project / "lib.rs").read_text()
     assert "unsafe fn preserved() { () }" in emitted
     assert "999" not in emitted
@@ -2460,7 +3005,7 @@ def test_mechanical_signature_change_runs_replacer_and_build(tmp_path):
         [],
         needs_transformation=False,
     )
-    record["annotated_skeleton"] = (
+    record["baseline"]["skeleton"] = (
         "unsafe fn unused_pointer(pointer: &mut i32, value: i32) -> i32 {\n"
         "    #[proctor(0)]\n"
         "    value * 2\n"
@@ -2478,8 +3023,8 @@ def test_mechanical_signature_change_runs_replacer_and_build(tmp_path):
     _, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
     replacement = next(event for event in tools.events if event[0] == "replace")
-    assert replacement[2]["transformation"] == record["annotated_skeleton"]
-    assert "&mut i32" in replacement[2]["items"][0]["skeleton"]
+    assert replacement[2]["transformation"] == record["baseline"]["skeleton"]
+    assert "&mut i32" in replacement[2]["items"][0]["view"]["skeleton"]
     assert client.requests == []
     assert output.metrics["cargo_builds"] == 2
 
@@ -2858,13 +3403,16 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
     assert manifest["version"] == "0.1.0"
     assert manifest["exec"] == ["python3", "main.py"]
     assert manifest["warmup"] == ["python3", "main.py", "--build-only"]
-    assert manifest["requires"] == {"rust_project": "required"}
+    assert manifest["requires"] == {
+        "rust_project": "required",
+        "rule_set": "optional",
+    }
     assert manifest["produces"] == {"rust_project": True}
     assert set(manifest["config"]) == {"crat_dir", "dump_llm_exchanges"}
     assert manifest["config"]["crat_dir"]["default"] == "../crat"
     assert manifest["config"]["dump_llm_exchanges"]["default"] is False
     assert not (
-        {"c_project", "test_package", "rule_set"}
+        {"c_project", "test_package"}
         & (set(manifest["requires"]) | set(manifest["produces"]))
     )
     project = tomllib.loads((STAGE_DIR / "pyproject.toml").read_text())
@@ -3362,12 +3910,12 @@ def test_skeleton_loader_requires_exact_matching_statement_metadata():
         ],
     )
     parsed = loaded([record])[0]
-    assert parsed.statement_pair_metadata[0].pointer_variables_complete is True
-    assert parsed.statement_pair_metadata[0].pointer_variables[0].before_type == (
-        "Option<\n    *mut i32,\n>"
-    )
+    assert parsed.baseline.statement_pair_metadata[0].pointer_variables_complete is True
+    assert parsed.baseline.statement_pair_metadata[0].pointer_variables[
+        0
+    ].before_type == ("Option<\n    *mut i32,\n>")
     assert [
-        row.name for row in parsed.statement_pair_metadata[0].pointer_variables
+        row.name for row in parsed.baseline.statement_pair_metadata[0].pointer_variables
     ] == [
         "pointer",
         "alias",
@@ -3375,92 +3923,108 @@ def test_skeleton_loader_requires_exact_matching_statement_metadata():
 
     malformed_records = []
     missing = copy.deepcopy(record)
-    del missing["statement_pair_metadata"]
+    del missing["baseline"]["statement_pair_metadata"]
     malformed_records.append(missing)
     unknown = copy.deepcopy(record)
-    unknown["statement_pair_metadata"][0]["unknown"] = 1
+    unknown["baseline"]["statement_pair_metadata"][0]["unknown"] = 1
     malformed_records.append(unknown)
     wrong_labels = copy.deepcopy(record)
-    wrong_labels["statement_pair_metadata"][0]["label"] = 3
+    wrong_labels["baseline"]["statement_pair_metadata"][0]["label"] = 3
     malformed_records.append(wrong_labels)
     newline = copy.deepcopy(record)
-    newline["statement_pair_metadata"][0]["before_statement"] += "\n"
+    newline["baseline"]["statement_pair_metadata"][0]["before_statement"] += "\n"
     malformed_records.append(newline)
     non_boolean = copy.deepcopy(record)
-    non_boolean["statement_pair_metadata"][0]["pointer_variables_complete"] = 1
+    non_boolean["baseline"]["statement_pair_metadata"][0][
+        "pointer_variables_complete"
+    ] = 1
     malformed_records.append(non_boolean)
     bad_name = copy.deepcopy(record)
-    bad_name["statement_pair_metadata"][0]["pointer_variables"][0]["name"] = "a\nb"
+    bad_name["baseline"]["statement_pair_metadata"][0]["pointer_variables"][0][
+        "name"
+    ] = "a\nb"
     malformed_records.append(bad_name)
     bad_origin = copy.deepcopy(record)
-    bad_origin["statement_pair_metadata"][0]["pointer_variables"][0]["origin"] = {
+    bad_origin["baseline"]["statement_pair_metadata"][0]["pointer_variables"][0][
+        "origin"
+    ] = {
         "kind": "parameter",
         "declaration_label": 0,
     }
     malformed_records.append(bad_origin)
     duplicate_origin = copy.deepcopy(record)
-    duplicate_origin["statement_pair_metadata"][0]["pointer_variables"][1]["origin"] = {
+    duplicate_origin["baseline"]["statement_pair_metadata"][0]["pointer_variables"][1][
+        "origin"
+    ] = {
         "kind": "parameter",
         "index": 0,
     }
     malformed_records.append(duplicate_origin)
     empty_type = copy.deepcopy(record)
-    empty_type["statement_pair_metadata"][0]["pointer_variables"][0][
+    empty_type["baseline"]["statement_pair_metadata"][0]["pointer_variables"][0][
         "selected_target_type"
     ] = ""
     malformed_records.append(empty_type)
     inferred_integer = copy.deepcopy(record)
-    inferred_integer["statement_pair_metadata"][0]["pointer_variables"][0][
+    inferred_integer["baseline"]["statement_pair_metadata"][0]["pointer_variables"][0][
         "before_type_is_inferred"
     ] = 0
     malformed_records.append(inferred_integer)
     for bad_metadata in (None, {}, "metadata"):
         malformed = copy.deepcopy(record)
-        malformed["statement_pair_metadata"] = bad_metadata
+        malformed["baseline"]["statement_pair_metadata"] = bad_metadata
         malformed_records.append(malformed)
     nonobject_statement = copy.deepcopy(record)
-    nonobject_statement["statement_pair_metadata"][0] = []
+    nonobject_statement["baseline"]["statement_pair_metadata"][0] = []
     malformed_records.append(nonobject_statement)
     for bad_label in (True, -1, 2**32):
         malformed = copy.deepcopy(record)
-        malformed["statement_pair_metadata"][0]["label"] = bad_label
+        malformed["baseline"]["statement_pair_metadata"][0]["label"] = bad_label
         malformed_records.append(malformed)
     empty_before = copy.deepcopy(record)
-    empty_before["statement_pair_metadata"][0]["before_statement"] = ""
+    empty_before["baseline"]["statement_pair_metadata"][0]["before_statement"] = ""
     malformed_records.append(empty_before)
     wrong_before_type = copy.deepcopy(record)
-    wrong_before_type["statement_pair_metadata"][0]["before_statement"] = 7
+    wrong_before_type["baseline"]["statement_pair_metadata"][0]["before_statement"] = 7
     malformed_records.append(wrong_before_type)
     carriage_return = copy.deepcopy(record)
-    carriage_return["statement_pair_metadata"][0]["before_statement"] += "\r"
+    carriage_return["baseline"]["statement_pair_metadata"][0]["before_statement"] += (
+        "\r"
+    )
     malformed_records.append(carriage_return)
     wrong_variables = copy.deepcopy(record)
-    wrong_variables["statement_pair_metadata"][0]["pointer_variables"] = {}
+    wrong_variables["baseline"]["statement_pair_metadata"][0]["pointer_variables"] = {}
     malformed_records.append(wrong_variables)
     nonobject_variable = copy.deepcopy(record)
-    nonobject_variable["statement_pair_metadata"][0]["pointer_variables"][0] = "row"
+    nonobject_variable["baseline"]["statement_pair_metadata"][0]["pointer_variables"][
+        0
+    ] = "row"
     malformed_records.append(nonobject_variable)
     missing_variable_key = copy.deepcopy(record)
-    del missing_variable_key["statement_pair_metadata"][0]["pointer_variables"][0][
-        "before_type"
-    ]
+    del missing_variable_key["baseline"]["statement_pair_metadata"][0][
+        "pointer_variables"
+    ][0]["before_type"]
     malformed_records.append(missing_variable_key)
     unknown_variable_key = copy.deepcopy(record)
-    unknown_variable_key["statement_pair_metadata"][0]["pointer_variables"][0][
-        "unknown"
-    ] = 1
+    unknown_variable_key["baseline"]["statement_pair_metadata"][0]["pointer_variables"][
+        0
+    ]["unknown"] = 1
     malformed_records.append(unknown_variable_key)
     for field in ("name", "before_type", "selected_target_type"):
         malformed = copy.deepcopy(record)
-        malformed["statement_pair_metadata"][0]["pointer_variables"][0][field] = ""
+        malformed["baseline"]["statement_pair_metadata"][0]["pointer_variables"][0][
+            field
+        ] = ""
         malformed_records.append(malformed)
         malformed = copy.deepcopy(record)
-        malformed["statement_pair_metadata"][0]["pointer_variables"][0][field] = 7
+        malformed["baseline"]["statement_pair_metadata"][0]["pointer_variables"][0][
+            field
+        ] = 7
         malformed_records.append(malformed)
     carriage_name = copy.deepcopy(record)
-    carriage_name["statement_pair_metadata"][0]["pointer_variables"][0]["name"] = (
-        "pointer\rname"
-    )
+    carriage_name["baseline"]["statement_pair_metadata"][0]["pointer_variables"][0][
+        "name"
+    ] = "pointer\rname"
     malformed_records.append(carriage_name)
     for bad_origin in (
         None,
@@ -3472,9 +4036,9 @@ def test_skeleton_loader_requires_exact_matching_statement_metadata():
         {"kind": "local", "index": 0},
     ):
         malformed = copy.deepcopy(record)
-        malformed["statement_pair_metadata"][0]["pointer_variables"][0]["origin"] = (
-            bad_origin
-        )
+        malformed["baseline"]["statement_pair_metadata"][0]["pointer_variables"][0][
+            "origin"
+        ] = bad_origin
         malformed_records.append(malformed)
     for malformed in malformed_records:
         with pytest.raises(SkeletonError):
@@ -3492,14 +4056,20 @@ def test_skeleton_loader_requires_exact_matching_statement_metadata():
         ],
     )
     parsed_ordered = loaded([ordered])[0]
-    assert [entry.label for entry in parsed_ordered.statement_pair_metadata] == [2, 4]
-    assert parsed_ordered.statement_pair_metadata[0].pointer_variables_complete is False
+    assert [
+        entry.label for entry in parsed_ordered.baseline.statement_pair_metadata
+    ] == [2, 4]
+    assert (
+        parsed_ordered.baseline.statement_pair_metadata[0].pointer_variables_complete
+        is False
+    )
     for labels in ([4], [2, 3, 4], [4, 2]):
         malformed = copy.deepcopy(ordered)
         by_label = {
-            entry["label"]: entry for entry in malformed["statement_pair_metadata"]
+            entry["label"]: entry
+            for entry in malformed["baseline"]["statement_pair_metadata"]
         }
-        malformed["statement_pair_metadata"] = [
+        malformed["baseline"]["statement_pair_metadata"] = [
             by_label.get(label, _pointer_metadata(label)) for label in labels
         ]
         with pytest.raises(SkeletonError):
@@ -4006,2161 +4576,6 @@ def test_extraction_runs_only_after_successful_build(tmp_path):
     assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
 
 
-# Rule extraction consumes normalized JSON trees, so these builders intentionally
-# model the wire grammar rather than Rust syntax.
-RULE_I32 = {"kind": "primitive", "name": "i32"}
-RULE_BOOL = {"kind": "primitive", "name": "bool"}
-RULE_RAW_I32 = {"kind": "raw_pointer", "mutability": "const", "pointee": RULE_I32}
-RULE_REF_I32 = {"kind": "reference", "mutability": "shared", "pointee": RULE_I32}
-RULE_SLICE_I32 = {"kind": "slice", "element": RULE_I32}
-RULE_MUT_SLICE_I32 = {
-    "kind": "reference",
-    "mutability": "mutable",
-    "pointee": RULE_SLICE_I32,
-}
-
-
-def rule_var(sort, index):
-    return {"kind": "variable", "sort": sort, "index": index}
-
-
-def rule_binding(index):
-    return {"kind": "path", "value": {"kind": "binding", "id": f"<id{index}>"}}
-
-
-def rule_external(name):
-    return {
-        "kind": "path",
-        "value": {"kind": "external", "crate": "fixture", "path": [name]},
-    }
-
-
-def rule_call(name, *arguments):
-    return {"kind": "call", "callee": rule_external(name), "arguments": list(arguments)}
-
-
-def rule_unary(operator, operand):
-    return {"kind": "unary", "operator": operator, "operand": operand}
-
-
-def rule_binary(operator, left, right):
-    return {"kind": "binary", "operator": operator, "left": left, "right": right}
-
-
-def rule_integer(value, ty):
-    return {
-        "kind": "literal",
-        "value": {"kind": "integer", "value": str(value), "type": ty},
-    }
-
-
-def rule_method(receiver, crate, path, *arguments):
-    return {
-        "kind": "method_call",
-        "receiver": receiver,
-        "method": {"kind": "external", "crate": crate, "path": list(path)},
-        "arguments": list(arguments),
-    }
-
-
-def rule_offset(base, amount):
-    return rule_method(base, "core", ("ptr", "const_ptr", "offset"), amount)
-
-
-def rule_range_from(start):
-    return {"kind": "range", "start": start, "end": None, "limits": "half_open"}
-
-
-def rule_index(base, value):
-    return {"kind": "index", "base": base, "index": value}
-
-
-def rule_mutable_slice_from(base, start):
-    return {
-        "kind": "address_of",
-        "borrow": "reference",
-        "mutability": "mut",
-        "expression": rule_index(base, rule_range_from(start)),
-    }
-
-
-def rule_local_adt(kind="struct", index=0):
-    return {"kind": "local", "id": f"<{kind}{index}>"}
-
-
-def rule_local_adt_type(kind="struct", index=0):
-    return {
-        "kind": "adt",
-        "adt_kind": kind,
-        "identity": rule_local_adt(kind, index),
-        "arguments": [],
-    }
-
-
-def rule_member(kind="field", owner_kind="struct", owner_index=0, index=0):
-    return {
-        "kind": "local",
-        "owner": rule_local_adt(owner_kind, owner_index),
-        "id": f"<{kind}{index}>",
-    }
-
-
-def rule_field(base, owner_kind="struct", owner_index=0, field_index=0):
-    return {
-        "kind": "field",
-        "base": base,
-        "field": rule_member("field", owner_kind, owner_index, field_index),
-    }
-
-
-def rule_anchor(index, target_type=RULE_MUT_SLICE_I32):
-    return {
-        "id": f"<id{index}>",
-        "source_type": copy.deepcopy(RULE_RAW_I32),
-        "target_type": copy.deepcopy(target_type),
-    }
-
-
-def rule_observation(source, target, *, anchors=None, root_types=None):
-    if anchors is None:
-        anchors = [rule_anchor(0)]
-    if root_types is None:
-        root_types = (RULE_I32, RULE_I32, RULE_I32, RULE_I32)
-    return {
-        "source_expression": source,
-        "target_expression": target,
-        "pointer_anchors": copy.deepcopy(anchors),
-        "source_type": copy.deepcopy(root_types[0]),
-        "source_adjusted_type": copy.deepcopy(root_types[1]),
-        "target_type": copy.deepcopy(root_types[2]),
-        "target_adjusted_type": copy.deepcopy(root_types[3]),
-    }
-
-
-def rule_document(*observations):
-    return {"schema_version": 1, "observations": list(observations)}
-
-
-def loaded_rule_document(*observations):
-    return load_observations(json.dumps(rule_document(*observations)))
-
-
-def minimal_rule_value():
-    anchor = rule_var("anchor", 0)
-    return {
-        "schema_version": 1,
-        "rules": [
-            {
-                "source_pattern": {
-                    "kind": "unary",
-                    "operator": "deref",
-                    "operand": {"kind": "path", "value": copy.deepcopy(anchor)},
-                },
-                "target_pattern": {"kind": "path", "value": copy.deepcopy(anchor)},
-                "pointer_anchors": [
-                    {
-                        "id": copy.deepcopy(anchor),
-                        "source_type": copy.deepcopy(RULE_RAW_I32),
-                        "target_type": copy.deepcopy(RULE_REF_I32),
-                    }
-                ],
-                "source_type": copy.deepcopy(RULE_I32),
-                "source_adjusted_type": copy.deepcopy(RULE_I32),
-                "target_type": copy.deepcopy(RULE_I32),
-                "target_adjusted_type": copy.deepcopy(RULE_I32),
-            }
-        ],
-    }
-
-
-def synthesized(*observations):
-    for left_index, left in enumerate(observations):
-        for right in observations[left_index + 1 :]:
-            result = synthesize_pair(left, right)
-            if result.rule is not None:
-                _assert_pair_reconstructs(result, left, right)
-    return synthesize_rules((loaded_rule_document(*observations),))
-
-
-def test_minimal_exact_rule_document_round_trips():
-    loaded = load_rules(json.dumps(minimal_rule_value()))
-    assert load_rules(rules_to_json(loaded)) == loaded
-    assert rules_to_json(loaded).endswith("}\n")
-
-
-@pytest.mark.parametrize(
-    ("path", "replacement"),
-    [
-        (("source_pattern", "operand", "value", "sort"), "value"),
-        (("source_pattern", "operand", "value", "index"), True),
-        (("source_pattern", "operand", "value", "index"), -1),
-        (("source_pattern", "operand", "value", "sort"), "expression"),
-        (("source_pattern", "operand", "value", "index"), 2**64),
-    ],
-)
-def test_all_variable_positions_are_closed(path, replacement):
-    value = minimal_rule_value()
-    nested = value["rules"][0]
-    for part in path[:-1]:
-        nested = nested[part]
-    nested[path[-1]] = replacement
-    with pytest.raises(RuleError):
-        load_rules(json.dumps(value))
-
-
-def test_integer_magnitude_variable_is_only_literal_value():
-    accepted = minimal_rule_value()
-    accepted["rules"][0]["source_pattern"] = {
-        "kind": "literal",
-        "value": {
-            "kind": "integer",
-            "value": rule_var("integer_magnitude", 0),
-            "type": "isize",
-        },
-    }
-    load_rules(json.dumps(accepted))
-    wrong_value = copy.deepcopy(accepted)
-    wrong_value["rules"][0]["source_pattern"]["value"]["value"] = rule_var(
-        "expression", 0
-    )
-    complete = copy.deepcopy(accepted)
-    complete["rules"][0]["source_pattern"] = rule_var("integer_magnitude", 0)
-    for invalid in (wrong_value, complete):
-        with pytest.raises(RuleError):
-            load_rules(json.dumps(invalid))
-
-
-def test_local_member_owner_remains_structural():
-    value = minimal_rule_value()
-    rule = value["rules"][0]
-    member = {
-        "kind": "local",
-        "owner": rule_var("struct", 0),
-        "id": rule_var("field", 0),
-    }
-    pattern = {
-        "kind": "field",
-        "base": {"kind": "path", "value": rule_var("anchor", 0)},
-        "field": member,
-    }
-    rule["source_pattern"] = pattern
-    rule["target_pattern"] = copy.deepcopy(pattern)
-    rule["source_type"] = {
-        "kind": "adt",
-        "adt_kind": "struct",
-        "identity": rule_var("struct", 0),
-        "arguments": [],
-    }
-    load_rules(json.dumps(value))
-    invalid = copy.deepcopy(value)
-    invalid["rules"][0]["source_pattern"]["field"] = rule_var("field", 0)
-    with pytest.raises(RuleError):
-        load_rules(json.dumps(invalid))
-
-
-def test_document_rule_and_nested_unknown_fields_reject():
-    for path in ((), ("rules", 0), ("rules", 0, "source_pattern")):
-        value = minimal_rule_value()
-        nested = value
-        for part in path:
-            nested = nested[part]
-        nested["extra"] = True
-        with pytest.raises(RuleError):
-            load_rules(json.dumps(value))
-    for version in (2, 0, True, "1"):
-        value = minimal_rule_value()
-        value["schema_version"] = version
-        with pytest.raises(RuleError):
-            load_rules(json.dumps(value))
-
-
-def test_canonical_indices_and_target_availability_are_checked():
-    noncanonical = minimal_rule_value()
-    noncanonical["rules"][0]["pointer_anchors"][0]["id"]["index"] = 1
-    missing = minimal_rule_value()
-    missing["rules"][0]["source_pattern"] = rule_var("expression", 1)
-    target_only = minimal_rule_value()
-    target_only["rules"][0]["target_pattern"] = rule_var("expression", 0)
-    for value in (noncanonical, missing, target_only):
-        with pytest.raises(RuleError):
-            load_rules(json.dumps(value))
-
-
-def test_empty_rule_document_has_exact_bytes():
-    assert rules_to_json(RuleDocument(rules=())) == (
-        '{\n  "schema_version": 1,\n  "rules": []\n}\n'
-    )
-
-
-def test_rule_loader_rejects_concrete_local_ids():
-    value = minimal_rule_value()
-    value["rules"][0]["pointer_anchors"][0]["id"] = "<id0>"
-    with pytest.raises(RuleError):
-        load_rules(json.dumps(value))
-
-
-def test_observation_loader_rejects_every_variable_position():
-    value = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    document = rule_document(value)
-    document["observations"][0]["source_expression"] = rule_var("expression", 0)
-    with pytest.raises(ObservationError):
-        load_observations(json.dumps(document))
-
-
-def test_anchor_identity_is_valid_in_binding_pattern():
-    block = {
-        "kind": "block",
-        "block": {
-            "statements": [
-                {
-                    "kind": "let",
-                    "pattern": {
-                        "kind": "binding",
-                        "id": "<id0>",
-                        "mutability": "mutable",
-                        "by_ref": "no",
-                    },
-                    "type": copy.deepcopy(RULE_RAW_I32),
-                    "initializer": None,
-                },
-                {
-                    "kind": "expression",
-                    "expression": rule_binding(0),
-                    "semicolon": False,
-                },
-            ]
-        },
-    }
-    value = rule_observation(block, copy.deepcopy(block), anchors=[rule_anchor(0)])
-    result = synthesized(value, copy.deepcopy(value))
-    pattern_id = result.rules[0]["source_pattern"]["block"]["statements"][0]["pattern"][
-        "id"
-    ]
-    assert pattern_id == rule_var("anchor", 0)
-    load_rules(rules_to_json(result))
-
-
-@pytest.mark.parametrize("adt_kind", ["struct", "enum", "union"])
-def test_observation_adt_namespace_must_match_kind(adt_kind):
-    valid = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(rule_local_adt_type(adt_kind),) * 4,
-    )
-    loaded_rule_document(valid)
-    invalid = copy.deepcopy(valid)
-    other = next(kind for kind in ("struct", "enum", "union") if kind != adt_kind)
-    invalid["source_type"]["identity"] = rule_local_adt(other)
-    with pytest.raises(ObservationError):
-        loaded_rule_document(invalid)
-
-
-def test_integer_magnitude_correspondence():
-    rules = synthesized(
-        rule_observation(
-            rule_offset(rule_binding(0), rule_integer(1, "isize")),
-            rule_mutable_slice_from(rule_binding(0), rule_integer(1, "usize")),
-        ),
-        rule_observation(
-            rule_offset(rule_binding(0), rule_integer(2, "isize")),
-            rule_mutable_slice_from(rule_binding(0), rule_integer(2, "usize")),
-        ),
-    )
-    assert len(rules.rules) == 1
-    text = rules_to_json(rules)
-    assert text.count('"sort": "integer_magnitude"') == 2
-
-
-def _reconstruct_rule_value(value, substitutions, seed, role=None):
-    if isinstance(value, dict):
-        if value.get("kind") == "variable":
-            variable = value
-            concrete = substitutions[(variable["sort"], variable["index"])][seed]
-            if variable["sort"] == "expression":
-                return copy.deepcopy(concrete)
-            if variable["sort"] == "integer_magnitude" or role == "id":
-                return concrete
-            if role == "adt":
-                return {"kind": "local", "id": concrete}
-            assert role == "value"
-            kind = "binding" if variable["sort"] == "anchor" else variable["sort"]
-            return {"kind": kind, "id": concrete}
-        kind = value.get("kind")
-        if kind == "path":
-            return {
-                "kind": "path",
-                "value": _reconstruct_rule_value(
-                    value["value"], substitutions, seed, "value"
-                ),
-            }
-        if kind == "constructor":
-            return {
-                "kind": "constructor",
-                "adt": _reconstruct_rule_value(
-                    value["adt"], substitutions, seed, "adt"
-                ),
-                "variant": _reconstruct_rule_value(
-                    value["variant"], substitutions, seed, "member"
-                )
-                if value["variant"] is not None
-                else None,
-            }
-        if kind == "local" and "owner" in value:
-            return {
-                "kind": "local",
-                "owner": _reconstruct_rule_value(
-                    value["owner"], substitutions, seed, "adt"
-                ),
-                "id": _reconstruct_rule_value(value["id"], substitutions, seed, "id"),
-            }
-        if kind == "adt":
-            return {
-                "kind": "adt",
-                "adt_kind": value["adt_kind"],
-                "identity": _reconstruct_rule_value(
-                    value["identity"], substitutions, seed, "adt"
-                ),
-                "arguments": [
-                    _reconstruct_rule_value(child, substitutions, seed)
-                    for child in value["arguments"]
-                ],
-            }
-        if kind == "method_call":
-            return {
-                "kind": "method_call",
-                "receiver": _reconstruct_rule_value(
-                    value["receiver"], substitutions, seed
-                ),
-                "method": _reconstruct_rule_value(
-                    value["method"], substitutions, seed, "value"
-                ),
-                "arguments": [
-                    _reconstruct_rule_value(child, substitutions, seed)
-                    for child in value["arguments"]
-                ],
-            }
-        if kind == "field":
-            return {
-                "kind": "field",
-                "base": _reconstruct_rule_value(value["base"], substitutions, seed),
-                "field": _reconstruct_rule_value(
-                    value["field"], substitutions, seed, "member"
-                ),
-            }
-        if kind == "struct":
-            return {
-                "kind": "struct",
-                "adt": _reconstruct_rule_value(
-                    value["adt"], substitutions, seed, "adt"
-                ),
-                "variant": _reconstruct_rule_value(
-                    value["variant"], substitutions, seed, "member"
-                )
-                if value["variant"] is not None
-                else None,
-                "fields": [
-                    {
-                        "field": _reconstruct_rule_value(
-                            field["field"], substitutions, seed, "member"
-                        ),
-                        "value": _reconstruct_rule_value(
-                            field["value"], substitutions, seed
-                        ),
-                    }
-                    for field in value["fields"]
-                ],
-                "rest": _reconstruct_rule_value(value["rest"], substitutions, seed)
-                if value["rest"] is not None
-                else None,
-            }
-        if kind == "binding" and isinstance(value.get("id"), dict):
-            result = copy.deepcopy(value)
-            result["id"] = _reconstruct_rule_value(
-                value["id"], substitutions, seed, "id"
-            )
-            return result
-        if value.get("kind") == "literal" and isinstance(
-            value["value"].get("value"), dict
-        ):
-            result = copy.deepcopy(value)
-            variable = result["value"]["value"]
-            result["value"]["value"] = substitutions[
-                (variable["sort"], variable["index"])
-            ][seed]
-            return result
-        return {
-            key: _reconstruct_rule_value(child, substitutions, seed)
-            for key, child in value.items()
-        }
-    if isinstance(value, list):
-        return [_reconstruct_rule_value(child, substitutions, seed) for child in value]
-    return copy.deepcopy(value)
-
-
-def _assert_pair_reconstructs(result, left, right):
-    assert result.rule is not None and result.substitutions is not None
-    rule = result.rule
-    for seed, expected in enumerate((left, right)):
-        anchors = [
-            {
-                "id": _reconstruct_rule_value(
-                    anchor["id"], result.substitutions, seed, "id"
-                ),
-                "source_type": _reconstruct_rule_value(
-                    anchor["source_type"], result.substitutions, seed
-                ),
-                "target_type": _reconstruct_rule_value(
-                    anchor["target_type"], result.substitutions, seed
-                ),
-            }
-            for anchor in rule["pointer_anchors"]
-        ]
-        reconstructed = {
-            "source_expression": _reconstruct_rule_value(
-                rule["source_pattern"], result.substitutions, seed
-            ),
-            "target_expression": _reconstruct_rule_value(
-                rule["target_pattern"], result.substitutions, seed
-            ),
-            "pointer_anchors": anchors,
-            "source_type": _reconstruct_rule_value(
-                rule["source_type"], result.substitutions, seed
-            ),
-            "source_adjusted_type": _reconstruct_rule_value(
-                rule["source_adjusted_type"], result.substitutions, seed
-            ),
-            "target_type": _reconstruct_rule_value(
-                rule["target_type"], result.substitutions, seed
-            ),
-            "target_adjusted_type": _reconstruct_rule_value(
-                rule["target_adjusted_type"], result.substitutions, seed
-            ),
-        }
-        assert reconstructed == expected
-
-
-def test_accepted_rule_reconstructs_both_seed_transformations_exactly():
-    left = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(1, "usize")),
-    )
-    right = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(2, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(2, "usize")),
-    )
-    result = synthesize_pair(left, right)
-    _assert_pair_reconstructs(result, left, right)
-
-
-def test_complete_expression_correspondence():
-    left = rule_binary("add", rule_binding(1), rule_integer(1, "isize"))
-    right = rule_binary("multiply", rule_binding(1), rule_integer(2, "isize"))
-    rules = synthesized(
-        rule_observation(
-            rule_offset(rule_binding(0), left),
-            rule_mutable_slice_from(rule_binding(0), copy.deepcopy(left)),
-        ),
-        rule_observation(
-            rule_offset(rule_binding(0), right),
-            rule_mutable_slice_from(rule_binding(0), copy.deepcopy(right)),
-        ),
-    )
-    assert len(rules.rules) == 1
-    assert rules_to_json(rules).count('"sort": "expression"') == 2
-
-
-def test_repeated_complete_expression_correspondence():
-    left = rule_binary("add", rule_binding(1), rule_integer(1, "isize"))
-    right = rule_binary("multiply", rule_binding(1), rule_integer(2, "isize"))
-    rules = synthesized(
-        rule_observation(
-            rule_call(
-                "pair",
-                rule_offset(rule_binding(0), left),
-                rule_offset(rule_binding(0), copy.deepcopy(left)),
-            ),
-            rule_call(
-                "pair",
-                rule_mutable_slice_from(rule_binding(0), copy.deepcopy(left)),
-                rule_mutable_slice_from(rule_binding(0), copy.deepcopy(left)),
-            ),
-        ),
-        rule_observation(
-            rule_call(
-                "pair",
-                rule_offset(rule_binding(0), right),
-                rule_offset(rule_binding(0), copy.deepcopy(right)),
-            ),
-            rule_call(
-                "pair",
-                rule_mutable_slice_from(rule_binding(0), copy.deepcopy(right)),
-                rule_mutable_slice_from(rule_binding(0), copy.deepcopy(right)),
-            ),
-        ),
-    )
-    assert len(rules.rules) == 1
-    assert '"index": 1' not in rules_to_json(rules)
-
-
-def test_source_only_magnitude_variable():
-    rules = synthesized(
-        rule_observation(
-            rule_method(
-                rule_offset(rule_binding(0), rule_integer(1, "isize")),
-                "core",
-                ("ptr", "const_ptr", "is_null"),
-            ),
-            {"kind": "literal", "value": {"kind": "bool", "value": False}},
-            root_types=(RULE_BOOL,) * 4,
-        ),
-        rule_observation(
-            rule_method(
-                rule_offset(rule_binding(0), rule_integer(2, "isize")),
-                "core",
-                ("ptr", "const_ptr", "is_null"),
-            ),
-            {"kind": "literal", "value": {"kind": "bool", "value": False}},
-            root_types=(RULE_BOOL,) * 4,
-        ),
-    )
-    assert len(rules.rules) == 1
-
-
-def test_reordered_binding_identities():
-    value = rule_observation(
-        rule_call(
-            "mix",
-            rule_unary("deref", rule_binding(0)),
-            rule_binding(1),
-            rule_binding(2),
-        ),
-        rule_call("mix", rule_binding(0), rule_binding(2), rule_binding(1)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    result = synthesized(value, copy.deepcopy(value))
-    assert len(result.rules) == 1
-    text = rules_to_json(result)
-    assert text.count('"sort": "binding"') == 4
-    assert "<id" not in text
-
-
-def test_ordered_disagreement_pairs_do_not_collapse():
-    result = synthesized(
-        rule_observation(
-            rule_call(
-                "triple",
-                rule_unary("deref", rule_binding(0)),
-                rule_integer(1, "usize"),
-                rule_integer(2, "usize"),
-            ),
-            rule_call(
-                "triple",
-                rule_binding(0),
-                rule_integer(1, "usize"),
-                rule_integer(2, "usize"),
-            ),
-            anchors=[rule_anchor(0, RULE_REF_I32)],
-        ),
-        rule_observation(
-            rule_call(
-                "triple",
-                rule_unary("deref", rule_binding(0)),
-                rule_integer(2, "usize"),
-                rule_integer(1, "usize"),
-            ),
-            rule_call(
-                "triple",
-                rule_binding(0),
-                rule_integer(2, "usize"),
-                rule_integer(1, "usize"),
-            ),
-            anchors=[rule_anchor(0, RULE_REF_I32)],
-        ),
-    )
-    assert len(result.rules) == 1
-    assert '"index": 1' in rules_to_json(result)
-
-
-def test_exact_rule_from_repeated_equal_observations():
-    value = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert len(synthesized(value, copy.deepcopy(value)).rules) == 1
-    assert synthesized(value).rules == ()
-
-
-def test_expression_equal_source_and_target_is_retained():
-    value = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_unary("deref", rule_binding(0)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert len(synthesized(value, copy.deepcopy(value)).rules) == 1
-
-
-def test_ordinary_binding_identities_are_explicit():
-    amount = rule_binary("add", rule_binding(1), rule_binding(2))
-    value = rule_observation(
-        rule_offset(rule_binding(0), amount),
-        rule_mutable_slice_from(rule_binding(0), copy.deepcopy(amount)),
-    )
-    text = rules_to_json(synthesized(value, copy.deepcopy(value)))
-    assert text.count('"sort": "binding"') == 4
-
-
-def test_identity_encapsulated_by_one_expression_variable():
-    left = rule_observation(
-        rule_binary(
-            "add",
-            rule_integer(1, "i32"),
-            rule_unary(
-                "deref",
-                rule_offset(
-                    rule_binding(0),
-                    rule_binary("add", rule_binding(1), rule_binding(2)),
-                ),
-            ),
-        ),
-        rule_binary(
-            "add",
-            rule_integer(1, "i32"),
-            rule_index(
-                rule_binding(0), rule_binary("add", rule_binding(1), rule_binding(2))
-            ),
-        ),
-    )
-    right = rule_observation(
-        rule_binary(
-            "add",
-            rule_binding(0),
-            rule_unary(
-                "deref",
-                rule_offset(
-                    rule_binding(1),
-                    rule_binary("add", rule_binding(2), rule_binding(3)),
-                ),
-            ),
-        ),
-        rule_binary(
-            "add",
-            rule_binding(0),
-            rule_index(
-                rule_binding(1), rule_binary("add", rule_binding(2), rule_binding(3))
-            ),
-        ),
-        anchors=[rule_anchor(1)],
-    )
-    assert len(synthesized(left, right).rules) == 1
-
-
-def test_updated_named_struct_owner_and_field_identity():
-    def named(value):
-        return {
-            "kind": "struct",
-            "adt": rule_local_adt(),
-            "variant": None,
-            "fields": [{"field": rule_member(), "value": value}],
-            "rest": None,
-        }
-
-    ty = rule_local_adt_type()
-    value = rule_observation(
-        named(rule_unary("deref", rule_binding(0))),
-        named(rule_binding(0)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(ty,) * 4,
-    )
-    text = rules_to_json(synthesized(value, copy.deepcopy(value)))
-    assert '"sort": "struct"' in text and '"sort": "field"' in text
-
-
-def test_promoted_local_field_identity_and_owner():
-    value = rule_observation(
-        rule_field(rule_unary("deref", rule_binding(0))),
-        rule_field(rule_binding(0)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    result = synthesized(value, copy.deepcopy(value))
-    assert len(result.rules) == 1
-    assert '"sort": "field"' in rules_to_json(result)
-
-
-def test_rigid_external_function_is_preserved():
-    result = synthesized(
-        rule_observation(
-            rule_call("load", rule_offset(rule_binding(0), rule_integer(1, "isize"))),
-            rule_call(
-                "load",
-                rule_mutable_slice_from(rule_binding(0), rule_integer(1, "usize")),
-            ),
-        ),
-        rule_observation(
-            rule_call("load", rule_offset(rule_binding(0), rule_integer(2, "isize"))),
-            rule_call(
-                "load",
-                rule_mutable_slice_from(rule_binding(0), rule_integer(2, "usize")),
-            ),
-        ),
-    )
-    assert len(result.rules) == 1
-    assert '"load"' in rules_to_json(result)
-
-
-def test_child_list_arity_is_hidden_by_enclosing_expression():
-    left_call = rule_call("f", rule_binding(1))
-    right_call = rule_call("f", rule_binding(1), rule_binding(2))
-    result = synthesized(
-        rule_observation(
-            rule_offset(rule_binding(0), left_call),
-            rule_mutable_slice_from(rule_binding(0), copy.deepcopy(left_call)),
-        ),
-        rule_observation(
-            rule_offset(rule_binding(0), right_call),
-            rule_mutable_slice_from(rule_binding(0), copy.deepcopy(right_call)),
-        ),
-    )
-    assert len(result.rules) == 1
-
-
-def test_operator_difference_is_hidden_by_expression():
-    left = rule_binary("add", rule_binding(1), rule_integer(1, "isize"))
-    right = rule_binary("subtract", rule_binding(1), rule_integer(1, "isize"))
-    result = synthesized(
-        rule_observation(
-            rule_offset(rule_binding(0), left),
-            rule_mutable_slice_from(rule_binding(0), copy.deepcopy(left)),
-        ),
-        rule_observation(
-            rule_offset(rule_binding(0), right),
-            rule_mutable_slice_from(rule_binding(0), copy.deepcopy(right)),
-        ),
-    )
-    assert len(result.rules) == 1
-
-
-def test_target_only_magnitude_disagreement_rejects():
-    result = synthesized(
-        rule_observation(
-            rule_method(rule_binding(0), "core", ("ptr", "const_ptr", "read")),
-            rule_integer(0, "i32"),
-        ),
-        rule_observation(
-            rule_method(rule_binding(0), "core", ("ptr", "const_ptr", "read")),
-            rule_integer(1, "i32"),
-        ),
-    )
-    assert result.rules == ()
-
-
-def test_different_source_and_target_disagreement_pairs_reject():
-    result = synthesized(
-        rule_observation(
-            rule_offset(rule_binding(0), rule_integer(1, "isize")),
-            rule_mutable_slice_from(rule_binding(0), rule_integer(0, "usize")),
-        ),
-        rule_observation(
-            rule_offset(rule_binding(0), rule_integer(2, "isize")),
-            rule_mutable_slice_from(rule_binding(0), rule_integer(1, "usize")),
-        ),
-    )
-    assert result.rules == ()
-
-
-def test_identical_sources_with_conflicting_targets_reject():
-    source = rule_unary("deref", rule_binding(0))
-    result = synthesized(
-        rule_observation(
-            source, rule_binding(0), anchors=[rule_anchor(0, RULE_REF_I32)]
-        ),
-        rule_observation(
-            copy.deepcopy(source),
-            {
-                "kind": "address_of",
-                "borrow": "reference",
-                "mutability": "mut",
-                "expression": copy.deepcopy(source),
-            },
-            anchors=[rule_anchor(0, RULE_REF_I32)],
-        ),
-    )
-    assert result.rules == ()
-
-
-def test_lone_expression_source_is_degenerate():
-    left = rule_observation(
-        rule_call("left", rule_unary("deref", rule_binding(0))),
-        rule_call("left", rule_unary("deref", rule_binding(0))),
-    )
-    right = rule_observation(
-        rule_call("right", rule_offset(rule_binding(0), rule_integer(1, "isize"))),
-        rule_call("right", rule_offset(rule_binding(0), rule_integer(1, "isize"))),
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.DEGENERATE_SOURCE
-
-
-def test_anchor_hidden_by_expression_rejects():
-    left = rule_observation(
-        rule_call("consume", rule_unary("deref", rule_binding(0))),
-        rule_call("consume", rule_unary("deref", rule_binding(0))),
-    )
-    right = rule_observation(
-        rule_call("consume", rule_offset(rule_binding(0), rule_integer(1, "isize"))),
-        rule_call("consume", rule_offset(rule_binding(0), rule_integer(1, "isize"))),
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.CARRIER
-
-
-def test_anchor_hidden_despite_explicit_occurrence_rejects():
-    left = rule_observation(
-        rule_call(
-            "combine",
-            rule_unary("deref", rule_binding(0)),
-            rule_call("read", rule_binding(0)),
-        ),
-        rule_call("combine", rule_binding(0), rule_call("read", rule_binding(0))),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    right = rule_observation(
-        rule_call(
-            "combine",
-            rule_unary("deref", rule_binding(0)),
-            rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        ),
-        rule_call(
-            "combine",
-            rule_binding(0),
-            rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        ),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.CARRIER
-
-
-def test_one_of_multiple_anchors_hidden_rejects():
-    left = rule_observation(
-        rule_call(
-            "combine",
-            rule_unary("deref", rule_binding(0)),
-            rule_call("read", rule_binding(1)),
-        ),
-        rule_call("combine", rule_binding(0), rule_call("read", rule_binding(1))),
-        anchors=[rule_anchor(0, RULE_REF_I32), rule_anchor(1)],
-    )
-    right = rule_observation(
-        rule_call(
-            "combine",
-            rule_unary("deref", rule_binding(0)),
-            rule_offset(rule_binding(1), rule_integer(1, "isize")),
-        ),
-        rule_call(
-            "combine",
-            rule_binding(0),
-            rule_offset(rule_binding(1), rule_integer(1, "isize")),
-        ),
-        anchors=[rule_anchor(0, RULE_REF_I32), rule_anchor(1)],
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.CARRIER
-
-
-def test_local_identity_split_between_explicit_and_expression_rejects():
-    left = rule_observation(
-        rule_binary(
-            "add",
-            rule_binding(0),
-            rule_unary("deref", rule_offset(rule_binding(1), rule_binding(0))),
-        ),
-        rule_binary(
-            "add", rule_binding(0), rule_index(rule_binding(1), rule_binding(0))
-        ),
-        anchors=[rule_anchor(1)],
-    )
-    right = rule_observation(
-        rule_binary(
-            "add",
-            rule_binding(0),
-            rule_unary("deref", rule_offset(rule_binding(1), rule_integer(1, "usize"))),
-        ),
-        rule_binary(
-            "add",
-            rule_binding(0),
-            rule_index(rule_binding(1), rule_integer(1, "usize")),
-        ),
-        anchors=[rule_anchor(1)],
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.CARRIER
-
-
-def test_inconsistent_binding_equality_partition_rejects():
-    left = rule_observation(
-        rule_call(
-            "combine",
-            rule_unary("deref", rule_binding(0)),
-            rule_binding(1),
-            rule_binding(1),
-        ),
-        rule_call("combine", rule_binding(0), rule_binding(1), rule_binding(1)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    right = rule_observation(
-        rule_call(
-            "combine",
-            rule_unary("deref", rule_binding(0)),
-            rule_binding(1),
-            rule_binding(2),
-        ),
-        rule_call("combine", rule_binding(0), rule_binding(1), rule_binding(2)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.CARRIER
-
-
-def test_target_only_local_field_identity_rejects():
-    value = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_field(rule_binding(0)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert synthesized(value, copy.deepcopy(value)).rules == ()
-
-
-def test_different_rigid_external_functions_reject():
-    left = rule_observation(
-        rule_call("load", rule_unary("deref", rule_binding(0))),
-        rule_call("load", rule_binding(0)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    right = rule_observation(
-        rule_call("peek", rule_unary("deref", rule_binding(0))),
-        rule_call("peek", rule_binding(0)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.DEGENERATE_SOURCE
-
-
-def test_remaining_local_identity_sorts_are_emitted():
-    local_values = [
-        {"kind": "path", "value": {"kind": "function", "id": "<fn0>"}},
-        {"kind": "path", "value": {"kind": "constant", "id": "<const0>"}},
-        {"kind": "path", "value": {"kind": "static", "id": "<static0>"}},
-        {
-            "kind": "method_call",
-            "receiver": rule_binding(1),
-            "method": {"kind": "method", "id": "<method0>"},
-            "arguments": [],
-        },
-    ]
-    enum_expression = {
-        "kind": "struct",
-        "adt": rule_local_adt("enum"),
-        "variant": rule_member("variant", "enum"),
-        "fields": [
-            {
-                "field": rule_member("field", "enum"),
-                "value": {
-                    "kind": "call",
-                    "callee": local_values[0],
-                    "arguments": [
-                        rule_unary("deref", rule_binding(0)),
-                        *local_values[1:],
-                    ],
-                },
-            }
-        ],
-        "rest": None,
-    }
-    target = copy.deepcopy(enum_expression)
-    target["fields"][0]["value"]["arguments"][0] = rule_binding(0)
-    value = rule_observation(
-        enum_expression, target, anchors=[rule_anchor(0, RULE_REF_I32)]
-    )
-    text = rules_to_json(synthesized(value, copy.deepcopy(value)))
-    for sort in (
-        "function",
-        "enum",
-        "field",
-        "variant",
-        "constant",
-        "static",
-        "method",
-    ):
-        assert f'"sort": "{sort}"' in text
-
-
-def test_local_nominal_context_alignment_is_one_environment():
-    ty = rule_local_adt_type()
-    left = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(ty,) * 4,
-    )
-    right = copy.deepcopy(left)
-    result = synthesized(left, right)
-    assert rules_to_json(result).count('"sort": "struct"') == 4
-
-
-def test_anchor_count_order_and_type_are_context():
-    one = rule_observation(rule_binding(0), rule_binding(0), anchors=[rule_anchor(0)])
-    two = rule_observation(
-        rule_call("f", rule_binding(0), rule_binding(1)),
-        rule_call("f", rule_binding(0), rule_binding(1)),
-        anchors=[rule_anchor(0), rule_anchor(1)],
-    )
-    assert synthesize_pair(one, two).rejection == PairRejection.CONTEXT
-    left = rule_observation(
-        rule_call("f", rule_binding(0), rule_binding(1)),
-        rule_call("f", rule_binding(0), rule_binding(1)),
-        anchors=[rule_anchor(0, RULE_REF_I32), rule_anchor(1)],
-    )
-    right = rule_observation(
-        rule_call("f", rule_binding(0), rule_binding(1)),
-        rule_call("f", rule_binding(0), rule_binding(1)),
-        anchors=[rule_anchor(0), rule_anchor(1, RULE_REF_I32)],
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.CONTEXT
-
-
-def test_root_type_constructor_external_and_arity_mismatch_skip():
-    ty = rule_local_adt_type()
-    left = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(ty,) * 4,
-    )
-    right = copy.deepcopy(left)
-    right["source_type"] = copy.deepcopy(RULE_I32)
-    assert synthesize_pair(left, right).rejection == PairRejection.CONTEXT
-
-
-def test_namespace_bijection_conflict_in_context_skips():
-    left_type = {
-        "kind": "tuple",
-        "elements": [
-            rule_local_adt_type("struct", 0),
-            rule_local_adt_type("struct", 0),
-        ],
-    }
-    right_type = {
-        "kind": "tuple",
-        "elements": [
-            rule_local_adt_type("struct", 0),
-            rule_local_adt_type("struct", 1),
-        ],
-    }
-    left = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(left_type,) * 4,
-    )
-    right = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(right_type,) * 4,
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.CONTEXT
-
-
-def test_integer_literal_type_controls_narrow_magnitude_rule():
-    left = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(1, "isize")), rule_binding(0)
-    )
-    right = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(2, "usize")), rule_binding(0)
-    )
-    text = rules_to_json(synthesized(left, right))
-    assert '"sort": "expression"' in text
-    assert '"sort": "integer_magnitude"' not in text
-
-
-@pytest.mark.parametrize(
-    ("left_value", "right_value", "expected_sort"),
-    [
-        ("01", "01", None),
-        ("01", "02", "expression"),
-        ("1", "02", "expression"),
-        ("١", "١", None),
-        ("١", "٢", "expression"),
-        ("0", "1", "integer_magnitude"),
-        ("9", "10", "integer_magnitude"),
-    ],
-)
-def test_magnitude_variables_require_canonical_ascii_decimal(
-    left_value, right_value, expected_sort
-):
-    left = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(left_value, "isize")), rule_binding(0)
-    )
-    right = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(right_value, "isize")),
-        rule_binding(0),
-    )
-    loaded_rule_document(left, right)
-    text = rules_to_json(synthesized(left, right))
-    if expected_sort is None:
-        assert '"sort": "expression"' not in text
-        assert '"sort": "integer_magnitude"' not in text
-    else:
-        assert f'"sort": "{expected_sort}"' in text
-
-
-def test_rigid_identity_conflict_can_hide_in_larger_nonroot_expression():
-    left = rule_observation(
-        rule_call(
-            "outer",
-            rule_call("load", rule_integer(0, "i32")),
-            rule_unary("deref", rule_binding(0)),
-        ),
-        rule_call("outer", rule_call("load", rule_integer(0, "i32")), rule_binding(0)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    right = rule_observation(
-        rule_call(
-            "outer",
-            rule_call("peek", rule_integer(1, "i32")),
-            rule_unary("deref", rule_binding(0)),
-        ),
-        rule_call("outer", rule_call("peek", rule_integer(1, "i32")), rule_binding(0)),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert len(synthesized(left, right).rules) == 1
-
-
-def test_source_variable_may_be_unused_by_target():
-    result = synthesized(
-        rule_observation(
-            rule_call(
-                "select", rule_unary("deref", rule_binding(0)), rule_integer(1, "i32")
-            ),
-            rule_binding(0),
-            anchors=[rule_anchor(0, RULE_REF_I32)],
-        ),
-        rule_observation(
-            rule_call(
-                "select", rule_unary("deref", rule_binding(0)), rule_integer(2, "i32")
-            ),
-            rule_binding(0),
-            anchors=[rule_anchor(0, RULE_REF_I32)],
-        ),
-    )
-    assert len(result.rules) == 1
-
-
-def test_target_lookup_does_not_widen_or_fallback():
-    left_amount = rule_binary("add", rule_binding(1), rule_integer(1, "isize"))
-    right_amount = rule_binary("multiply", rule_binding(1), rule_integer(2, "isize"))
-    result = synthesized(
-        rule_observation(
-            rule_offset(rule_binding(0), left_amount),
-            rule_mutable_slice_from(rule_binding(0), rule_integer(1, "isize")),
-        ),
-        rule_observation(
-            rule_offset(rule_binding(0), right_amount),
-            rule_mutable_slice_from(rule_binding(0), rule_integer(2, "isize")),
-        ),
-    )
-    assert result.rules == ()
-
-
-def test_member_owner_and_member_have_independent_carriers():
-    value = rule_observation(
-        rule_call(
-            "pair",
-            rule_field(rule_unary("deref", rule_binding(0)), field_index=0),
-            rule_field(rule_unary("deref", rule_binding(0)), field_index=1),
-        ),
-        rule_call(
-            "pair",
-            rule_field(rule_binding(0), field_index=0),
-            rule_field(rule_binding(0), field_index=1),
-        ),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert len(synthesized(value, copy.deepcopy(value)).rules) == 1
-
-
-def test_distinct_expression_variables_may_have_equal_substitutions():
-    left = rule_observation(
-        rule_call(
-            "triple",
-            rule_call("left", rule_integer(0, "i32")),
-            rule_call("left", rule_integer(0, "i32")),
-            rule_unary("deref", rule_binding(0)),
-        ),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    right = rule_observation(
-        rule_call(
-            "triple",
-            rule_call("right", rule_integer(1, "i32")),
-            rule_call("other", rule_integer(2, "i32")),
-            rule_unary("deref", rule_binding(0)),
-        ),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    text = rules_to_json(synthesized(left, right))
-    assert '"index": 1' in text
-
-
-def test_conflicting_and_specific_rules_are_all_retained():
-    a = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(1, "usize")),
-    )
-    b = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(2, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(2, "usize")),
-    )
-    c = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        rule_call("alternate", rule_binding(0), rule_integer(1, "usize")),
-    )
-    d = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(2, "isize")),
-        rule_call("alternate", rule_binding(0), rule_integer(2, "usize")),
-    )
-    assert len(synthesized(a, b, copy.deepcopy(a), c, d).rules) == 3
-
-
-@pytest.mark.parametrize(
-    "source,target",
-    [
-        (
-            {"kind": "array", "elements": [rule_unary("deref", rule_binding(0))]},
-            {"kind": "array", "elements": [rule_binding(0)]},
-        ),
-        (
-            {
-                "kind": "cast",
-                "expression": rule_unary("deref", rule_binding(0)),
-                "type": RULE_I32,
-            },
-            {"kind": "cast", "expression": rule_binding(0), "type": RULE_I32},
-        ),
-        (
-            {"kind": "return", "value": rule_unary("deref", rule_binding(0))},
-            {"kind": "return", "value": rule_binding(0)},
-        ),
-        (
-            {
-                "kind": "repeat",
-                "value": rule_unary("deref", rule_binding(0)),
-                "count": rule_integer(2, "usize"),
-            },
-            {
-                "kind": "repeat",
-                "value": rule_binding(0),
-                "count": rule_integer(2, "usize"),
-            },
-        ),
-        (
-            {
-                "kind": "tuple",
-                "elements": [
-                    rule_integer(0, "i32"),
-                    rule_unary("deref", rule_binding(0)),
-                ],
-            },
-            {"kind": "tuple", "elements": [rule_integer(0, "i32"), rule_binding(0)]},
-        ),
-        (
-            {
-                "kind": "if",
-                "condition": {
-                    "kind": "literal",
-                    "value": {"kind": "bool", "value": True},
-                },
-                "then": {
-                    "statements": [
-                        {
-                            "kind": "expression",
-                            "expression": rule_unary("deref", rule_binding(0)),
-                            "semicolon": False,
-                        }
-                    ]
-                },
-                "else": rule_unary("deref", rule_binding(0)),
-            },
-            {
-                "kind": "if",
-                "condition": {
-                    "kind": "literal",
-                    "value": {"kind": "bool", "value": True},
-                },
-                "then": {
-                    "statements": [
-                        {
-                            "kind": "expression",
-                            "expression": rule_binding(0),
-                            "semicolon": False,
-                        }
-                    ]
-                },
-                "else": rule_binding(0),
-            },
-        ),
-        (
-            {
-                "kind": "while",
-                "condition": {
-                    "kind": "literal",
-                    "value": {"kind": "bool", "value": True},
-                },
-                "body": {
-                    "statements": [
-                        {
-                            "kind": "expression",
-                            "expression": rule_unary("deref", rule_binding(0)),
-                            "semicolon": False,
-                        }
-                    ]
-                },
-            },
-            {
-                "kind": "while",
-                "condition": {
-                    "kind": "literal",
-                    "value": {"kind": "bool", "value": True},
-                },
-                "body": {
-                    "statements": [
-                        {
-                            "kind": "expression",
-                            "expression": rule_binding(0),
-                            "semicolon": False,
-                        }
-                    ]
-                },
-            },
-        ),
-        (
-            {
-                "kind": "loop",
-                "body": {
-                    "statements": [
-                        {
-                            "kind": "expression",
-                            "expression": rule_unary("deref", rule_binding(0)),
-                            "semicolon": False,
-                        }
-                    ]
-                },
-            },
-            {
-                "kind": "loop",
-                "body": {
-                    "statements": [
-                        {
-                            "kind": "expression",
-                            "expression": rule_binding(0),
-                            "semicolon": False,
-                        }
-                    ]
-                },
-            },
-        ),
-        (
-            {
-                "kind": "assign",
-                "left": rule_integer(0, "i32"),
-                "right": rule_unary("deref", rule_binding(0)),
-            },
-            {
-                "kind": "assign",
-                "left": rule_integer(0, "i32"),
-                "right": rule_binding(0),
-            },
-        ),
-        (
-            {
-                "kind": "assign_op",
-                "operator": "add",
-                "left": rule_integer(0, "i32"),
-                "right": rule_unary("deref", rule_binding(0)),
-            },
-            {
-                "kind": "assign_op",
-                "operator": "add",
-                "left": rule_integer(0, "i32"),
-                "right": rule_binding(0),
-            },
-        ),
-        (
-            {
-                "kind": "range",
-                "start": rule_integer(0, "usize"),
-                "end": rule_unary("deref", rule_binding(0)),
-                "limits": "closed",
-            },
-            {
-                "kind": "range",
-                "start": rule_integer(0, "usize"),
-                "end": rule_binding(0),
-                "limits": "closed",
-            },
-        ),
-        (
-            {
-                "kind": "address_of",
-                "borrow": "raw",
-                "mutability": "const",
-                "expression": rule_unary("deref", rule_binding(0)),
-            },
-            {
-                "kind": "address_of",
-                "borrow": "raw",
-                "mutability": "const",
-                "expression": rule_binding(0),
-            },
-        ),
-        (
-            {"kind": "break", "value": rule_unary("deref", rule_binding(0))},
-            {"kind": "break", "value": rule_binding(0)},
-        ),
-        (
-            {
-                "kind": "block",
-                "block": {
-                    "statements": [
-                        {
-                            "kind": "expression",
-                            "expression": rule_unary("deref", rule_binding(0)),
-                            "semicolon": False,
-                        }
-                    ]
-                },
-            },
-            {
-                "kind": "block",
-                "block": {
-                    "statements": [
-                        {
-                            "kind": "expression",
-                            "expression": rule_binding(0),
-                            "semicolon": False,
-                        }
-                    ]
-                },
-            },
-        ),
-        (
-            {
-                "kind": "array",
-                "elements": [
-                    {"kind": "continue"},
-                    rule_unary("deref", rule_binding(0)),
-                ],
-            },
-            {"kind": "array", "elements": [{"kind": "continue"}, rule_binding(0)]},
-        ),
-    ],
-)
-def test_every_closed_constructor_traverses_all_children(source, target):
-    value = rule_observation(source, target, anchors=[rule_anchor(0, RULE_REF_I32)])
-    assert len(synthesized(value, copy.deepcopy(value)).rules) == 1
-
-
-def test_binding_pattern_block_initializer_reconstructs_exactly():
-    source = {
-        "kind": "block",
-        "block": {
-            "statements": [
-                {
-                    "kind": "let",
-                    "pattern": {
-                        "kind": "binding",
-                        "id": "<id0>",
-                        "mutability": "mutable",
-                        "by_ref": "no",
-                    },
-                    "type": copy.deepcopy(RULE_I32),
-                    "initializer": rule_unary("deref", rule_binding(1)),
-                },
-                {
-                    "kind": "expression",
-                    "expression": rule_binding(0),
-                    "semicolon": False,
-                },
-            ]
-        },
-    }
-    target = copy.deepcopy(source)
-    target["block"]["statements"][0]["initializer"] = rule_binding(1)
-    value = rule_observation(source, target, anchors=[rule_anchor(1, RULE_REF_I32)])
-    result = synthesized(value, copy.deepcopy(value))
-    rule = result.rules[0]
-    pattern_id = rule["source_pattern"]["block"]["statements"][0]["pattern"]["id"]
-    later_path = rule["source_pattern"]["block"]["statements"][1]["expression"]["value"]
-    initializer_path = rule["source_pattern"]["block"]["statements"][0]["initializer"][
-        "operand"
-    ]["value"]
-    assert pattern_id == later_path == rule_var("binding", 0)
-    assert initializer_path == rule_var("anchor", 0)
-
-
-@pytest.mark.parametrize(
-    "root_type",
-    [
-        RULE_I32,
-        {"kind": "slice", "element": RULE_I32},
-        {"kind": "array", "element": RULE_I32, "length": 4},
-        RULE_RAW_I32,
-        RULE_REF_I32,
-        {"kind": "tuple", "elements": [RULE_I32, RULE_REF_I32]},
-        rule_local_adt_type("struct"),
-        {
-            "kind": "adt",
-            "adt_kind": "enum",
-            "identity": {
-                "kind": "external",
-                "crate": "core",
-                "path": ["option", "Option"],
-            },
-            "arguments": [RULE_REF_I32],
-        },
-    ],
-)
-def test_every_closed_type_constructor_is_retained(root_type):
-    value = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(root_type,) * 4,
-    )
-    assert len(synthesized(value, copy.deepcopy(value)).rules) == 1
-
-
-def test_root_array_length_mismatch_rejects_context():
-    left_type = {"kind": "array", "element": copy.deepcopy(RULE_I32), "length": 4}
-    right_type = copy.deepcopy(left_type)
-    right_type["length"] = 5
-    left = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(left_type,) * 4,
-    )
-    right = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(right_type,) * 4,
-    )
-    assert synthesize_pair(left, right).rejection == PairRejection.CONTEXT
-
-
-def test_local_and_external_root_adt_identity_mismatch_rejects_context():
-    local_type = rule_local_adt_type("struct")
-    external_type = {
-        "kind": "adt",
-        "adt_kind": "struct",
-        "identity": {
-            "kind": "external",
-            "crate": "fixture",
-            "path": ["External"],
-        },
-        "arguments": [],
-    }
-    left = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(local_type,) * 4,
-    )
-    right = copy.deepcopy(left)
-    right["source_type"] = external_type
-    assert synthesize_pair(left, right).rejection == PairRejection.CONTEXT
-
-
-def test_local_root_adt_argument_arity_mismatch_rejects_context():
-    left_type = rule_local_adt_type("struct")
-    right_type = copy.deepcopy(left_type)
-    right_type["arguments"] = [copy.deepcopy(RULE_I32)]
-    left = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-        root_types=(left_type,) * 4,
-    )
-    right = copy.deepcopy(left)
-    right["source_type"] = right_type
-    assert synthesize_pair(left, right).rejection == PairRejection.CONTEXT
-
-
-def test_all_loader_reachable_target_only_namespaces_reject():
-    targets = [
-        rule_field(rule_binding(0)),
-        {
-            "kind": "cast",
-            "expression": rule_binding(0),
-            "type": rule_local_adt_type("struct"),
-        },
-        {
-            "kind": "cast",
-            "expression": rule_binding(0),
-            "type": rule_local_adt_type("union"),
-        },
-        {
-            "kind": "call",
-            "callee": {
-                "kind": "path",
-                "value": {
-                    "kind": "constructor",
-                    "adt": rule_local_adt("enum"),
-                    "variant": rule_member("variant", "enum"),
-                },
-            },
-            "arguments": [rule_binding(0)],
-        },
-        rule_call(
-            "pair",
-            rule_binding(0),
-            {"kind": "path", "value": {"kind": "constant", "id": "<const0>"}},
-        ),
-        rule_call(
-            "pair",
-            rule_binding(0),
-            {"kind": "path", "value": {"kind": "static", "id": "<static0>"}},
-        ),
-        rule_call(
-            "pair",
-            rule_binding(0),
-            {
-                "kind": "method_call",
-                "receiver": rule_binding(0),
-                "method": {"kind": "method", "id": "<method0>"},
-                "arguments": [],
-            },
-        ),
-    ]
-    for target in targets:
-        value = rule_observation(
-            rule_unary("deref", rule_binding(0)),
-            target,
-            anchors=[rule_anchor(0, RULE_REF_I32)],
-        )
-        assert synthesized(value, copy.deepcopy(value)).rules == ()
-
-
-def test_constructor_value_identity_preserves_owned_variant():
-    constructor = {
-        "kind": "path",
-        "value": {
-            "kind": "constructor",
-            "adt": rule_local_adt("enum"),
-            "variant": rule_member("variant", "enum"),
-        },
-    }
-    source = {
-        "kind": "call",
-        "callee": constructor,
-        "arguments": [rule_unary("deref", rule_binding(0))],
-    }
-    target = {
-        "kind": "call",
-        "callee": copy.deepcopy(constructor),
-        "arguments": [rule_binding(0)],
-    }
-    value = rule_observation(source, target, anchors=[rule_anchor(0, RULE_REF_I32)])
-    text = rules_to_json(synthesized(value, copy.deepcopy(value)))
-    assert '"sort": "enum"' in text and '"sort": "variant"' in text
-
-
-def test_foreign_identities_and_noninteger_literals_remain_rigid():
-    foreign = {
-        "kind": "path",
-        "value": {"kind": "foreign_function", "symbol": "ffi_read"},
-    }
-    source = {
-        "kind": "call",
-        "callee": foreign,
-        "arguments": [
-            {"kind": "literal", "value": {"kind": "char", "value": "x"}},
-            rule_unary("deref", rule_binding(0)),
-        ],
-    }
-    target = copy.deepcopy(source)
-    target["arguments"][1] = rule_binding(0)
-    value = rule_observation(source, target, anchors=[rule_anchor(0, RULE_REF_I32)])
-    text = rules_to_json(synthesized(value, copy.deepcopy(value)))
-    assert "ffi_read" in text and '"value": "x"' in text
-
-
-def test_canonical_first_occurrence_order_is_context_then_patterns():
-    root = rule_local_adt_type("struct", 1)
-    value = rule_observation(
-        rule_call(
-            "ordered",
-            rule_unary("deref", rule_binding(0)),
-            rule_unary("deref", rule_binding(1)),
-            rule_binding(2),
-            rule_field(rule_binding(2), owner_index=0),
-        ),
-        rule_call(
-            "ordered",
-            rule_binding(0),
-            rule_binding(1),
-            rule_binding(2),
-            rule_field(rule_binding(2), owner_index=0),
-        ),
-        anchors=[rule_anchor(0, RULE_REF_I32), rule_anchor(1, RULE_REF_I32)],
-        root_types=(root,) * 4,
-    )
-    result = synthesized(value, copy.deepcopy(value))
-    assert load_rules(rules_to_json(result)) == result
-
-
-def test_duplicate_compression_crosses_documents(monkeypatch):
-    value = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    calls = []
-    real = synthesize_pair
-
-    def tracked(left, right):
-        calls.append((left, right))
-        return real(left, right)
-
-    import rule_synthesis as synthesis_module
-
-    monkeypatch.setattr(synthesis_module, "synthesize_pair", tracked)
-    documents = tuple(loaded_rule_document(copy.deepcopy(value)) for _ in range(3))
-    result = synthesize_rules(documents)
-    assert len(calls) == 1
-    assert len(result.rules) == 1
-
-
-def test_singleton_never_self_pairs_and_empty_is_success():
-    value = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    assert synthesize_rules((loaded_rule_document(value),)).rules == ()
-    assert synthesize_rules((loaded_rule_document(),)).rules == ()
-
-
-def test_input_document_and_observation_permutations_are_byte_identical():
-    a = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(1, "usize")),
-    )
-    b = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(2, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(2, "usize")),
-    )
-    c = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        rule_call("alternate", rule_binding(0), rule_integer(1, "usize")),
-    )
-    d = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(2, "isize")),
-        rule_call("alternate", rule_binding(0), rule_integer(2, "usize")),
-    )
-    variants = [
-        (loaded_rule_document(a, b), loaded_rule_document(c, d, copy.deepcopy(a))),
-        (loaded_rule_document(a, c), loaded_rule_document(d, b, copy.deepcopy(a))),
-        (
-            loaded_rule_document(a),
-            loaded_rule_document(copy.deepcopy(a)),
-            loaded_rule_document(c, b, d),
-        ),
-    ]
-    outputs = {rules_to_json(synthesize_rules(documents)) for documents in variants}
-    assert len(outputs) == 1
-
-
-def test_canonical_dedup_ignores_precanonical_variable_indices():
-    value = minimal_rule_value()["rules"][0]
-    first = copy.deepcopy(value)
-    second = copy.deepcopy(value)
-    for candidate, index in ((first, 4), (second, 9)):
-        candidate["pointer_anchors"][0]["id"]["index"] = index
-        candidate["source_pattern"]["operand"]["value"]["index"] = index
-        candidate["target_pattern"]["value"]["index"] = index
-    assert canonicalize_rule(first) == canonicalize_rule(second)
-
-
-def test_command_arguments_and_exact_success_file(tmp_path, capsys):
-    value = rule_observation(
-        rule_unary("deref", rule_binding(0)),
-        rule_binding(0),
-        anchors=[rule_anchor(0, RULE_REF_I32)],
-    )
-    source = tmp_path / "a.json"
-    source.write_text(
-        json.dumps(rule_document(value, copy.deepcopy(value))), encoding="utf-8"
-    )
-    output = tmp_path / "rules.json"
-    assert extract_rules_main(["--output", str(output), str(source)]) == 0
-    captured = capsys.readouterr()
-    assert captured.out == captured.err == ""
-    expected = rules_to_json(
-        synthesize_rules((load_observations(source.read_text(encoding="utf-8")),))
-    )
-    assert output.read_text(encoding="utf-8") == expected
-    assert set(tmp_path.iterdir()) == {source, output}
-
-
-@pytest.mark.parametrize("content", ["{}\n", "not json\n", "\xff"])
-def test_command_rejects_input_shape_and_path_aliases_before_write(
-    tmp_path, capsys, content
-):
-    source = tmp_path / "a.json"
-    if content == "\xff":
-        source.write_bytes(b"\xff")
-    else:
-        source.write_text(content, encoding="utf-8")
-    output = tmp_path / "rules.json"
-    assert extract_rules_main(["--output", str(output), str(source)]) == 1
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err.startswith("extract_rules: ") and captured.err.count("\n") == 1
-    assert not output.exists()
-
-
-def test_command_path_rejections(tmp_path, capsys):
-    value = rule_document()
-    source = tmp_path / "a.json"
-    source.write_text(json.dumps(value), encoding="utf-8")
-    for arguments in (
-        ["--output", str(tmp_path / "out.json")],
-        ["--output", str(tmp_path / "out.json"), str(tmp_path / "missing.json")],
-        ["--output", str(tmp_path / "out.json"), str(tmp_path)],
-        ["--output", str(tmp_path / "out.json"), str(source), str(source)],
-        ["--output", str(source), str(source)],
-    ):
-        assert extract_rules_main(arguments) == 1
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert captured.err.startswith("extract_rules: ")
-
-
-def test_publication_is_atomic_and_preserves_old_output_on_failure(
-    tmp_path, monkeypatch, capsys
-):
-    source = tmp_path / "a.json"
-    source.write_text(json.dumps(rule_document()), encoding="utf-8")
-    output = tmp_path / "rules.json"
-    output.write_bytes(b"old\n")
-
-    def fail_replace(source_path, destination_path):
-        raise OSError("replace failed")
-
-    monkeypatch.setattr(extract_rules_module.os, "replace", fail_replace)
-    assert extract_rules_main(["--output", str(output), str(source)]) == 1
-    assert output.read_bytes() == b"old\n"
-    assert not list(tmp_path.glob(".rules.json.*.tmp"))
-    assert capsys.readouterr().err.startswith("extract_rules: replace failed")
-
-
-@pytest.mark.parametrize("failure_point", ["create", "write", "flush", "close"])
-def test_publication_preserves_old_output_for_each_io_failure(
-    tmp_path, monkeypatch, failure_point
-):
-    output = tmp_path / "rules.json"
-    output.write_bytes(b"old\n")
-    if failure_point == "create":
-        monkeypatch.setattr(
-            extract_rules_module.tempfile,
-            "mkstemp",
-            lambda **kwargs: (_ for _ in ()).throw(OSError("create failed")),
-        )
-    else:
-        real_fdopen = extract_rules_module.os.fdopen
-
-        class FailingStream:
-            def __init__(self, stream):
-                self.stream = stream
-
-            def __enter__(self):
-                return self
-
-            def write(self, text):
-                if failure_point == "write":
-                    raise OSError("write failed")
-                return self.stream.write(text)
-
-            def flush(self):
-                if failure_point == "flush":
-                    raise OSError("flush failed")
-                return self.stream.flush()
-
-            def __exit__(self, exc_type, exc, traceback):
-                self.stream.close()
-                if failure_point == "close":
-                    raise OSError("close failed")
-                return False
-
-        monkeypatch.setattr(
-            extract_rules_module.os,
-            "fdopen",
-            lambda descriptor, *args, **kwargs: FailingStream(
-                real_fdopen(descriptor, *args, **kwargs)
-            ),
-        )
-    with pytest.raises(OSError, match=failure_point):
-        extract_rules_module._publish_output(output, "new\n")
-    assert output.read_bytes() == b"old\n"
-    assert not list(tmp_path.glob(".rules.json.*.tmp"))
-
-
-def test_descriptor_close_and_unlink_failures_are_reported(tmp_path, monkeypatch):
-    output = tmp_path / "rules.json"
-    output.write_bytes(b"old\n")
-    real_close = extract_rules_module.os.close
-    descriptors = []
-
-    def fail_fdopen(descriptor, *args, **kwargs):
-        descriptors.append(descriptor)
-        raise OSError("fdopen failed")
-
-    monkeypatch.setattr(extract_rules_module.os, "fdopen", fail_fdopen)
-    monkeypatch.setattr(
-        extract_rules_module.os,
-        "close",
-        lambda descriptor: (_ for _ in ()).throw(OSError("raw close failed")),
-    )
-    real_unlink = Path.unlink
-    monkeypatch.setattr(
-        Path,
-        "unlink",
-        lambda self, **kwargs: (_ for _ in ()).throw(OSError("unlink failed")),
-    )
-    with pytest.raises(OSError) as raised:
-        extract_rules_module._publish_output(output, "new\n")
-    message = str(raised.value)
-    assert "fdopen failed" in message
-    assert "raw close failed" in message
-    assert "unlink failed" in message
-    assert output.read_bytes() == b"old\n"
-    monkeypatch.undo()
-    for descriptor in descriptors:
-        real_close(descriptor)
-    for temporary in tmp_path.glob(".rules.json.*.tmp"):
-        real_unlink(temporary)
-
-
-def test_publication_replaces_symlink_and_rejects_nonregular_nodes(tmp_path):
-    target = tmp_path / "target.json"
-    target.write_bytes(b"target\n")
-    output = tmp_path / "rules.json"
-    output.symlink_to(target)
-    extract_rules_module._publish_output(output, "new\n")
-    assert not output.is_symlink()
-    assert output.read_text(encoding="utf-8") == "new\n"
-    assert target.read_bytes() == b"target\n"
-    directory = tmp_path / "directory"
-    directory.mkdir()
-    with pytest.raises(OSError, match="regular file or symlink"):
-        extract_rules_module._publish_output(directory, "new\n")
-    fifo = tmp_path / "fifo"
-    os.mkfifo(fifo)
-    with pytest.raises(OSError, match="regular file or symlink"):
-        extract_rules_module._publish_output(fifo, "new\n")
-
-
-def test_command_error_is_one_physical_line_for_line_separator_path(
-    tmp_path, capsys, monkeypatch
-):
-    source = tmp_path / "observations\nnext.json"
-    source.write_text(json.dumps(rule_document()), encoding="utf-8")
-    monkeypatch.setattr(
-        extract_rules_module,
-        "load_observations",
-        lambda text: (_ for _ in ()).throw(ValueError("first\r\nsecond\u2028third")),
-    )
-    assert (
-        extract_rules_main(["--output", str(tmp_path / "rules.json"), str(source)]) == 1
-    )
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err.splitlines() == ["extract_rules: first second third"]
-
-
-def test_pair_nonresults_do_not_mask_fatal_command_errors(tmp_path, capsys):
-    left = rule_observation(
-        rule_method(rule_binding(0), "core", ("ptr", "const_ptr", "read")),
-        rule_integer(0, "i32"),
-    )
-    right = rule_observation(
-        rule_method(rule_binding(0), "core", ("ptr", "const_ptr", "read")),
-        rule_integer(1, "i32"),
-    )
-    source = tmp_path / "a.json"
-    source.write_text(json.dumps(rule_document(left, right)), encoding="utf-8")
-    output = tmp_path / "rules.json"
-    assert extract_rules_main(["--output", str(output), str(source)]) == 0
-    assert output.read_text(encoding="utf-8") == rules_to_json(RuleDocument(rules=()))
-    assert capsys.readouterr().err == ""
-
-
-def test_synthesis_never_mutates_nested_inputs():
-    left = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(1, "usize")),
-    )
-    right = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(2, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(2, "usize")),
-    )
-    loaded = loaded_rule_document(left, right)
-    before = copy.deepcopy(loaded.observations)
-    first = synthesize_rules((loaded,))
-    assert loaded.observations == before
-    second = synthesize_rules((loaded,))
-    assert loaded.observations == before
-    assert rules_to_json(first) == rules_to_json(second)
-
-
-def test_recursive_json_member_order_is_semantically_irrelevant():
-    def reverse_members(value):
-        if isinstance(value, dict):
-            return {key: reverse_members(value[key]) for key in reversed(tuple(value))}
-        if isinstance(value, list):
-            return [reverse_members(child) for child in value]
-        return value
-
-    left = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(1, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(1, "usize")),
-    )
-    right = rule_observation(
-        rule_offset(rule_binding(0), rule_integer(2, "isize")),
-        rule_mutable_slice_from(rule_binding(0), rule_integer(2, "usize")),
-    )
-    original = rule_document(left, right, copy.deepcopy(left))
-    normal = load_observations(json.dumps(original))
-    reversed_document = load_observations(json.dumps(reverse_members(original)))
-    assert rules_to_json(synthesize_rules((normal,))) == rules_to_json(
-        synthesize_rules((reversed_document,))
-    )
-
-
-def test_help_is_successful_and_side_effect_free(tmp_path, capsys, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    assert extract_rules_main(["--help"]) == 0
-    captured = capsys.readouterr()
-    assert captured.err == ""
-    assert captured.out.startswith("usage: extract_rules.py")
-    assert "--output" in captured.out
-    assert captured.out.endswith("\n")
-    assert list(tmp_path.iterdir()) == []
-
-
 @pytest.mark.parametrize(
     "failure",
     [StageFailure("extract failed"), "{ malformed"],
@@ -6262,13 +4677,9 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
         fn_record(0, "leaf", "leaf", []),
         fn_record(1, "root", "root", [0]),
     ]
-    base = _valid_observation_document()["observations"][0]
-    leaf = copy.deepcopy(base)
-    root0 = copy.deepcopy(base)
-    root1 = copy.deepcopy(base)
-    leaf["source_type"] = {"kind": "primitive", "name": "u8"}
-    root0["source_type"] = {"kind": "primitive", "name": "u16"}
-    root1["source_type"] = {"kind": "primitive", "name": "u32"}
+    leaf = {"opaque": "leaf"}
+    root0 = {"opaque": "root-0"}
+    root1 = {"opaque": "root-1"}
     tools = FakeTools(
         skeletons=records,
         builds=[CommandResult(0), CommandResult(0), CommandResult(0)],
@@ -6510,7 +4921,7 @@ def test_markdown_uses_complete_before_and_canonical_after_snippets():
 
 
 def test_nonempty_artifact_is_pretty_deterministic_and_data_only(tmp_path):
-    observation = _valid_observation_document()["observations"][0]
+    observation = {"opaque": ["unchanged", 7, True]}
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
         builds=[CommandResult(0), CommandResult(0)],
@@ -6529,6 +4940,32 @@ def test_nonempty_artifact_is_pretty_deterministic_and_data_only(tmp_path):
     assert not (value.outputs.rust_project / "observations.json").exists()
     assert "observations.json" not in output.logs
     assert "proctor" not in path.read_text().lower()
+
+
+def test_merged_observation_output_is_published_as_opaque_bytes(tmp_path):
+    merged = "opaque merge output\nwith no Python-readable JSON\n"
+    tools = FakeTools(
+        builds=[CommandResult(0)],
+        merged_observations=merged,
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([]))
+    assert output.status == "success"
+    assert (value.outputs.artifacts_dir / "observations.json").read_text() == merged
+    merge = next(event for event in tools.events if event[0] == "merge_observations")
+    assert merge[1] == ()
+
+
+def test_merge_failure_prevents_all_final_publication(tmp_path):
+    tools = FakeTools(
+        builds=[CommandResult(0)],
+        merged_observations=StageFailure("merge rejected opaque inputs"),
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([]))
+    assert output.status == "failure"
+    assert "merge rejected opaque inputs" in output.error
+    assert not value.outputs.rust_project.exists()
+    assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+    assert not (value.outputs.artifacts_dir / "observations.json").exists()
 
 
 def test_empty_document_is_always_published_beside_statement_pairs(tmp_path):

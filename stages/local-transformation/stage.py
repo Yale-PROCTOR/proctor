@@ -7,7 +7,7 @@ import re
 import shutil
 import tempfile
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
@@ -18,15 +18,15 @@ from model import (
     CallableCorrespondence,
     ItemRecord,
     PointerVariableMetadata,
+    ReplacementMetadata,
     StatementPairMetadata,
+    SkeletonView,
     SkeletonError,
     ObservationError,
-    ObservationDocument,
     dependency_context,
     function_graph,
     leaf_schedule,
     load_skeletons,
-    load_observations,
     load_replacement_metadata,
     render_transformation_targets,
 )
@@ -99,7 +99,7 @@ class RunState:
         default_factory=dict
     )
     accepted_correspondence: list[CallableCorrespondence] = field(default_factory=list)
-    observations: list[dict[str, Any]] = field(default_factory=list)
+    accepted_observation_documents: list[Path] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -166,13 +166,18 @@ def _library_relative_path(project: Path) -> Path:
     return relative
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
 def _validate_boundaries(
     stage_input: StageInput, stage_dir: Path
-) -> tuple[Path, Path, Path, Path, Path, Path, dict[str, Any]]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path | None, dict[str, Any]]:
     config = _effective_config(stage_input.config, stage_dir)
     source = stage_input.inputs.rust_project
     destination = stage_input.outputs.rust_project
     workdir = stage_input.framework.workdir
+    rule_set = stage_input.inputs.rule_set
     if source is None:
         raise StageFailure("inputs.rust_project is required")
     if destination is None:
@@ -255,6 +260,29 @@ def _validate_boundaries(
             or current_resolved in path.parents
         ):
             raise StageFailure(f"{name} overlaps working Rust project: {path}")
+    if rule_set is not None:
+        if rule_set.is_symlink() or not rule_set.is_file():
+            raise StageFailure("inputs.rule_set must be a regular nonsymlink file")
+        rule_resolved = rule_set.resolve()
+        boundaries = {
+            "input Rust project": source_resolved,
+            "work directory": workdir.resolve(),
+            "output Rust project": destination_resolved,
+            "statement report": report_resolved,
+            "observations artifact": observations_resolved,
+            "configured Crat checkout": Path(config["crat_dir"]).resolve(),
+        }
+        if stage_input.outputs.artifacts_dir is not None:
+            boundaries["artifacts directory"] = (
+                stage_input.outputs.artifacts_dir.resolve()
+            )
+        if stage_input.framework.usage_log is not None:
+            boundaries["framework usage log"] = (
+                stage_input.framework.usage_log.resolve()
+            )
+        for name, boundary in boundaries.items():
+            if _paths_overlap(rule_resolved, boundary):
+                raise StageFailure(f"inputs.rule_set overlaps {name}")
     library_relative = _library_relative_path(source)
     return (
         source,
@@ -263,6 +291,7 @@ def _validate_boundaries(
         library_relative,
         report_path,
         observations_path,
+        rule_set,
         config,
     )
 
@@ -478,6 +507,7 @@ def _load_replacement_statement_pairs(
     path: Path,
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
+    views_by_id: dict[int, SkeletonView],
 ) -> tuple[ReplacementStatementPair, ...]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -504,7 +534,7 @@ def _load_replacement_statement_pairs(
     expected: dict[tuple[int, int], str] = {
         (item_id, label): records_by_id[item_id].path
         for item_id in members
-        for label in records_by_id[item_id].statements_requiring_transformation
+        for label in views_by_id[item_id].transform_labels
     }
     result: list[ReplacementStatementPair] = []
     previous: tuple[int, int] | None = None
@@ -591,8 +621,9 @@ def _load_and_validate_replacement_metadata(
     observation_source: Path,
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
+    views_by_id: dict[int, SkeletonView],
     accepted: tuple[CallableCorrespondence, ...],
-):
+) -> ReplacementMetadata:
     try:
         metadata = load_replacement_metadata(path.read_text(encoding="utf-8"))
     except ObservationError as exc:
@@ -643,7 +674,7 @@ def _load_and_validate_replacement_metadata(
             raise StageFailure(
                 "replacement metadata records do not preserve request order"
             )
-        expected_labels = expected.statements_requiring_transformation
+        expected_labels = views_by_id[new.item_id].transform_labels
         if current.transform_labels != expected_labels:
             raise StageFailure(
                 f"replacement metadata current_items[{index}].transform_labels "
@@ -702,6 +733,7 @@ def _load_and_validate_replacement_metadata(
 def _accept_statement_pairs(
     pairs: tuple[ReplacementStatementPair, ...],
     records_by_id: dict[int, ItemRecord],
+    views_by_id: dict[int, SkeletonView],
     accumulator: dict[tuple[int, int], AcceptedStatementPair],
 ) -> None:
     for pair in pairs:
@@ -710,11 +742,10 @@ def _accept_statement_pairs(
             raise StageFailure(
                 f"duplicate accepted statement-pair key {pair.item_id}:{pair.label}"
             )
-        record = records_by_id[pair.item_id]
         metadata = next(
             (
                 statement
-                for statement in record.statement_pair_metadata
+                for statement in views_by_id[pair.item_id].statement_pair_metadata
                 if statement.label == pair.label
             ),
             None,
@@ -863,7 +894,7 @@ def _publish_final_outputs(
     report_path: Path,
     report: str,
     observations_path: Path | None = None,
-    observations: str = '{\n  "schema_version": 1,\n  "observations": []\n}\n',
+    observations: str | Path = '{\n  "schema_version": 1,\n  "observations": []\n}\n',
 ) -> None:
     observations_path = observations_path or report_path.with_name("observations.json")
     report_temporary: Path | None = None
@@ -893,8 +924,12 @@ def _publish_final_outputs(
             suffix=".tmp",
         )
         observations_temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
-            output.write(observations)
+        if isinstance(observations, Path):
+            os.close(descriptor)
+            shutil.copyfile(observations, observations_temporary)
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+                output.write(observations)
         _copy_final(current, destination, mark_destination_created)
         os.replace(report_temporary, report_path)
         report_temporary = None
@@ -931,7 +966,7 @@ def _publish_final_outputs(
 
 
 @contextmanager
-def _replacement_attempt_outputs(paths: tuple[Path, ...]):
+def _replacement_attempt_outputs(paths: tuple[Path, ...]) -> Iterator[None]:
     primary: BaseException | None = None
     try:
         yield
@@ -988,131 +1023,86 @@ def _process_scc(
         )
         raise StageFailure(f"duplicate function names inside SCC: {detail}")
 
-    if not any(
-        records_by_id[item_id].needs_transformation is True for item_id in members
-    ):
-        transformation = "\n\n".join(
-            records_by_id[item_id].annotated_skeleton or ""
-            for item_id in sorted(members)
-        )
-        replacement_request_path = workdir / "replacement-request.json"
-        candidate = workdir / "candidate.rs"
-        statement_pairs_path = workdir / "replacement-statement-pairs.json"
-        observation_source_path = workdir / "replacement-observation.rs"
-        observation_metadata_path = workdir / "replacement-observation-metadata.json"
-        write_json(
-            replacement_request_path,
-            replacement_request(
-                members,
-                records_by_id,
-                transformation,
-                tuple(state.accepted_correspondence),
-            ),
-        )
-        with _replacement_attempt_outputs(
-            (
-                candidate,
-                statement_pairs_path,
-                observation_source_path,
-                observation_metadata_path,
-            )
-        ):
-            tools.replace(
-                current,
-                replacement_request_path,
-                candidate,
-                statement_pairs_path,
-                observation_source_path,
-                observation_metadata_path,
-            )
-            statement_pairs = _load_replacement_statement_pairs(
-                statement_pairs_path,
-                members,
-                records_by_id,
-            )
-            metadata = _load_and_validate_replacement_metadata(
-                observation_metadata_path,
-                candidate,
-                statement_pairs_path,
-                observation_source_path,
-                members,
-                records_by_id,
-                tuple(state.accepted_correspondence),
-            )
-            state.metrics.cargo_builds += 1
-            build = install_candidate_transaction(
-                library_source,
-                candidate,
-                workdir / "rollback",
-                lambda: tools.cargo_build(current),
-            )
-            if build.returncode != 0:
-                state.metrics.compilation_failures += 1
-                raise StageFailure(
-                    "mechanical SCC candidate cargo build failed "
-                    f"({build.returncode})\nstdout:\n{build.stdout}"
-                    f"\nstderr:\n{build.stderr}"
-                )
-            _accept_statement_pairs(
-                statement_pairs,
-                records_by_id,
-                state.statement_pairs,
-            )
-            state.accepted_correspondence.extend(metadata.new_correspondence)
-        return
-
-    context, _ = dependency_context(members, records_by_id, limit=CONTEXT_LIMIT)
-    targets = render_transformation_targets(members, records_by_id)
+    context: str | None = None
+    applied_views = {
+        item_id: cast(SkeletonView, records_by_id[item_id].applied)
+        for item_id in members
+    }
+    baseline_views = {
+        item_id: cast(SkeletonView, records_by_id[item_id].baseline)
+        for item_id in members
+    }
+    active_views = applied_views
     latest_failed: str | None = None
     latest_diagnostics: str | None = None
+    generation = 0
+    mechanical = not any(view.needs_transformation for view in active_views.values())
 
-    for generation in range(MAX_REPAIRS + 1):
-        if generation:
-            state.metrics.repair_calls += 1
-        rendered = render_prompt(
-            PromptRenderInput(
-                dependency_context=context,
-                transformation_targets=targets,
-                failed_transformation=latest_failed,
-                diagnostics=latest_diagnostics,
+    while generation <= MAX_REPAIRS:
+        targets = render_transformation_targets(members, records_by_id, active_views)
+        if mechanical:
+            transformation = "\n\n".join(
+                active_views[item_id].skeleton for item_id in sorted(members)
             )
-        )
-        request = llm_request(rendered, run_id=stage_input.run_id, members=members)
-        exchange_dir: Path | None = None
-        if exchange_root is not None:
-            scc = "_".join(str(item_id) for item_id in sorted(members))
-            exchange_dir = exchange_root / f"scc-{scc}" / f"generation-{generation:02d}"
-            exchange_dir.mkdir(parents=True, exist_ok=True)
-            (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
-        state.prompt_used = True
-        state.metrics.llm_generation_calls += 1
-        before = len(read_usage(usage_path))
-        response = client.complete(request)
-        _record_untracked_response(tracker, usage_path, before, request, response)
-        if exchange_dir is not None:
-            (exchange_dir / "response.md").write_text(response.text, encoding="utf-8")
-        extraction = extract_code_block(response.text)
-        if extraction.candidate is None:
-            state.metrics.structural_failures += 1
-            latest_failed = extraction.failed_text
-            latest_diagnostics = extraction.diagnostics
-            continue
-        transformation = extraction.candidate
-        validation_request_path = workdir / "validation-request.json"
-        validation_response_path = workdir / "validation-response.json"
-        write_json(
-            validation_request_path,
-            validation_request(members, records_by_id, transformation),
-        )
-        raw_response, parsed_response = tools.validate(
-            validation_request_path, validation_response_path
-        )
-        validation_status = _validate_validator_response(parsed_response)
-        if validation_status == "invalid":
-            state.metrics.structural_failures += 1
-            latest_failed = transformation
-            latest_diagnostics = raw_response
-            continue
+        else:
+            if context is None:
+                context, _ = dependency_context(
+                    members, records_by_id, limit=CONTEXT_LIMIT
+                )
+            if generation:
+                state.metrics.repair_calls += 1
+            rendered = render_prompt(
+                PromptRenderInput(
+                    dependency_context=context,
+                    transformation_targets=targets,
+                    failed_transformation=latest_failed,
+                    diagnostics=latest_diagnostics,
+                )
+            )
+            request = llm_request(rendered, run_id=stage_input.run_id, members=members)
+            exchange_dir: Path | None = None
+            if exchange_root is not None:
+                scc = "_".join(str(item_id) for item_id in sorted(members))
+                exchange_dir = (
+                    exchange_root / f"scc-{scc}" / f"generation-{generation:02d}"
+                )
+                exchange_dir.mkdir(parents=True, exist_ok=True)
+                (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
+            state.prompt_used = True
+            state.metrics.llm_generation_calls += 1
+            before = len(read_usage(usage_path))
+            response = client.complete(request)
+            _record_untracked_response(tracker, usage_path, before, request, response)
+            if exchange_dir is not None:
+                (exchange_dir / "response.md").write_text(
+                    response.text, encoding="utf-8"
+                )
+            extraction = extract_code_block(response.text)
+            if extraction.candidate is None:
+                state.metrics.structural_failures += 1
+                latest_failed = extraction.failed_text
+                latest_diagnostics = extraction.diagnostics
+                generation += 1
+                continue
+            transformation = extraction.candidate
+            validation_request_path = workdir / "validation-request.json"
+            validation_response_path = workdir / "validation-response.json"
+            write_json(
+                validation_request_path,
+                validation_request(
+                    members, records_by_id, active_views, transformation
+                ),
+            )
+            raw_response, parsed_response = tools.validate(
+                validation_request_path, validation_response_path
+            )
+            validation_status = _validate_validator_response(parsed_response)
+            if validation_status == "invalid":
+                state.metrics.structural_failures += 1
+                latest_failed = transformation
+                latest_diagnostics = raw_response
+                generation += 1
+                continue
 
         replacement_request_path = workdir / "replacement-request.json"
         candidate = workdir / "candidate.rs"
@@ -1125,6 +1115,7 @@ def _process_scc(
             replacement_request(
                 members,
                 records_by_id,
+                active_views,
                 transformation,
                 tuple(state.accepted_correspondence),
             ),
@@ -1147,9 +1138,7 @@ def _process_scc(
                 observation_metadata_path,
             )
             statement_pairs = _load_replacement_statement_pairs(
-                statement_pairs_path,
-                members,
-                records_by_id,
+                statement_pairs_path, members, records_by_id, active_views
             )
             metadata = _load_and_validate_replacement_metadata(
                 observation_metadata_path,
@@ -1158,6 +1147,7 @@ def _process_scc(
                 observation_source_path,
                 members,
                 records_by_id,
+                active_views,
                 tuple(state.accepted_correspondence),
             )
             state.metrics.cargo_builds += 1
@@ -1168,34 +1158,58 @@ def _process_scc(
                 lambda: tools.cargo_build(current),
             )
             if build.returncode == 0:
-                extracted = ObservationDocument(observations=())
-                if any(item.transform_labels for item in metadata.current_items):
+                accepted_documents = list(state.accepted_observation_documents)
+                if any(view.transform_labels for view in active_views.values()):
                     tools.extract_observations(
                         observation_source_path,
                         observation_metadata_path,
                         extracted_observations_path,
                     )
-                    try:
-                        extracted = load_observations(
-                            extracted_observations_path.read_text(encoding="utf-8")
-                        )
-                    except ObservationError as exc:
+                    accepted_dir = workdir / "accepted-observations"
+                    accepted_dir.mkdir(parents=True, exist_ok=True)
+                    retained = accepted_dir / f"{len(accepted_documents):06d}.json"
+                    if retained.exists() or retained.is_symlink():
                         raise StageFailure(
-                            f"invalid extracted observation document: {exc}"
-                        ) from exc
+                            "accepted observation destination unexpectedly exists"
+                        )
+                    os.replace(extracted_observations_path, retained)
+                    accepted_documents.append(retained)
+                accepted_pairs = dict(state.statement_pairs)
                 _accept_statement_pairs(
                     statement_pairs,
                     records_by_id,
-                    state.statement_pairs,
+                    active_views,
+                    accepted_pairs,
                 )
-                state.observations.extend(extracted.observations)
+                state.statement_pairs = accepted_pairs
+                state.accepted_observation_documents = accepted_documents
                 state.accepted_correspondence.extend(metadata.new_correspondence)
                 return
+
         state.metrics.compilation_failures += 1
-        latest_failed = transformation
-        latest_diagnostics = (
+        diagnostics = (
             f"cargo build stdout:\n{build.stdout}\ncargo build stderr:\n{build.stderr}"
         )
+        rule_involved = any(
+            view.contains_rule_application for view in active_views.values()
+        )
+        if rule_involved:
+            active_views = baseline_views
+            latest_failed = transformation
+            latest_diagnostics = diagnostics
+            mechanical = False
+            generation += 1
+            continue
+        if mechanical:
+            raise StageFailure(
+                "mechanical SCC candidate cargo build failed "
+                f"({build.returncode})\nstdout:\n{build.stdout}"
+                f"\nstderr:\n{build.stderr}"
+            )
+        latest_failed = transformation
+        latest_diagnostics = diagnostics
+        generation += 1
+
     raise StageFailure(
         f"SCC {','.join(map(str, members))} exhausted {MAX_REPAIRS} repair calls"
     )
@@ -1219,6 +1233,7 @@ def run_stage(
             library_relative,
             report_path,
             observations_path,
+            rule_set,
             config,
         ) = _validate_boundaries(stage_input, stage_dir)
         _clear_stale_report(report_path)
@@ -1254,7 +1269,7 @@ def run_stage(
             )
 
         skeleton_path = workdir / "skeletons.json"
-        active_tools.make_skeleton(current, skeleton_path)
+        active_tools.make_skeleton(current, skeleton_path, rule_set)
         records = load_skeletons(skeleton_path.read_text(encoding="utf-8"))
         records_by_id = {record.id: record for record in records}
 
@@ -1312,11 +1327,9 @@ def run_stage(
                     state=state,
                 )
         report = _render_statement_pairs(state.statement_pairs)
-        observations = (
-            json.dumps(
-                {"schema_version": 1, "observations": state.observations}, indent=2
-            )
-            + "\n"
+        merged_observations = workdir / "merged-observations.json"
+        active_tools.merge_observations(
+            tuple(state.accepted_observation_documents), merged_observations
         )
         _publish_final_outputs(
             current,
@@ -1324,7 +1337,7 @@ def run_stage(
             report_path,
             report,
             observations_path,
-            observations,
+            merged_observations,
         )
         return _output("success", state, destination=destination)
     except (

@@ -13,6 +13,7 @@ from typing import Any
 from protocol import (
     extract_observations_command,
     make_skeleton_command,
+    merge_observations_command,
     normalize_safety_command,
     replace_command,
     validate_command,
@@ -103,16 +104,37 @@ class CratTools:
         *,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        redactions: tuple[tuple[str, str], ...] = (),
     ) -> CommandResult:
-        result = self.run_command(command, cwd=cwd, env=env)
+        rendered_command = " ".join(command)
+        for sensitive, replacement in redactions:
+            rendered_command = rendered_command.replace(sensitive, replacement)
+        try:
+            result = self.run_command(command, cwd=cwd, env=env)
+        except Exception as exc:
+            safe_error = str(exc)
+            for sensitive, replacement in redactions:
+                safe_error = safe_error.replace(sensitive, replacement)
+            with self.log_path.open("a", encoding="utf-8") as log:
+                log.write(f"$ {rendered_command}\n")
+                log.write(f"{type(exc).__name__}: {safe_error}\n")
+            raise StageFailure(
+                f"{operation} failed while invoking command: "
+                f"{type(exc).__name__}: {safe_error}"
+            ) from exc
+        safe_stdout = result.stdout
+        safe_stderr = result.stderr
+        for sensitive, replacement in redactions:
+            safe_stdout = safe_stdout.replace(sensitive, replacement)
+            safe_stderr = safe_stderr.replace(sensitive, replacement)
         with self.log_path.open("a", encoding="utf-8") as log:
-            log.write(f"$ {' '.join(command)}\n")
-            log.write(result.stdout)
-            log.write(result.stderr)
+            log.write(f"$ {rendered_command}\n")
+            log.write(safe_stdout)
+            log.write(safe_stderr)
         if result.returncode != 0:
             raise StageFailure(
                 f"{operation} failed with exit code {result.returncode}\n"
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+                f"stdout:\n{safe_stdout}\nstderr:\n{safe_stderr}"
             )
         return result
 
@@ -190,16 +212,29 @@ class CratTools:
         operation: str,
         command: list[str],
         output: Path,
+        *,
+        redactions: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self._clear_output(output)
-        self._run(operation, command, env=self.environment)
+        self._run(operation, command, env=self.environment, redactions=redactions)
         self._require_regular_output(operation, output)
 
-    def make_skeleton(self, current_project: Path, output: Path) -> None:
+    def make_skeleton(
+        self, current_project: Path, output: Path, rule_set: Path | None = None
+    ) -> None:
         assert self.crat_tool is not None
         self._output_operation(
             "crat-tool make-skeleton",
-            make_skeleton_command(self.crat_tool, current_project, output),
+            make_skeleton_command(self.crat_tool, current_project, output, rule_set),
+            output,
+            redactions=((str(rule_set), "<rule-set>"),) if rule_set is not None else (),
+        )
+
+    def merge_observations(self, inputs: tuple[Path, ...], output: Path) -> None:
+        assert self.crat_tool is not None
+        self._output_operation(
+            "crat-tool merge-observations",
+            merge_observations_command(self.crat_tool, output, inputs),
             output,
         )
 

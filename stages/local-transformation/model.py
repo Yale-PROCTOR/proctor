@@ -25,10 +25,6 @@ class ObservationError(ValueError):
     pass
 
 
-class RuleError(ValueError):
-    pass
-
-
 @dataclass(frozen=True)
 class CallableCorrespondence:
     item_id: int
@@ -57,20 +53,7 @@ class ReplacementMetadata:
     current_items: tuple[CurrentObservationItem, ...]
 
 
-@dataclass(frozen=True)
-class ObservationDocument:
-    observations: tuple[dict[str, Any], ...]
-
-
-@dataclass(frozen=True)
-class RuleDocument:
-    rules: tuple[dict[str, Any], ...]
-
-
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
-_ANON_ID = re.compile(
-    r"<(id|fn|struct|enum|union|field|variant|const|static|method)([0-9]+)>\Z"
-)
 
 
 def _exact_object(value: Any, keys: set[str], where: str) -> dict[str, Any]:
@@ -235,1051 +218,6 @@ def load_replacement_metadata(text: str) -> ReplacementMetadata:
     )
 
 
-_PRIMITIVES = {
-    "bool",
-    "char",
-    "str",
-    "never",
-    "i8",
-    "i16",
-    "i32",
-    "i64",
-    "i128",
-    "isize",
-    "u8",
-    "u16",
-    "u32",
-    "u64",
-    "u128",
-    "usize",
-    "f16",
-    "f32",
-    "f64",
-    "f128",
-}
-_BINARY = {
-    "add",
-    "subtract",
-    "multiply",
-    "divide",
-    "remainder",
-    "and",
-    "or",
-    "bit_xor",
-    "bit_and",
-    "bit_or",
-    "shift_left",
-    "shift_right",
-    "equal",
-    "not_equal",
-    "less",
-    "less_equal",
-    "greater",
-    "greater_equal",
-}
-
-
-def _enum(value: Any, allowed: set[str], where: str) -> str:
-    if not isinstance(value, str) or value not in allowed:
-        raise ObservationError(f"{where} has unknown value {value!r}")
-    return value
-
-
-def _anon(value: Any, prefixes: set[str], where: str) -> str:
-    if not isinstance(value, str):
-        raise ObservationError(f"{where} must be an anonymized ID")
-    match = _ANON_ID.fullmatch(value)
-    if match is None or match.group(1) not in prefixes:
-        raise ObservationError(f"{where} must be a {sorted(prefixes)} anonymized ID")
-    return value
-
-
-def _external_identity(value: Any, where: str) -> None:
-    value = _exact_object(value, {"kind", "crate", "path"}, where)
-    if value["kind"] != "external":
-        raise ObservationError(f"{where}.kind must be 'external'")
-    if not isinstance(value["crate"], str) or not value["crate"]:
-        raise ObservationError(f"{where}.crate must be a nonempty string")
-    if (
-        not isinstance(value["path"], list)
-        or not value["path"]
-        or any(not isinstance(part, str) or not part for part in value["path"])
-    ):
-        raise ObservationError(f"{where}.path must be a nonempty string array")
-
-
-def _adt_identity(
-    value: Any, where: str, expected_local_kind: str | None = None
-) -> None:
-    if not isinstance(value, dict):
-        raise ObservationError(f"{where} must be an object")
-    if value.get("kind") == "external":
-        _external_identity(value, where)
-    elif value.get("kind") == "local":
-        _exact_object(value, {"kind", "id"}, where)
-        allowed = (
-            {expected_local_kind}
-            if expected_local_kind is not None
-            else {"struct", "enum", "union"}
-        )
-        _anon(value["id"], allowed, f"{where}.id")
-    else:
-        raise ObservationError(f"{where}.kind is unknown")
-
-
-def _member_identity(value: Any, prefix: str, where: str) -> None:
-    if not isinstance(value, dict):
-        raise ObservationError(f"{where} must be an object")
-    if value.get("kind") == "external":
-        _external_identity(value, where)
-    elif value.get("kind") == "local":
-        _exact_object(value, {"kind", "owner", "id"}, where)
-        _adt_identity(value["owner"], f"{where}.owner")
-        _anon(value["id"], {prefix}, f"{where}.id")
-    else:
-        raise ObservationError(f"{where}.kind is unknown")
-
-
-def _type_tree(value: Any, where: str) -> None:
-    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
-        raise ObservationError(f"{where} must be a tagged object")
-    kind = value["kind"]
-    if kind == "primitive":
-        _exact_object(value, {"kind", "name"}, where)
-        _enum(value["name"], _PRIMITIVES, f"{where}.name")
-    elif kind == "slice":
-        _exact_object(value, {"kind", "element"}, where)
-        _type_tree(value["element"], f"{where}.element")
-    elif kind == "array":
-        _exact_object(value, {"kind", "element", "length"}, where)
-        _type_tree(value["element"], f"{where}.element")
-        _wire_integer(value["length"], f"{where}.length")
-    elif kind in {"raw_pointer", "reference"}:
-        _exact_object(value, {"kind", "mutability", "pointee"}, where)
-        _enum(
-            value["mutability"],
-            {"const", "mut"} if kind == "raw_pointer" else {"shared", "mutable"},
-            f"{where}.mutability",
-        )
-        _type_tree(value["pointee"], f"{where}.pointee")
-    elif kind == "tuple":
-        _exact_object(value, {"kind", "elements"}, where)
-        if not isinstance(value["elements"], list):
-            raise ObservationError(f"{where}.elements must be an array")
-        for index, element in enumerate(value["elements"]):
-            _type_tree(element, f"{where}.elements[{index}]")
-    elif kind == "adt":
-        _exact_object(value, {"kind", "adt_kind", "identity", "arguments"}, where)
-        _enum(value["adt_kind"], {"struct", "enum", "union"}, f"{where}.adt_kind")
-        _adt_identity(
-            value["identity"],
-            f"{where}.identity",
-            expected_local_kind=value["adt_kind"],
-        )
-        if not isinstance(value["arguments"], list):
-            raise ObservationError(f"{where}.arguments must be an array")
-        for index, argument in enumerate(value["arguments"]):
-            _type_tree(argument, f"{where}.arguments[{index}]")
-    else:
-        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
-
-
-def _value_identity(value: Any, where: str) -> None:
-    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
-        raise ObservationError(f"{where} must be a tagged object")
-    kind = value["kind"]
-    if kind in {"binding", "function", "constant", "static", "method"}:
-        _exact_object(value, {"kind", "id"}, where)
-        prefixes = {
-            "binding": {"id"},
-            "function": {"fn"},
-            "constant": {"const"},
-            "static": {"static"},
-            "method": {"method"},
-        }[kind]
-        _anon(value["id"], prefixes, f"{where}.id")
-    elif kind == "external":
-        _external_identity(value, where)
-    elif kind in {"foreign_function", "foreign_static"}:
-        _exact_object(value, {"kind", "symbol"}, where)
-        if not isinstance(value["symbol"], str) or not value["symbol"]:
-            raise ObservationError(f"{where}.symbol must be nonempty")
-    elif kind == "constructor":
-        _exact_object(value, {"kind", "adt", "variant"}, where)
-        _adt_identity(value["adt"], f"{where}.adt")
-        if value["variant"] is not None:
-            _member_identity(value["variant"], "variant", f"{where}.variant")
-    else:
-        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
-
-
-def _expression(value: Any, where: str) -> None:
-    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
-        raise ObservationError(f"{where} must be a tagged expression")
-    kind = value["kind"]
-    if kind in {"array", "tuple"}:
-        _exact_object(value, {"kind", "elements"}, where)
-        if not isinstance(value["elements"], list):
-            raise ObservationError(f"{where}.elements must be an array")
-        for index, child in enumerate(value["elements"]):
-            _expression(child, f"{where}.elements[{index}]")
-    elif kind == "call":
-        _exact_object(value, {"kind", "callee", "arguments"}, where)
-        _expression(value["callee"], f"{where}.callee")
-        if not isinstance(value["arguments"], list):
-            raise ObservationError(f"{where}.arguments must be an array")
-        for index, child in enumerate(value["arguments"]):
-            _expression(child, f"{where}.arguments[{index}]")
-    elif kind == "method_call":
-        _exact_object(value, {"kind", "receiver", "method", "arguments"}, where)
-        _expression(value["receiver"], f"{where}.receiver")
-        _value_identity(value["method"], f"{where}.method")
-        if not isinstance(value["arguments"], list):
-            raise ObservationError(f"{where}.arguments must be an array")
-        for index, child in enumerate(value["arguments"]):
-            _expression(child, f"{where}.arguments[{index}]")
-    elif kind in {"binary", "assign_op"}:
-        _exact_object(value, {"kind", "operator", "left", "right"}, where)
-        _enum(value["operator"], _BINARY, f"{where}.operator")
-        _expression(value["left"], f"{where}.left")
-        _expression(value["right"], f"{where}.right")
-    elif kind == "unary":
-        _exact_object(value, {"kind", "operator", "operand"}, where)
-        _enum(value["operator"], {"deref", "not", "negate"}, f"{where}.operator")
-        _expression(value["operand"], f"{where}.operand")
-    elif kind == "path":
-        _exact_object(value, {"kind", "value"}, where)
-        _value_identity(value["value"], f"{where}.value")
-    elif kind == "cast":
-        _exact_object(value, {"kind", "expression", "type"}, where)
-        _expression(value["expression"], f"{where}.expression")
-        _type_tree(value["type"], f"{where}.type")
-    elif kind in {"assign", "index"}:
-        keys = (
-            {"kind", "left", "right"} if kind == "assign" else {"kind", "base", "index"}
-        )
-        _exact_object(value, keys, where)
-        for key in keys - {"kind"}:
-            _expression(value[key], f"{where}.{key}")
-    elif kind == "field":
-        _exact_object(value, {"kind", "base", "field"}, where)
-        _expression(value["base"], f"{where}.base")
-        _member_identity(value["field"], "field", f"{where}.field")
-    elif kind == "range":
-        _exact_object(value, {"kind", "start", "end", "limits"}, where)
-        _enum(value["limits"], {"half_open", "closed"}, f"{where}.limits")
-        for key in ("start", "end"):
-            if value[key] is not None:
-                _expression(value[key], f"{where}.{key}")
-    elif kind == "if":
-        _exact_object(value, {"kind", "condition", "then", "else"}, where)
-        _expression(value["condition"], f"{where}.condition")
-        _block(value["then"], f"{where}.then")
-        if value["else"] is not None:
-            _expression(value["else"], f"{where}.else")
-    elif kind == "while":
-        _exact_object(value, {"kind", "condition", "body"}, where)
-        _expression(value["condition"], f"{where}.condition")
-        _block(value["body"], f"{where}.body")
-    elif kind == "loop":
-        _exact_object(value, {"kind", "body"}, where)
-        _block(value["body"], f"{where}.body")
-    elif kind == "struct":
-        _exact_object(value, {"kind", "adt", "variant", "fields", "rest"}, where)
-        _adt_identity(value["adt"], f"{where}.adt")
-        if value["variant"] is not None:
-            _member_identity(value["variant"], "variant", f"{where}.variant")
-        if not isinstance(value["fields"], list):
-            raise ObservationError(f"{where}.fields must be an array")
-        seen_fields: set[str] = set()
-        for index, field in enumerate(value["fields"]):
-            field_where = f"{where}.fields[{index}]"
-            field = _exact_object(field, {"field", "value"}, field_where)
-            _member_identity(field["field"], "field", f"{field_where}.field")
-            field_key = json.dumps(field["field"], sort_keys=True)
-            if field_key in seen_fields:
-                raise ObservationError(f"{where}.fields contains a duplicate field")
-            seen_fields.add(field_key)
-            _expression(field["value"], f"{field_where}.value")
-        if value["rest"] is not None:
-            _expression(value["rest"], f"{where}.rest")
-    elif kind == "literal":
-        _exact_object(value, {"kind", "value"}, where)
-        _literal(value["value"], f"{where}.value")
-    elif kind == "address_of":
-        _exact_object(value, {"kind", "borrow", "mutability", "expression"}, where)
-        _enum(value["borrow"], {"reference", "raw"}, f"{where}.borrow")
-        _enum(value["mutability"], {"const", "mut"}, f"{where}.mutability")
-        _expression(value["expression"], f"{where}.expression")
-    elif kind in {"return", "break"}:
-        _exact_object(value, {"kind", "value"}, where)
-        if value["value"] is not None:
-            _expression(value["value"], f"{where}.value")
-    elif kind == "continue":
-        _exact_object(value, {"kind"}, where)
-    elif kind == "repeat":
-        _exact_object(value, {"kind", "value", "count"}, where)
-        _expression(value["value"], f"{where}.value")
-        _expression(value["count"], f"{where}.count")
-    elif kind == "block":
-        _exact_object(value, {"kind", "block"}, where)
-        _block(value["block"], f"{where}.block")
-    else:
-        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
-
-
-def _literal(value: Any, where: str) -> None:
-    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
-        raise ObservationError(f"{where} must be a tagged literal")
-    kind = value["kind"]
-    keys = {"kind", "value"}
-    if kind in {"integer", "float"}:
-        keys = {"kind", "value" if kind == "integer" else "bits", "type"}
-    _exact_object(value, keys, where)
-    if kind == "bool" and not isinstance(value["value"], bool):
-        raise ObservationError(f"{where}.value must be a Boolean")
-    elif kind in {"char", "string"} and not isinstance(value["value"], str):
-        raise ObservationError(f"{where}.value must be a string")
-    elif kind == "byte" and (
-        isinstance(value["value"], bool)
-        or not isinstance(value["value"], int)
-        or not 0 <= value["value"] <= 255
-    ):
-        raise ObservationError(f"{where}.value must be a byte")
-    elif kind in {"byte_string", "c_string"} and (
-        not isinstance(value["value"], list)
-        or any(
-            isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 255
-            for item in value["value"]
-        )
-    ):
-        raise ObservationError(f"{where}.value must be a byte array")
-    elif kind == "integer":
-        if not isinstance(value["value"], str) or not value["value"].isdigit():
-            raise ObservationError(f"{where}.value must be an unsigned decimal string")
-        _enum(
-            value["type"],
-            _PRIMITIVES - {"bool", "char", "str", "never", "f16", "f32", "f64", "f128"},
-            f"{where}.type",
-        )
-    elif kind == "float":
-        _enum(value["type"], {"f16", "f32", "f64", "f128"}, f"{where}.type")
-        widths = {"f16": 4, "f32": 8, "f64": 16, "f128": 32}
-        if (
-            not isinstance(value["bits"], str)
-            or re.fullmatch(rf"[0-9a-f]{{{widths[value['type']]}}}", value["bits"])
-            is None
-        ):
-            raise ObservationError(
-                f"{where}.bits must be exactly {widths[value['type']]} lowercase hexadecimal digits"
-            )
-    elif kind not in {
-        "bool",
-        "char",
-        "byte",
-        "string",
-        "byte_string",
-        "c_string",
-        "integer",
-        "float",
-    }:
-        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
-
-
-def _block(value: Any, where: str) -> None:
-    value = _exact_object(value, {"statements"}, where)
-    if not isinstance(value["statements"], list):
-        raise ObservationError(f"{where}.statements must be an array")
-    for index, statement in enumerate(value["statements"]):
-        statement_where = f"{where}.statements[{index}]"
-        if not isinstance(statement, dict):
-            raise ObservationError(f"{statement_where} must be an object")
-        if statement.get("kind") == "expression":
-            _exact_object(
-                statement, {"kind", "expression", "semicolon"}, statement_where
-            )
-            if not isinstance(statement["semicolon"], bool):
-                raise ObservationError(f"{statement_where}.semicolon must be a Boolean")
-            _expression(statement["expression"], f"{statement_where}.expression")
-        elif statement.get("kind") == "let":
-            _exact_object(
-                statement, {"kind", "pattern", "type", "initializer"}, statement_where
-            )
-            _pattern(statement["pattern"], f"{statement_where}.pattern")
-            if statement["type"] is not None:
-                _type_tree(statement["type"], f"{statement_where}.type")
-            if statement["initializer"] is not None:
-                _expression(statement["initializer"], f"{statement_where}.initializer")
-        else:
-            raise ObservationError(f"{statement_where}.kind is unknown")
-
-
-def _pattern(value: Any, where: str) -> None:
-    if not isinstance(value, dict):
-        raise ObservationError(f"{where} must be an object")
-    if value.get("kind") == "wildcard":
-        _exact_object(value, {"kind"}, where)
-    elif value.get("kind") == "binding":
-        _exact_object(value, {"kind", "id", "mutability", "by_ref"}, where)
-        _anon(value["id"], {"id"}, f"{where}.id")
-        _enum(value["mutability"], {"immutable", "mutable"}, f"{where}.mutability")
-        _enum(value["by_ref"], {"no", "shared", "mutable"}, f"{where}.by_ref")
-    else:
-        raise ObservationError(f"{where}.kind is unknown")
-
-
-def _anonymized_ids(value: Any) -> list[tuple[str, int, str]]:
-    result: list[tuple[str, int, str]] = []
-
-    def visit(current: Any) -> None:
-        if isinstance(current, dict):
-            for child in current.values():
-                visit(child)
-        elif isinstance(current, list):
-            for child in current:
-                visit(child)
-        elif isinstance(current, str):
-            match = _ANON_ID.fullmatch(current)
-            if match is not None:
-                result.append((match.group(1), int(match.group(2)), current))
-
-    visit(value)
-    return result
-
-
-def _validate_anonymization(observation: dict[str, Any], where: str) -> None:
-    all_ids = _anonymized_ids(observation)
-    for prefix in {prefix for prefix, _, _ in all_ids}:
-        first_occurrences: list[int] = []
-        for candidate, index, _ in all_ids:
-            if candidate == prefix and index not in first_occurrences:
-                first_occurrences.append(index)
-        if first_occurrences != list(range(len(first_occurrences))):
-            raise ObservationError(
-                f"{where} anonymized {prefix} IDs must follow contiguous first-occurrence order"
-            )
-
-    source_ids = {
-        text for _, _, text in _anonymized_ids(observation["source_expression"])
-    }
-    target_only = sorted(
-        text
-        for prefix, _, text in _anonymized_ids(observation["target_expression"])
-        if prefix in {"id", "fn"} and text not in source_ids
-    )
-    if target_only:
-        raise ObservationError(
-            f"{where}.target_expression contains target-only anonymized ID {target_only[0]}"
-        )
-
-    source_binding_order: list[str] = []
-    for prefix, _, text in _anonymized_ids(observation["source_expression"]):
-        if prefix == "id" and text not in source_binding_order:
-            source_binding_order.append(text)
-    anchor_ids = [anchor["id"] for anchor in observation["pointer_anchors"]]
-    source_positions = {
-        value: index for index, value in enumerate(source_binding_order)
-    }
-    if any(value not in source_positions for value in anchor_ids) or any(
-        source_positions[left] >= source_positions[right]
-        for left, right in pairwise(anchor_ids)
-    ):
-        raise ObservationError(
-            f"{where}.pointer_anchors do not preserve first source occurrence order"
-        )
-
-
-def load_observations(text: str) -> ObservationDocument:
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ObservationError(f"observation JSON decode failure: {exc}") from exc
-    value = _exact_object(
-        value, {"schema_version", "observations"}, "observation document"
-    )
-    if isinstance(value["schema_version"], bool) or value["schema_version"] != 1:
-        raise ObservationError(
-            f"unsupported observation schema_version {value['schema_version']!r}"
-        )
-    if not isinstance(value["observations"], list):
-        raise ObservationError("observation document observations must be an array")
-    for index, observation in enumerate(value["observations"]):
-        where = f"observations[{index}]"
-        observation = _exact_object(
-            observation,
-            {
-                "source_expression",
-                "target_expression",
-                "pointer_anchors",
-                "source_type",
-                "source_adjusted_type",
-                "target_type",
-                "target_adjusted_type",
-            },
-            where,
-        )
-        _expression(observation["source_expression"], f"{where}.source_expression")
-        _expression(observation["target_expression"], f"{where}.target_expression")
-        if not isinstance(observation["pointer_anchors"], list):
-            raise ObservationError(f"{where}.pointer_anchors must be an array")
-        if not observation["pointer_anchors"]:
-            raise ObservationError(f"{where}.pointer_anchors must be nonempty")
-        seen: set[str] = set()
-        for anchor_index, anchor in enumerate(observation["pointer_anchors"]):
-            anchor_where = f"{where}.pointer_anchors[{anchor_index}]"
-            anchor = _exact_object(
-                anchor, {"id", "source_type", "target_type"}, anchor_where
-            )
-            anchor_id = _anon(anchor["id"], {"id"}, f"{anchor_where}.id")
-            if anchor_id in seen:
-                raise ObservationError(
-                    f"{where}.pointer_anchors has duplicate ID {anchor_id}"
-                )
-            seen.add(anchor_id)
-            _type_tree(anchor["source_type"], f"{anchor_where}.source_type")
-            _type_tree(anchor["target_type"], f"{anchor_where}.target_type")
-            if anchor["source_type"].get("kind") != "raw_pointer":
-                raise ObservationError(
-                    f"{anchor_where}.source_type must have outer kind raw_pointer"
-                )
-        for key in (
-            "source_type",
-            "source_adjusted_type",
-            "target_type",
-            "target_adjusted_type",
-        ):
-            _type_tree(observation[key], f"{where}.{key}")
-        _validate_anonymization(observation, where)
-    return ObservationDocument(observations=tuple(value["observations"]))
-
-
-_VARIABLE_SORTS = frozenset(
-    {
-        "anchor",
-        "binding",
-        "function",
-        "struct",
-        "enum",
-        "union",
-        "field",
-        "variant",
-        "constant",
-        "static",
-        "method",
-        "expression",
-        "integer_magnitude",
-    }
-)
-
-
-def _rule_variable(value: Any, allowed: set[str], where: str) -> dict[str, Any]:
-    checked: dict[str, Any] = _exact_object(value, {"kind", "sort", "index"}, where)
-    if checked["kind"] != "variable":
-        raise ObservationError(f"{where}.kind must be 'variable'")
-    sort = checked["sort"]
-    if not isinstance(sort, str) or sort not in _VARIABLE_SORTS:
-        raise ObservationError(f"{where}.sort has unknown value {sort!r}")
-    if sort not in allowed:
-        raise ObservationError(f"{where}.sort is not valid at this position")
-    _wire_integer(checked["index"], f"{where}.index")
-    return checked
-
-
-def _rule_adt_identity(value: Any, expected: str | None, where: str) -> None:
-    if isinstance(value, dict) and value.get("kind") == "variable":
-        allowed = {expected} if expected is not None else {"struct", "enum", "union"}
-        _rule_variable(value, allowed, where)
-    elif isinstance(value, dict) and value.get("kind") == "external":
-        _external_identity(value, where)
-    else:
-        raise ObservationError(f"{where} must be an ADT variable or external identity")
-
-
-def _rule_member_identity(value: Any, member_sort: str, where: str) -> None:
-    if not isinstance(value, dict):
-        raise ObservationError(f"{where} must be an object")
-    if value.get("kind") == "external":
-        _external_identity(value, where)
-    elif value.get("kind") == "local":
-        _exact_object(value, {"kind", "owner", "id"}, where)
-        _rule_adt_identity(value["owner"], None, f"{where}.owner")
-        _rule_variable(value["id"], {member_sort}, f"{where}.id")
-    else:
-        raise ObservationError(f"{where}.kind is unknown")
-
-
-def _rule_type_tree(value: Any, where: str) -> None:
-    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
-        raise ObservationError(f"{where} must be a tagged object")
-    kind = value["kind"]
-    if kind == "primitive":
-        _exact_object(value, {"kind", "name"}, where)
-        _enum(value["name"], _PRIMITIVES, f"{where}.name")
-    elif kind == "slice":
-        _exact_object(value, {"kind", "element"}, where)
-        _rule_type_tree(value["element"], f"{where}.element")
-    elif kind == "array":
-        _exact_object(value, {"kind", "element", "length"}, where)
-        _rule_type_tree(value["element"], f"{where}.element")
-        _wire_integer(value["length"], f"{where}.length")
-    elif kind in {"raw_pointer", "reference"}:
-        _exact_object(value, {"kind", "mutability", "pointee"}, where)
-        _enum(
-            value["mutability"],
-            {"const", "mut"} if kind == "raw_pointer" else {"shared", "mutable"},
-            f"{where}.mutability",
-        )
-        _rule_type_tree(value["pointee"], f"{where}.pointee")
-    elif kind == "tuple":
-        _exact_object(value, {"kind", "elements"}, where)
-        if not isinstance(value["elements"], list):
-            raise ObservationError(f"{where}.elements must be an array")
-        for index, element in enumerate(value["elements"]):
-            _rule_type_tree(element, f"{where}.elements[{index}]")
-    elif kind == "adt":
-        _exact_object(value, {"kind", "adt_kind", "identity", "arguments"}, where)
-        adt_kind = _enum(
-            value["adt_kind"], {"struct", "enum", "union"}, f"{where}.adt_kind"
-        )
-        _rule_adt_identity(value["identity"], adt_kind, f"{where}.identity")
-        if not isinstance(value["arguments"], list):
-            raise ObservationError(f"{where}.arguments must be an array")
-        for index, argument in enumerate(value["arguments"]):
-            _rule_type_tree(argument, f"{where}.arguments[{index}]")
-    else:
-        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
-
-
-def _rule_value_identity(value: Any, where: str) -> None:
-    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
-        raise ObservationError(f"{where} must be a tagged object")
-    kind = value["kind"]
-    if kind == "variable":
-        _rule_variable(
-            value,
-            {"anchor", "binding", "function", "constant", "static", "method"},
-            where,
-        )
-    elif kind == "external":
-        _external_identity(value, where)
-    elif kind in {"foreign_function", "foreign_static"}:
-        _exact_object(value, {"kind", "symbol"}, where)
-        if not isinstance(value["symbol"], str) or not value["symbol"]:
-            raise ObservationError(f"{where}.symbol must be nonempty")
-    elif kind == "constructor":
-        _exact_object(value, {"kind", "adt", "variant"}, where)
-        _rule_adt_identity(value["adt"], None, f"{where}.adt")
-        if value["variant"] is not None:
-            _rule_member_identity(value["variant"], "variant", f"{where}.variant")
-    else:
-        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
-
-
-def _rule_expression(value: Any, where: str) -> None:
-    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
-        raise ObservationError(f"{where} must be a tagged expression")
-    kind = value["kind"]
-    if kind == "variable":
-        _rule_variable(value, {"expression"}, where)
-    elif kind in {"array", "tuple"}:
-        _exact_object(value, {"kind", "elements"}, where)
-        if not isinstance(value["elements"], list):
-            raise ObservationError(f"{where}.elements must be an array")
-        for index, child in enumerate(value["elements"]):
-            _rule_expression(child, f"{where}.elements[{index}]")
-    elif kind == "call":
-        _exact_object(value, {"kind", "callee", "arguments"}, where)
-        _rule_expression(value["callee"], f"{where}.callee")
-        if not isinstance(value["arguments"], list):
-            raise ObservationError(f"{where}.arguments must be an array")
-        for index, child in enumerate(value["arguments"]):
-            _rule_expression(child, f"{where}.arguments[{index}]")
-    elif kind == "method_call":
-        _exact_object(value, {"kind", "receiver", "method", "arguments"}, where)
-        _rule_expression(value["receiver"], f"{where}.receiver")
-        _rule_value_identity(value["method"], f"{where}.method")
-        if not isinstance(value["arguments"], list):
-            raise ObservationError(f"{where}.arguments must be an array")
-        for index, child in enumerate(value["arguments"]):
-            _rule_expression(child, f"{where}.arguments[{index}]")
-    elif kind in {"binary", "assign_op"}:
-        _exact_object(value, {"kind", "operator", "left", "right"}, where)
-        _enum(value["operator"], _BINARY, f"{where}.operator")
-        _rule_expression(value["left"], f"{where}.left")
-        _rule_expression(value["right"], f"{where}.right")
-    elif kind == "unary":
-        _exact_object(value, {"kind", "operator", "operand"}, where)
-        _enum(value["operator"], {"deref", "not", "negate"}, f"{where}.operator")
-        _rule_expression(value["operand"], f"{where}.operand")
-    elif kind == "path":
-        _exact_object(value, {"kind", "value"}, where)
-        _rule_value_identity(value["value"], f"{where}.value")
-    elif kind == "cast":
-        _exact_object(value, {"kind", "expression", "type"}, where)
-        _rule_expression(value["expression"], f"{where}.expression")
-        _rule_type_tree(value["type"], f"{where}.type")
-    elif kind in {"assign", "index"}:
-        keys = (
-            {"kind", "left", "right"} if kind == "assign" else {"kind", "base", "index"}
-        )
-        _exact_object(value, keys, where)
-        for key in ("left", "right") if kind == "assign" else ("base", "index"):
-            _rule_expression(value[key], f"{where}.{key}")
-    elif kind == "field":
-        _exact_object(value, {"kind", "base", "field"}, where)
-        _rule_expression(value["base"], f"{where}.base")
-        _rule_member_identity(value["field"], "field", f"{where}.field")
-    elif kind == "range":
-        _exact_object(value, {"kind", "start", "end", "limits"}, where)
-        _enum(value["limits"], {"half_open", "closed"}, f"{where}.limits")
-        for key in ("start", "end"):
-            if value[key] is not None:
-                _rule_expression(value[key], f"{where}.{key}")
-    elif kind == "if":
-        _exact_object(value, {"kind", "condition", "then", "else"}, where)
-        _rule_expression(value["condition"], f"{where}.condition")
-        _rule_block(value["then"], f"{where}.then")
-        if value["else"] is not None:
-            _rule_expression(value["else"], f"{where}.else")
-    elif kind == "while":
-        _exact_object(value, {"kind", "condition", "body"}, where)
-        _rule_expression(value["condition"], f"{where}.condition")
-        _rule_block(value["body"], f"{where}.body")
-    elif kind == "loop":
-        _exact_object(value, {"kind", "body"}, where)
-        _rule_block(value["body"], f"{where}.body")
-    elif kind == "struct":
-        _exact_object(value, {"kind", "adt", "variant", "fields", "rest"}, where)
-        _rule_adt_identity(value["adt"], None, f"{where}.adt")
-        if value["variant"] is not None:
-            _rule_member_identity(value["variant"], "variant", f"{where}.variant")
-        if not isinstance(value["fields"], list):
-            raise ObservationError(f"{where}.fields must be an array")
-        seen_fields: set[str] = set()
-        for index, field in enumerate(value["fields"]):
-            field_where = f"{where}.fields[{index}]"
-            field = _exact_object(field, {"field", "value"}, field_where)
-            _rule_member_identity(field["field"], "field", f"{field_where}.field")
-            field_key = json.dumps(field["field"], sort_keys=True)
-            if field_key in seen_fields:
-                raise ObservationError(f"{where}.fields contains a duplicate field")
-            seen_fields.add(field_key)
-            _rule_expression(field["value"], f"{field_where}.value")
-        if value["rest"] is not None:
-            _rule_expression(value["rest"], f"{where}.rest")
-    elif kind == "literal":
-        _exact_object(value, {"kind", "value"}, where)
-        _rule_literal(value["value"], f"{where}.value")
-    elif kind == "address_of":
-        _exact_object(value, {"kind", "borrow", "mutability", "expression"}, where)
-        _enum(value["borrow"], {"reference", "raw"}, f"{where}.borrow")
-        _enum(value["mutability"], {"const", "mut"}, f"{where}.mutability")
-        _rule_expression(value["expression"], f"{where}.expression")
-    elif kind in {"return", "break"}:
-        _exact_object(value, {"kind", "value"}, where)
-        if value["value"] is not None:
-            _rule_expression(value["value"], f"{where}.value")
-    elif kind == "continue":
-        _exact_object(value, {"kind"}, where)
-    elif kind == "repeat":
-        _exact_object(value, {"kind", "value", "count"}, where)
-        _rule_expression(value["value"], f"{where}.value")
-        _rule_expression(value["count"], f"{where}.count")
-    elif kind == "block":
-        _exact_object(value, {"kind", "block"}, where)
-        _rule_block(value["block"], f"{where}.block")
-    else:
-        raise ObservationError(f"{where}.kind is unknown: {kind!r}")
-
-
-def _rule_literal(value: Any, where: str) -> None:
-    if isinstance(value, dict) and value.get("kind") == "integer":
-        value = _exact_object(value, {"kind", "value", "type"}, where)
-        if isinstance(value["value"], dict):
-            _rule_variable(value["value"], {"integer_magnitude"}, f"{where}.value")
-            concrete = dict(value)
-            concrete["value"] = "0"
-            _literal(concrete, where)
-        else:
-            _literal(value, where)
-    else:
-        _literal(value, where)
-
-
-def _rule_block(value: Any, where: str) -> None:
-    value = _exact_object(value, {"statements"}, where)
-    if not isinstance(value["statements"], list):
-        raise ObservationError(f"{where}.statements must be an array")
-    for index, statement in enumerate(value["statements"]):
-        statement_where = f"{where}.statements[{index}]"
-        if not isinstance(statement, dict):
-            raise ObservationError(f"{statement_where} must be an object")
-        if statement.get("kind") == "expression":
-            _exact_object(
-                statement, {"kind", "expression", "semicolon"}, statement_where
-            )
-            if not isinstance(statement["semicolon"], bool):
-                raise ObservationError(f"{statement_where}.semicolon must be a Boolean")
-            _rule_expression(statement["expression"], f"{statement_where}.expression")
-        elif statement.get("kind") == "let":
-            _exact_object(
-                statement, {"kind", "pattern", "type", "initializer"}, statement_where
-            )
-            _rule_pattern(statement["pattern"], f"{statement_where}.pattern")
-            if statement["type"] is not None:
-                _rule_type_tree(statement["type"], f"{statement_where}.type")
-            if statement["initializer"] is not None:
-                _rule_expression(
-                    statement["initializer"], f"{statement_where}.initializer"
-                )
-        else:
-            raise ObservationError(f"{statement_where}.kind is unknown")
-
-
-def _rule_pattern(value: Any, where: str) -> None:
-    if not isinstance(value, dict):
-        raise ObservationError(f"{where} must be an object")
-    if value.get("kind") == "wildcard":
-        _exact_object(value, {"kind"}, where)
-    elif value.get("kind") == "binding":
-        _exact_object(value, {"kind", "id", "mutability", "by_ref"}, where)
-        _rule_variable(value["id"], {"anchor", "binding"}, f"{where}.id")
-        _enum(value["mutability"], {"immutable", "mutable"}, f"{where}.mutability")
-        _enum(value["by_ref"], {"no", "shared", "mutable"}, f"{where}.by_ref")
-    else:
-        raise ObservationError(f"{where}.kind is unknown")
-
-
-_RULE_KEY_ORDERS = {
-    frozenset({"kind", "sort", "index"}): ("kind", "sort", "index"),
-    frozenset({"kind", "name"}): ("kind", "name"),
-    frozenset({"kind", "element"}): ("kind", "element"),
-    frozenset({"kind", "element", "length"}): ("kind", "element", "length"),
-    frozenset({"kind", "mutability", "pointee"}): ("kind", "mutability", "pointee"),
-    frozenset({"kind", "elements"}): ("kind", "elements"),
-    frozenset({"kind", "adt_kind", "identity", "arguments"}): (
-        "kind",
-        "adt_kind",
-        "identity",
-        "arguments",
-    ),
-    frozenset({"kind", "crate", "path"}): ("kind", "crate", "path"),
-    frozenset({"kind", "symbol"}): ("kind", "symbol"),
-    frozenset({"kind", "owner", "id"}): ("kind", "owner", "id"),
-    frozenset({"kind", "adt", "variant"}): ("kind", "adt", "variant"),
-    frozenset({"kind", "callee", "arguments"}): ("kind", "callee", "arguments"),
-    frozenset({"kind", "receiver", "method", "arguments"}): (
-        "kind",
-        "receiver",
-        "method",
-        "arguments",
-    ),
-    frozenset({"kind", "operator", "left", "right"}): (
-        "kind",
-        "operator",
-        "left",
-        "right",
-    ),
-    frozenset({"kind", "operator", "operand"}): ("kind", "operator", "operand"),
-    frozenset({"kind", "value"}): ("kind", "value"),
-    frozenset({"kind", "expression", "type"}): ("kind", "expression", "type"),
-    frozenset({"kind", "left", "right"}): ("kind", "left", "right"),
-    frozenset({"kind", "base", "index"}): ("kind", "base", "index"),
-    frozenset({"kind", "base", "field"}): ("kind", "base", "field"),
-    frozenset({"kind", "start", "end", "limits"}): ("kind", "start", "end", "limits"),
-    frozenset({"kind", "condition", "then", "else"}): (
-        "kind",
-        "condition",
-        "then",
-        "else",
-    ),
-    frozenset({"kind", "condition", "body"}): ("kind", "condition", "body"),
-    frozenset({"kind", "body"}): ("kind", "body"),
-    frozenset({"kind", "adt", "variant", "fields", "rest"}): (
-        "kind",
-        "adt",
-        "variant",
-        "fields",
-        "rest",
-    ),
-    frozenset({"field", "value"}): ("field", "value"),
-    frozenset({"kind", "borrow", "mutability", "expression"}): (
-        "kind",
-        "borrow",
-        "mutability",
-        "expression",
-    ),
-    frozenset({"kind"}): ("kind",),
-    frozenset({"kind", "value", "count"}): ("kind", "value", "count"),
-    frozenset({"kind", "block"}): ("kind", "block"),
-    frozenset({"statements"}): ("statements",),
-    frozenset({"kind", "expression", "semicolon"}): ("kind", "expression", "semicolon"),
-    frozenset({"kind", "pattern", "type", "initializer"}): (
-        "kind",
-        "pattern",
-        "type",
-        "initializer",
-    ),
-    frozenset({"kind", "id", "mutability", "by_ref"}): (
-        "kind",
-        "id",
-        "mutability",
-        "by_ref",
-    ),
-    frozenset({"kind", "value", "type"}): ("kind", "value", "type"),
-    frozenset({"kind", "bits", "type"}): ("kind", "bits", "type"),
-}
-
-
-def _visit_rule_variables(value: Any, visit: Any) -> None:
-    if isinstance(value, dict):
-        if value.get("kind") == "variable":
-            visit(value)
-            return
-        order = _RULE_KEY_ORDERS.get(frozenset(value))
-        if order is None:
-            raise ObservationError("rule contains an unrecognized object shape")
-        for key in order:
-            _visit_rule_variables(value[key], visit)
-    elif isinstance(value, list):
-        for child in value:
-            _visit_rule_variables(child, visit)
-
-
-def _validate_rule_invariants(rule: dict[str, Any], where: str) -> None:
-    anchors = rule["pointer_anchors"]
-    if not anchors:
-        raise ObservationError(f"{where}.pointer_anchors must be nonempty")
-    anchor_variables: list[tuple[str, int]] = []
-    for index, anchor in enumerate(anchors):
-        anchor_where = f"{where}.pointer_anchors[{index}]"
-        anchor = _exact_object(
-            anchor, {"id", "source_type", "target_type"}, anchor_where
-        )
-        variable = _rule_variable(anchor["id"], {"anchor"}, f"{anchor_where}.id")
-        anchor_variables.append((variable["sort"], variable["index"]))
-        _rule_type_tree(anchor["source_type"], f"{anchor_where}.source_type")
-        _rule_type_tree(anchor["target_type"], f"{anchor_where}.target_type")
-        if anchor["source_type"].get("kind") != "raw_pointer":
-            raise ObservationError(
-                f"{anchor_where}.source_type must have outer kind raw_pointer"
-            )
-    if len(set(anchor_variables)) != len(anchor_variables):
-        raise ObservationError(
-            f"{where}.pointer_anchors has a duplicate anchor variable"
-        )
-
-    counters: dict[str, int] = {}
-    seen: set[tuple[str, int]] = set()
-
-    def record(variable: dict[str, Any]) -> None:
-        key = (variable["sort"], variable["index"])
-        if key not in seen:
-            expected = counters.get(variable["sort"], 0)
-            if variable["index"] != expected:
-                raise ObservationError(
-                    f"{where} variable indices must follow canonical first-occurrence order"
-                )
-            counters[variable["sort"]] = expected + 1
-            seen.add(key)
-
-    for anchor in anchors:
-        _visit_rule_variables(anchor["id"], record)
-        _visit_rule_variables(anchor["source_type"], record)
-        _visit_rule_variables(anchor["target_type"], record)
-    for key in (
-        "source_type",
-        "source_adjusted_type",
-        "target_type",
-        "target_adjusted_type",
-    ):
-        _visit_rule_variables(rule[key], record)
-    _visit_rule_variables(rule["source_pattern"], record)
-    available = set(seen)
-
-    def target_record(variable: dict[str, Any]) -> None:
-        key = (variable["sort"], variable["index"])
-        record(variable)
-        if key not in available:
-            raise ObservationError(
-                f"{where}.target_pattern contains unavailable variable"
-            )
-
-    _visit_rule_variables(rule["target_pattern"], target_record)
-    declared_anchors = set(anchor_variables)
-    if any(
-        sort == "anchor" and key not in declared_anchors
-        for key in seen
-        for sort in [key[0]]
-    ):
-        raise ObservationError(f"{where} uses an undeclared anchor variable")
-
-
-def _rule_document_value(document: RuleDocument) -> dict[str, Any]:
-    return {"schema_version": 1, "rules": list(document.rules)}
-
-
-def _load_rule_value(value: Any) -> RuleDocument:
-    value = _exact_object(value, {"schema_version", "rules"}, "rule document")
-    if isinstance(value["schema_version"], bool) or value["schema_version"] != 1:
-        raise ObservationError(
-            f"unsupported rule schema_version {value['schema_version']!r}"
-        )
-    if not isinstance(value["rules"], list):
-        raise ObservationError("rule document rules must be an array")
-    rules: list[dict[str, Any]] = []
-    for index, rule in enumerate(value["rules"]):
-        where = f"rules[{index}]"
-        rule = _exact_object(
-            rule,
-            {
-                "source_pattern",
-                "target_pattern",
-                "pointer_anchors",
-                "source_type",
-                "source_adjusted_type",
-                "target_type",
-                "target_adjusted_type",
-            },
-            where,
-        )
-        _rule_expression(rule["source_pattern"], f"{where}.source_pattern")
-        _rule_expression(rule["target_pattern"], f"{where}.target_pattern")
-        if not isinstance(rule["pointer_anchors"], list):
-            raise ObservationError(f"{where}.pointer_anchors must be an array")
-        for key in (
-            "source_type",
-            "source_adjusted_type",
-            "target_type",
-            "target_adjusted_type",
-        ):
-            _rule_type_tree(rule[key], f"{where}.{key}")
-        _validate_rule_invariants(rule, where)
-        rules.append(rule)
-    return RuleDocument(rules=tuple(rules))
-
-
-def load_rules(text: str) -> RuleDocument:
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RuleError(f"rule JSON decode failure: {exc}") from exc
-    try:
-        return _load_rule_value(value)
-    except ObservationError as exc:
-        raise RuleError(str(exc)) from exc
-
-
-def rules_to_json(document: RuleDocument) -> str:
-    try:
-        validated = _load_rule_value(_rule_document_value(document))
-    except ObservationError as exc:
-        raise RuleError(str(exc)) from exc
-    return (
-        json.dumps(_rule_document_value(validated), indent=2, ensure_ascii=False) + "\n"
-    )
-
-
 @dataclass(frozen=True)
 class PointerVariableOrigin:
     kind: str
@@ -1304,6 +242,43 @@ class StatementPairMetadata:
 
 
 @dataclass(frozen=True)
+class StatementDisposition:
+    label: int
+    disposition: str
+    children: tuple[StatementDisposition, ...]
+
+
+@dataclass(frozen=True)
+class SkeletonView:
+    skeleton: str
+    needs_transformation: bool
+    statement_dispositions: tuple[StatementDisposition, ...]
+    statement_pair_metadata: tuple[StatementPairMetadata, ...]
+
+    @property
+    def transform_labels(self) -> tuple[int, ...]:
+        def visit(nodes: tuple[StatementDisposition, ...]) -> tuple[int, ...]:
+            labels: list[int] = []
+            for node in nodes:
+                if node.disposition == "transform":
+                    labels.append(node.label)
+                labels.extend(visit(node.children))
+            return tuple(labels)
+
+        return visit(self.statement_dispositions)
+
+    @property
+    def contains_rule_application(self) -> bool:
+        def visit(nodes: tuple[StatementDisposition, ...]) -> bool:
+            return any(
+                node.disposition == "rule_applied" or visit(node.children)
+                for node in nodes
+            )
+
+        return visit(self.statement_dispositions)
+
+
+@dataclass(frozen=True)
 class ItemRecord:
     id: int
     path: str
@@ -1312,12 +287,10 @@ class ItemRecord:
     signature_dependencies: tuple[int, ...] = ()
     name: str | None = None
     annotated_source: str | None = None
-    annotated_skeleton: str | None = None
+    baseline: SkeletonView | None = None
+    applied: SkeletonView | None = None
     source_signature: str | None = None
     target_signature: str | None = None
-    needs_transformation: bool | None = None
-    statements_requiring_transformation: tuple[int, ...] = ()
-    statement_pair_metadata: tuple[StatementPairMetadata, ...] = ()
     foreign_function_names: tuple[str, ...] = ()
     declaration: str | None = None
     definition: str | None = None
@@ -1455,8 +428,10 @@ def _statement_pair_metadata(
     value: Any,
     record_id: int,
     expected_labels: tuple[int, ...],
+    *,
+    field: str = "statement_pair_metadata",
 ) -> tuple[StatementPairMetadata, ...]:
-    where = f"record {record_id} field 'statement_pair_metadata'"
+    where = f"record {record_id} {field}"
     if not isinstance(value, list):
         raise SkeletonError(f"{where} must be an array")
     result: list[StatementPairMetadata] = []
@@ -1554,10 +529,698 @@ def _statement_pair_metadata(
     labels = tuple(statement.label for statement in result)
     if labels != expected_labels:
         raise SkeletonError(
-            f"{where} labels must exactly match "
-            "'statements_requiring_transformation' in producer order"
+            f"{where} labels must exactly match recursive transform labels "
+            "in depth-first order"
         )
     return tuple(result)
+
+
+def _statement_dispositions(
+    value: Any, record_id: int, view_name: str
+) -> tuple[StatementDisposition, ...]:
+    where = f"record {record_id} {view_name}.statement_dispositions"
+    seen: set[int] = set()
+
+    def load_nodes(raw: Any, node_where: str) -> tuple[StatementDisposition, ...]:
+        if not isinstance(raw, list):
+            raise SkeletonError(f"{node_where} must be an array")
+        result: list[StatementDisposition] = []
+        for index, item in enumerate(raw):
+            item_where = f"{node_where}[{index}]"
+            if not isinstance(item, dict) or set(item) != {
+                "label",
+                "disposition",
+                "children",
+            }:
+                raise SkeletonError(
+                    f"{item_where} must contain exactly "
+                    "['children', 'disposition', 'label']"
+                )
+            label = _u32(item["label"], f"{item_where}.label")
+            if label in seen:
+                raise SkeletonError(f"{where} has duplicate label {label}")
+            seen.add(label)
+            disposition = item["disposition"]
+            if disposition not in {"preserve", "transform", "rule_applied"}:
+                raise SkeletonError(
+                    f"{item_where}.disposition must be 'preserve', 'transform', "
+                    "or 'rule_applied'"
+                )
+            children = load_nodes(item["children"], f"{item_where}.children")
+            if disposition == "preserve" and any(
+                descendant.disposition != "preserve"
+                for descendant in _walk_dispositions(children)
+            ):
+                raise SkeletonError(
+                    f"{item_where} preserve node has a non-preserve descendant"
+                )
+            result.append(
+                StatementDisposition(
+                    label=label,
+                    disposition=disposition,
+                    children=children,
+                )
+            )
+        return tuple(result)
+
+    result = load_nodes(value, where)
+    labels = tuple(node.label for node in _walk_dispositions(result))
+    for previous, current in pairwise(labels):
+        if current <= previous:
+            detail = "duplicate" if current == previous else "out-of-order"
+            raise SkeletonError(f"{where} has {detail} label {current}")
+    return result
+
+
+def _walk_dispositions(
+    nodes: tuple[StatementDisposition, ...],
+) -> tuple[StatementDisposition, ...]:
+    result: list[StatementDisposition] = []
+    for node in nodes:
+        result.append(node)
+        result.extend(_walk_dispositions(node.children))
+    return tuple(result)
+
+
+def _load_skeleton_view(value: Any, record_id: int, view_name: str) -> SkeletonView:
+    where = f"record {record_id} {view_name}"
+    if not isinstance(value, dict) or set(value) != {
+        "skeleton",
+        "needs_transformation",
+        "statement_dispositions",
+        "statement_pair_metadata",
+    }:
+        raise SkeletonError(
+            f"{where} must contain exactly ['needs_transformation', 'skeleton', "
+            "'statement_dispositions', 'statement_pair_metadata']"
+        )
+    skeleton = _nonempty_string(value["skeleton"], f"{where}.skeleton")
+    needs = value["needs_transformation"]
+    if not isinstance(needs, bool):
+        raise SkeletonError(f"{where}.needs_transformation must be a Boolean")
+    dispositions = _statement_dispositions(
+        value["statement_dispositions"], record_id, view_name
+    )
+    transform_labels = tuple(
+        node.label
+        for node in _walk_dispositions(dispositions)
+        if node.disposition == "transform"
+    )
+    if needs != bool(transform_labels):
+        raise SkeletonError(
+            f"{where}.needs_transformation is inconsistent with its dispositions"
+        )
+    metadata = _statement_pair_metadata(
+        value["statement_pair_metadata"],
+        record_id,
+        transform_labels,
+        field=f"{view_name}.statement_pair_metadata",
+    )
+    return SkeletonView(
+        skeleton=skeleton,
+        needs_transformation=needs,
+        statement_dispositions=dispositions,
+        statement_pair_metadata=metadata,
+    )
+
+
+def _view_topology(view: SkeletonView) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    return tuple(
+        (node.label, tuple(child.label for child in node.children))
+        for node in _walk_dispositions(view.statement_dispositions)
+    )
+
+
+@dataclass(frozen=True)
+class _SkeletonStatementShape:
+    label: int
+    parent: int | None
+    root: str
+    declaration: tuple[str, ...]
+    control: tuple[Any, ...]
+    child_slots: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True)
+class _SkeletonShape:
+    signature: tuple[str, ...]
+    statements: tuple[_SkeletonStatementShape, ...]
+
+
+_RUST_MULTI_PUNCTUATION = (
+    "<<=",
+    ">>=",
+    "...",
+    "..=",
+    "::",
+    "->",
+    "=>",
+    "==",
+    "!=",
+    "<=",
+    ">=",
+    "&&",
+    "||",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "&=",
+    "|=",
+    "^=",
+    "<<",
+    ">>",
+    "..",
+)
+
+
+def _rust_tokens(source: str, where: str) -> tuple[str, ...]:
+    """Lex enough Rust to compare closed expected-skeleton structure."""
+    tokens: list[str] = []
+    index = 0
+    length = len(source)
+    while index < length:
+        character = source[index]
+        if character.isspace():
+            index += 1
+            continue
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            depth = 1
+            cursor = index + 2
+            while cursor < length and depth:
+                if source.startswith("/*", cursor):
+                    depth += 1
+                    cursor += 2
+                elif source.startswith("*/", cursor):
+                    depth -= 1
+                    cursor += 2
+                else:
+                    cursor += 1
+            if depth:
+                raise SkeletonError(f"{where} has an unterminated block comment")
+            index = cursor
+            continue
+
+        raw_prefix = re.match(r"(?:br|r)(?P<hashes>#+)?\"", source[index:])
+        if raw_prefix is not None:
+            prefix = raw_prefix.group(0)
+            hashes = raw_prefix.group("hashes") or ""
+            terminator = '"' + hashes
+            end = source.find(terminator, index + len(prefix))
+            if end < 0:
+                raise SkeletonError(f"{where} has an unterminated raw string")
+            tokens.append(source[index : end + len(terminator)])
+            index = end + len(terminator)
+            continue
+
+        string_prefix = next(
+            (
+                prefix
+                for prefix in ('b"', 'c"', '"')
+                if source.startswith(prefix, index)
+            ),
+            None,
+        )
+        if string_prefix is not None:
+            cursor = index + len(string_prefix)
+            escaped = False
+            while cursor < length:
+                current = source[cursor]
+                cursor += 1
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    break
+            else:
+                raise SkeletonError(f"{where} has an unterminated string")
+            tokens.append(source[index:cursor])
+            index = cursor
+            continue
+
+        if character == "'":
+            character_literal = re.match(r"'(?:\\.|[^'\\])+'", source[index:])
+            if character_literal is not None:
+                token = character_literal.group(0)
+                tokens.append(token)
+                index += len(token)
+                continue
+            lifetime = re.match(r"'[A-Za-z_][A-Za-z0-9_]*", source[index:])
+            if lifetime is not None:
+                token = lifetime.group(0)
+                tokens.append(token)
+                index += len(token)
+                continue
+        identifier = re.match(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*", source[index:])
+        if identifier is not None:
+            token = identifier.group(0)
+            tokens.append(token)
+            index += len(token)
+            continue
+        number = re.match(r"(?:0[xob][0-9A-Fa-f_]+|[0-9][0-9A-Za-z_]*)", source[index:])
+        if number is not None:
+            token = number.group(0)
+            tokens.append(token)
+            index += len(token)
+            continue
+        punctuation = next(
+            (
+                candidate
+                for candidate in _RUST_MULTI_PUNCTUATION
+                if source.startswith(candidate, index)
+            ),
+            None,
+        )
+        if punctuation is not None:
+            tokens.append(punctuation)
+            index += len(punctuation)
+            continue
+        tokens.append(character)
+        index += 1
+    return tuple(tokens)
+
+
+def _matching_delimiter(
+    tokens: tuple[str, ...], opening: int, limit: int, where: str
+) -> int:
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    opener = tokens[opening]
+    if opener not in pairs:
+        raise SkeletonError(f"{where} has malformed delimiter structure")
+    stack = [pairs[opener]]
+    for index in range(opening + 1, limit):
+        token = tokens[index]
+        if token in pairs:
+            stack.append(pairs[token])
+        elif token in pairs.values():
+            if not stack or token != stack.pop():
+                raise SkeletonError(f"{where} has unbalanced delimiters")
+            if not stack:
+                return index
+    raise SkeletonError(f"{where} has an unterminated delimiter")
+
+
+def _top_level_token(
+    tokens: tuple[str, ...], start: int, stop: int, wanted: set[str]
+) -> int | None:
+    closing = {"(": ")", "[": "]", "{": "}"}
+    stack: list[str] = []
+    for index in range(start, stop):
+        token = tokens[index]
+        if not stack and token in wanted:
+            return index
+        if token in closing:
+            stack.append(closing[token])
+        elif token in closing.values():
+            if stack and token == stack[-1]:
+                stack.pop()
+    return None
+
+
+def _control_details(
+    tokens: tuple[str, ...], start: int, limit: int, where: str
+) -> tuple[int, str, tuple[str, ...], tuple[tuple[str, int, int], ...]]:
+    root = tokens[start]
+    if root == "{" or root in {"if", "while", "for", "loop", "match"}:
+        opening = (
+            start if root == "{" else _top_level_token(tokens, start + 1, limit, {"{"})
+        )
+        if opening is None:
+            raise SkeletonError(f"{where} has a control without a body")
+        closing = _matching_delimiter(tokens, opening, limit, where)
+    else:
+        raise SkeletonError(f"{where} is not a supported control root")
+
+    if root == "if":
+        binding: tuple[str, ...] = ()
+        kind = "if"
+        if start + 1 < opening and tokens[start + 1] == "let":
+            equals = _top_level_token(tokens, start + 2, opening, {"="})
+            if equals is None:
+                raise SkeletonError(f"{where} has malformed if-let syntax")
+            kind = "if_let"
+            binding = tokens[start + 2 : equals]
+        slots: list[tuple[str, int, int]] = [("then", opening + 1, closing)]
+        layout: list[str] = [kind]
+        end = closing + 1
+        if end < limit and tokens[end] == "else":
+            end += 1
+            if end >= limit:
+                raise SkeletonError(f"{where} has malformed else syntax")
+            if tokens[end] == "if":
+                nested_end, nested_layout, nested_binding, nested_slots = (
+                    _control_details(tokens, end, limit, where)
+                )
+                layout.extend(("else_if", *nested_layout))
+                binding += ("|else-if|", *nested_binding)
+                slots.extend(
+                    (f"else.{name}", slot_start, slot_end)
+                    for name, slot_start, slot_end in nested_slots
+                )
+                end = nested_end
+            elif tokens[end] == "{":
+                else_close = _matching_delimiter(tokens, end, limit, where)
+                layout.append("else")
+                slots.append(("else", end + 1, else_close))
+                end = else_close + 1
+            else:
+                raise SkeletonError(f"{where} has unsupported else syntax")
+        if end < limit and tokens[end] == ";":
+            end += 1
+        return end, kind, tuple(layout) + binding, tuple(slots)
+
+    if root in {"while", "for"}:
+        kind = root
+        binding = ()
+        if root == "while" and start + 1 < opening and tokens[start + 1] == "let":
+            equals = _top_level_token(tokens, start + 2, opening, {"="})
+            if equals is None:
+                raise SkeletonError(f"{where} has malformed while-let syntax")
+            kind = "while_let"
+            binding = tokens[start + 2 : equals]
+        elif root == "for":
+            in_token = _top_level_token(tokens, start + 1, opening, {"in"})
+            if in_token is None:
+                raise SkeletonError(f"{where} has malformed for syntax")
+            binding = tokens[start + 1 : in_token]
+        end = closing + 1
+        if end < limit and tokens[end] == ";":
+            end += 1
+        return end, kind, (kind, *binding), (("body", opening + 1, closing),)
+
+    if root == "match":
+        arms: list[tuple[str, int, int]] = []
+        patterns: list[str] = []
+        cursor = opening + 1
+        arm_index = 0
+        while cursor < closing:
+            while cursor < closing and tokens[cursor] == ",":
+                cursor += 1
+            if cursor >= closing:
+                break
+            arrow = _top_level_token(tokens, cursor, closing, {"=>"})
+            if arrow is None:
+                raise SkeletonError(f"{where} has malformed match arms")
+            patterns.extend(("|arm|", *tokens[cursor:arrow]))
+            body = arrow + 1
+            if body >= closing or tokens[body] != "{":
+                raise SkeletonError(f"{where} has a non-block match arm")
+            arm_close = _matching_delimiter(tokens, body, closing + 1, where)
+            arms.append((f"arm.{arm_index}", body + 1, arm_close))
+            arm_index += 1
+            cursor = arm_close + 1
+            if cursor < closing and tokens[cursor] == ",":
+                cursor += 1
+        end = closing + 1
+        if end < limit and tokens[end] == ";":
+            end += 1
+        return end, "match", ("match", *patterns), tuple(arms)
+
+    end = closing + 1
+    if end < limit and tokens[end] == ";":
+        end += 1
+    kind = "block" if root == "{" else root
+    return end, kind, (kind,), (("body", opening + 1, closing),)
+
+
+def _statement_end(
+    tokens: tuple[str, ...], start: int, limit: int, where: str
+) -> tuple[int, str, tuple[str, ...], tuple[tuple[str, int, int], ...]]:
+    root = tokens[start]
+    if root == "{" or root in {"if", "while", "for", "loop", "match"}:
+        return _control_details(tokens, start, limit, where)
+    macro = _top_level_token(tokens, start, limit, {"!"})
+    if (
+        macro is not None
+        and macro + 1 < limit
+        and tokens[macro + 1] == "{"
+        and all(
+            token == "::"
+            or re.fullmatch(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*", token) is not None
+            for token in tokens[start:macro]
+        )
+    ):
+        closing = _matching_delimiter(tokens, macro + 1, limit, where)
+        end = closing + 1
+        if end < limit and tokens[end] == ";":
+            end += 1
+        return end, "macro_brace", (), ()
+    semicolon = _top_level_token(tokens, start, limit, {";"})
+    end = limit if semicolon is None else semicolon + 1
+    if root != "let":
+        statement_role = "tail" if semicolon is None else "semicolon"
+        expression_role = (
+            root if root in {"return", "break", "continue", "yield"} else "expression"
+        )
+        return end, f"{statement_role}_{expression_role}", (), ()
+    equals = _top_level_token(tokens, start + 1, end, {"="})
+    if equals is None:
+        declaration_end = end - 1 if tokens[end - 1] == ";" else end
+        declaration = tokens[start + 1 : declaration_end]
+        if not declaration:
+            raise SkeletonError(f"{where} has a malformed local declaration")
+        return end, "let_uninitialized", declaration, ()
+    declaration = tokens[start + 1 : equals]
+    else_token = _top_level_token(tokens, equals + 1, end, {"else"})
+    if else_token is None:
+        return end, "let", declaration, ()
+    else_open = else_token + 1
+    if else_open >= end or tokens[else_open] != "{":
+        raise SkeletonError(f"{where} has malformed let-else syntax")
+    else_close = _matching_delimiter(tokens, else_open, end, where)
+    return (
+        end,
+        "let_else",
+        declaration,
+        (("else", else_open + 1, else_close),),
+    )
+
+
+def _proctor_marker(
+    tokens: tuple[str, ...], index: int, where: str
+) -> tuple[int, int] | None:
+    if tokens[index : index + 4] != ("#", "[", "proctor", "("):
+        return None
+    if index + 7 > len(tokens) or tokens[index + 5 : index + 7] != (")", "]"):
+        raise SkeletonError(f"{where} has a malformed proctor label")
+    raw = tokens[index + 4]
+    if not raw.isdecimal():
+        raise SkeletonError(f"{where} has a non-integer proctor label")
+    label = int(raw)
+    if label > U32_MAX:
+        raise SkeletonError(f"{where} has an out-of-range proctor label")
+    return label, index + 7
+
+
+def _enclosing_block_limit(
+    tokens: tuple[str, ...],
+    body_open: int,
+    marker_index: int,
+    body_close: int,
+    where: str,
+) -> int:
+    stack = [body_open]
+    for index in range(body_open + 1, marker_index):
+        if tokens[index] == "{":
+            stack.append(index)
+        elif tokens[index] == "}":
+            if len(stack) == 1:
+                raise SkeletonError(f"{where} has unbalanced block delimiters")
+            stack.pop()
+    return (
+        body_close
+        if len(stack) == 1
+        else _matching_delimiter(tokens, stack[-1], body_close + 1, where)
+    )
+
+
+def _skeleton_shape(skeleton: str, record_id: int, view_name: str) -> _SkeletonShape:
+    where = f"record {record_id} {view_name}.skeleton"
+    tokens = _rust_tokens(skeleton, where)
+    if not tokens:
+        raise SkeletonError(f"{where} must contain one function")
+    body_open = _top_level_token(tokens, 0, len(tokens), {"{"})
+    if body_open is None:
+        raise SkeletonError(f"{where} must contain a function body")
+    body_close = _matching_delimiter(tokens, body_open, len(tokens), where)
+    if body_close != len(tokens) - 1 or "fn" not in tokens[:body_open]:
+        raise SkeletonError(f"{where} must contain exactly one complete function")
+
+    markers: list[tuple[int, int, int]] = []
+    index = body_open + 1
+    while index < body_close:
+        if (
+            tokens[index] == "!"
+            and index + 1 < body_close
+            and tokens[index + 1] in {"(", "[", "{"}
+        ):
+            index = _matching_delimiter(tokens, index + 1, body_close, where) + 1
+            continue
+        marker = _proctor_marker(tokens, index, where)
+        if marker is None:
+            index += 1
+            continue
+        label, start = marker
+        markers.append((label, index, start))
+        index = start
+    if len({label for label, _, _ in markers}) != len(markers):
+        raise SkeletonError(f"{where} has duplicate proctor labels")
+
+    intervals: list[
+        tuple[
+            int,
+            int,
+            int,
+            str,
+            tuple[str, ...],
+            tuple[tuple[str, int, int], ...],
+        ]
+    ] = []
+    for label, marker_index, start in markers:
+        if start >= body_close:
+            raise SkeletonError(f"{where} label {label} has no statement")
+        statement_limit = _enclosing_block_limit(
+            tokens, body_open, marker_index, body_close, where
+        )
+        end, root, declaration, slots = _statement_end(
+            tokens, start, statement_limit, f"{where} label {label}"
+        )
+        intervals.append((label, marker_index, end, root, declaration, slots))
+
+    parent_by_label: dict[int, int | None] = {}
+    for label, marker_index, _, _, _, _ in intervals:
+        containers = [
+            (other_label, other_marker)
+            for other_label, other_marker, other_end, _, _, _ in intervals
+            if other_marker < marker_index < other_end
+        ]
+        parent_by_label[label] = (
+            max(containers, key=lambda value: value[1])[0] if containers else None
+        )
+
+    statements: list[_SkeletonStatementShape] = []
+    for label, marker_index, end, root, declaration, slots in intervals:
+        parent = parent_by_label[label]
+        direct_children = [
+            (child_label, child_marker)
+            for child_label, child_marker, _, _, _, _ in intervals
+            if parent_by_label[child_label] == label
+        ]
+        child_slots: list[tuple[int, str]] = []
+        for child_label, child_marker in direct_children:
+            matching_slots = [
+                name
+                for name, slot_start, slot_end in slots
+                if slot_start <= child_marker < slot_end
+            ]
+            slot = matching_slots[-1] if matching_slots else "payload"
+            child_slots.append((child_label, slot))
+        control = (root, *(name for name, _, _ in slots))
+        if root in {
+            "if",
+            "if_let",
+            "while",
+            "while_let",
+            "for",
+            "loop",
+            "match",
+            "block",
+        }:
+            control = declaration
+        statements.append(
+            _SkeletonStatementShape(
+                label=label,
+                parent=parent,
+                root=root,
+                declaration=declaration,
+                control=control,
+                child_slots=tuple(child_slots),
+            )
+        )
+    return _SkeletonShape(signature=tokens[:body_open], statements=tuple(statements))
+
+
+def _validate_cross_view_invariants(
+    record_id: int, baseline: SkeletonView, applied: SkeletonView
+) -> None:
+    baseline_nodes = _walk_dispositions(baseline.statement_dispositions)
+    applied_nodes = _walk_dispositions(applied.statement_dispositions)
+    if any(node.disposition == "rule_applied" for node in baseline_nodes):
+        raise SkeletonError(f"record {record_id} baseline contains rule_applied")
+    if _view_topology(baseline) != _view_topology(applied):
+        raise SkeletonError(
+            f"record {record_id} baseline/applied label topology differs"
+        )
+    baseline_shape = _skeleton_shape(baseline.skeleton, record_id, "baseline")
+    applied_shape = _skeleton_shape(applied.skeleton, record_id, "applied")
+
+    def disposition_topology(
+        nodes: tuple[StatementDisposition, ...], parent: int | None = None
+    ) -> tuple[tuple[int, int | None], ...]:
+        result: list[tuple[int, int | None]] = []
+        for node in nodes:
+            result.append((node.label, parent))
+            result.extend(disposition_topology(node.children, node.label))
+        return tuple(result)
+
+    expected_topology = disposition_topology(baseline.statement_dispositions)
+    baseline_topology = tuple(
+        (statement.label, statement.parent) for statement in baseline_shape.statements
+    )
+    if baseline_topology != expected_topology:
+        raise SkeletonError(
+            f"record {record_id} baseline skeleton labels do not match its disposition topology"
+        )
+    applied_topology = tuple(
+        (statement.label, statement.parent) for statement in applied_shape.statements
+    )
+    if applied_topology != expected_topology:
+        raise SkeletonError(
+            f"record {record_id} applied skeleton labels do not match its disposition topology"
+        )
+    for before, after in zip(baseline_nodes, applied_nodes, strict=True):
+        if before.disposition == "preserve" and after.disposition != "preserve":
+            raise SkeletonError(
+                f"record {record_id} applied view changes preserved label {before.label}"
+            )
+        if after.disposition == "rule_applied" and before.disposition != "transform":
+            raise SkeletonError(
+                f"record {record_id} rule-applied label {after.label} was not transformable"
+            )
+        if before.disposition == "transform" and after.disposition == "preserve":
+            raise SkeletonError(
+                f"record {record_id} applied view preserves transformable label "
+                f"{after.label}"
+            )
+    if baseline_shape.signature != applied_shape.signature:
+        raise SkeletonError(f"record {record_id} baseline/applied signatures differ")
+    for before_shape, after_shape in zip(
+        baseline_shape.statements, applied_shape.statements, strict=True
+    ):
+        if (
+            before_shape.root != after_shape.root
+            or before_shape.control != after_shape.control
+        ):
+            raise SkeletonError(
+                f"record {record_id} baseline/applied control topology differs "
+                f"at label {before_shape.label}"
+            )
+        if before_shape.declaration != after_shape.declaration:
+            raise SkeletonError(
+                f"record {record_id} baseline/applied declaration topology differs "
+                f"at label {before_shape.label}"
+            )
+        if before_shape.child_slots != after_shape.child_slots:
+            raise SkeletonError(
+                f"record {record_id} baseline/applied control child slots differ "
+                f"at label {before_shape.label}"
+            )
 
 
 def _load_record(data: Any, index: int) -> ItemRecord:
@@ -1569,71 +1232,57 @@ def _load_record(data: Any, index: int) -> ItemRecord:
     if not isinstance(kind, str) or kind not in ALL_KINDS:
         raise SkeletonError(f"record {record_id} has unknown kind {kind!r}")
     if kind == "Fn":
-        required = (
+        required = {
+            "id",
+            "path",
+            "kind",
             "name",
             "annotated_source",
-            "annotated_skeleton",
+            "baseline",
+            "applied",
             "source_signature",
             "target_signature",
-            "needs_transformation",
-            "statements_requiring_transformation",
-            "statement_pair_metadata",
             "foreign_function_names",
             "signature_dependencies",
             "dependencies",
-        )
-        missing = [key for key in required if key not in data]
-        if missing:
+        }
+        if set(data) != required:
             raise SkeletonError(
-                f"record {record_id} is missing required fields: {', '.join(missing)}"
+                f"record {record_id} must contain exactly {sorted(required)}"
             )
         dependencies = _dependencies(data, "dependencies", record_id)
         signature_dependencies = _dependencies(
             data, "signature_dependencies", record_id
         )
-        needs_transformation = data["needs_transformation"]
-        if not isinstance(needs_transformation, bool):
-            raise SkeletonError(
-                f"record {record_id} field 'needs_transformation' must be a Boolean"
-            )
-        statements_requiring_transformation = _u32_labels(
-            data["statements_requiring_transformation"],
-            f"record {record_id} field 'statements_requiring_transformation'",
-        )
-        if needs_transformation != bool(statements_requiring_transformation):
-            raise SkeletonError(
-                f"record {record_id} preservation Boolean and label array are inconsistent"
-            )
-        statement_pair_metadata = _statement_pair_metadata(
-            data["statement_pair_metadata"],
-            record_id,
-            statements_requiring_transformation,
-        )
+        baseline = _load_skeleton_view(data["baseline"], record_id, "baseline")
+        applied = _load_skeleton_view(data["applied"], record_id, "applied")
+        _validate_cross_view_invariants(record_id, baseline, applied)
         return ItemRecord(
             id=record_id,
             path=path,
             kind=kind,
             name=_string(data, "name", record_id),
             annotated_source=_string(data, "annotated_source", record_id),
-            annotated_skeleton=_string(data, "annotated_skeleton", record_id),
+            baseline=baseline,
+            applied=applied,
             source_signature=_string(data, "source_signature", record_id),
             target_signature=_string(data, "target_signature", record_id),
-            needs_transformation=needs_transformation,
-            statements_requiring_transformation=statements_requiring_transformation,
-            statement_pair_metadata=statement_pair_metadata,
             foreign_function_names=_foreign_function_names(data, record_id),
             signature_dependencies=signature_dependencies,
             dependencies=dependencies,
         )
     if kind in {"Static", "Const"}:
-        missing = [
-            key
-            for key in ("declaration", "signature_dependencies", "dependencies")
-            if key not in data
-        ]
-        if missing:
+        required = {
+            "id",
+            "path",
+            "kind",
+            "declaration",
+            "signature_dependencies",
+            "dependencies",
+        }
+        if set(data) != required:
             raise SkeletonError(
-                f"record {record_id} is missing required fields: {', '.join(missing)}"
+                f"record {record_id} must contain exactly {sorted(required)}"
             )
         declaration = _string(data, "declaration", record_id)
         dependencies = _dependencies(data, "dependencies", record_id)
@@ -1648,10 +1297,10 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             signature_dependencies=signature_dependencies,
             dependencies=dependencies,
         )
-    missing = [key for key in ("definition", "dependencies") if key not in data]
-    if missing:
+    required = {"id", "path", "kind", "definition", "dependencies"}
+    if set(data) != required:
         raise SkeletonError(
-            f"record {record_id} is missing required fields: {', '.join(missing)}"
+            f"record {record_id} must contain exactly {sorted(required)}"
         )
     return ItemRecord(
         id=record_id,
@@ -1791,11 +1440,18 @@ def render_dependency_entry(record: ItemRecord) -> str:
 
 
 def render_transformation_targets(
-    members: tuple[int, ...], records_by_id: dict[int, ItemRecord]
+    members: tuple[int, ...],
+    records_by_id: dict[int, ItemRecord],
+    views_by_id: dict[int, SkeletonView] | None = None,
 ) -> str:
     entries = []
     for item_id in sorted(members):
         record = records_by_id[item_id]
+        view = views_by_id[item_id] if views_by_id is not None else record.applied
+        if view is None:
+            raise SkeletonError(
+                f"function record {item_id} has no selected skeleton view"
+            )
         foreign_references = ""
         if record.foreign_function_names:
             names = ", ".join(f"`{name}`" for name in record.foreign_function_names)
@@ -1804,7 +1460,7 @@ def render_transformation_targets(
             f"### Function `{record.name}`\n\n"
             f"{foreign_references}"
             f"Source:\n```rust\n{record.annotated_source}\n```\n"
-            f"Target skeleton:\n```rust\n{record.annotated_skeleton}\n```"
+            f"Target skeleton:\n```rust\n{view.skeleton}\n```"
         )
     return "\n\n".join(entries)
 

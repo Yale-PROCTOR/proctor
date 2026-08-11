@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from model import CallableCorrespondence, ItemRecord
+from model import CallableCorrespondence, ItemRecord, SkeletonView, StatementDisposition
 
 from proctor.llm.types import Message, Request, RequestMetadata
 from proctor.prompts.library import PromptLibrary, RenderedPrompt
@@ -60,6 +60,7 @@ def extract_code_block(response: str) -> Extraction:
 def validation_request(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
+    views_by_id: dict[int, SkeletonView],
     transformation: str,
 ) -> dict[str, object]:
     return {
@@ -68,11 +69,7 @@ def validation_request(
             {
                 "id": records_by_id[item_id].id,
                 "name": records_by_id[item_id].name,
-                "skeleton": records_by_id[item_id].annotated_skeleton,
-                "needs_transformation": records_by_id[item_id].needs_transformation,
-                "statements_requiring_transformation": list(
-                    records_by_id[item_id].statements_requiring_transformation
-                ),
+                "view": skeleton_view_value(views_by_id[item_id]),
             }
             for item_id in sorted(members)
         ],
@@ -83,6 +80,7 @@ def validation_request(
 def replacement_request(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
+    views_by_id: dict[int, SkeletonView],
     transformation: str,
     accepted_correspondence: tuple[CallableCorrespondence, ...] = (),
 ) -> dict[str, object]:
@@ -93,11 +91,7 @@ def replacement_request(
                 "id": records_by_id[item_id].id,
                 "path": records_by_id[item_id].path,
                 "name": records_by_id[item_id].name,
-                "skeleton": records_by_id[item_id].annotated_skeleton,
-                "needs_transformation": records_by_id[item_id].needs_transformation,
-                "statements_requiring_transformation": list(
-                    records_by_id[item_id].statements_requiring_transformation
-                ),
+                "view": skeleton_view_value(views_by_id[item_id]),
             }
             for item_id in sorted(members)
         ],
@@ -110,6 +104,49 @@ def replacement_request(
                 "wrapper_path": record.wrapper_path,
             }
             for record in accepted_correspondence
+        ],
+    }
+
+
+def _disposition_value(value: StatementDisposition) -> dict[str, object]:
+    return {
+        "label": value.label,
+        "disposition": value.disposition,
+        "children": [_disposition_value(child) for child in value.children],
+    }
+
+
+def skeleton_view_value(value: SkeletonView) -> dict[str, object]:
+    return {
+        "skeleton": value.skeleton,
+        "needs_transformation": value.needs_transformation,
+        "statement_dispositions": [
+            _disposition_value(node) for node in value.statement_dispositions
+        ],
+        "statement_pair_metadata": [
+            {
+                "label": statement.label,
+                "before_statement": statement.before_statement,
+                "pointer_variables_complete": statement.pointer_variables_complete,
+                "pointer_variables": [
+                    {
+                        "name": variable.name,
+                        "origin": (
+                            {"kind": "parameter", "index": variable.origin.value}
+                            if variable.origin.kind == "parameter"
+                            else {
+                                "kind": "local",
+                                "declaration_label": variable.origin.value,
+                            }
+                        ),
+                        "before_type": variable.before_type,
+                        "selected_target_type": variable.selected_target_type,
+                        "before_type_is_inferred": variable.before_type_is_inferred,
+                    }
+                    for variable in statement.pointer_variables
+                ],
+            }
+            for statement in value.statement_pair_metadata
         ],
     }
 
@@ -160,14 +197,32 @@ def llm_request(
 
 
 def make_skeleton_command(
-    crat_tool: Path, current_project: Path, output: Path
+    crat_tool: Path,
+    current_project: Path,
+    output: Path,
+    rule_set: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         str(crat_tool),
         "make-skeleton",
         "--output",
         str(output),
-        str(current_project),
+    ]
+    if rule_set is not None:
+        command.extend(("--rules", str(rule_set)))
+    command.append(str(current_project))
+    return command
+
+
+def merge_observations_command(
+    crat_tool: Path, output: Path, inputs: tuple[Path, ...]
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "merge-observations",
+        "--output",
+        str(output),
+        *(str(path) for path in inputs),
     ]
 
 
