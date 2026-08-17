@@ -2,7 +2,7 @@
 id = "local_transformation"
 version = 1
 description = "Transform one Rust function SCC against Crat skeletons."
-variables = ["dependency_context", "transformation_targets", "repair_context"]
+variables = ["dependency_context", "transformation_targets", "repair_context", "use_xj_scanf_guidance"]
 +++
 You are transforming unsafe Rust functions generated from C.
 
@@ -55,10 +55,89 @@ Requirements:
    own group label.
 10. For each listed foreign-function reference, prefer a behavior-equivalent
     safe Rust function or method when one is available; otherwise preserve the
-    foreign call.
-11. Do not introduce an explicit `unsafe` block or a statement or expression
+    foreign call.{% if use_xj_scanf_guidance %}
+
+    When a listed foreign reference is `scanf`, `fscanf`, or `sscanf`, use
+    `xj_scanf::legacy::scanf`, `xj_scanf::legacy::brscanf`, or
+    `xj_scanf::legacy::bscanf`, respectively. Whenever the format, target
+    types, and transformed input type are supported, replace the foreign call
+    with that function instead of reimplementing scanning. Otherwise preserve
+    the foreign call. The function signatures are:
+
+    ```rust
+    pub fn scanf(
+        format: &str,
+        args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],
+    ) -> i32;
+    pub fn brscanf<R: std::io::BufRead>(
+        reader: R,
+        format: &str,
+        args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],
+    ) -> i32;
+    pub fn bscanf(
+        input: &[u8],
+        format: &str,
+        args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],
+    ) -> i32;
+    ```
+
+    Integer conversions are `%d`, `%i`, `%o`, `%u`, `%x`, and `%X`; `%i`
+    detects decimal, octal, or hexadecimal prefixes. Floating-point
+    conversions are `%f`, `%F`, `%e`, `%E`, `%g`, `%G`, `%a`, and `%A`. `%c`
+    reads a fixed number of characters, defaulting to one; `%s` reads
+    non-whitespace characters; and `%[...]` and `%[^...]` match a character
+    set or its inverse. `%n` stores the number of characters consumed, and
+    `%%` matches a literal percent sign. `*` suppresses assignment, a decimal
+    field width limits the bytes scanned, and the length modifiers are `hh`
+    for integer `char`, `h` for integer `short`, `l` for integer `long` or
+    floating-point `double`, `ll` for integer `long long`, `L` for
+    floating-point `long double`, `j` for integer `intmax_t`, `t` for integer
+    `ptrdiff_t`, and `z` for integer `size_t`.
+
+    Supply mutable targets in conversion order.
+    `xj_scanf::legacy::ScanTarget` is implemented for `i8`, `i16`, `i32`,
+    `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`, `char`, `String`,
+    `Vec<u8>`, and `&mut [u8]`; storing fails when a scanned value's type does
+    not match its target. The functions return the number of successful
+    assignments, `0` when available input fails the first conversion, and
+    `-1` for EOF before any conversion. `scanf` reads standard input,
+    `brscanf` accepts a `std::io::BufRead`, and `bscanf` accepts a byte slice.
+
+    These signatures are reference material only. Do not define or import any
+    item for these calls, including `ScanTarget`. Call the selected function
+    through its fully qualified path. For example, with `input: &[u8]`,
+    `x: i32`, and `y: f32`:
+
+    ```rust
+    xj_scanf::legacy::bscanf(input, "%d %f", &mut [&mut x, &mut y])
+    ```{% endif %}
+11. When casting between references or slices, avoid unsafe code by using these
+    `bytemuck` functions whenever they preserve behavior for inputs on which
+    the source behavior is defined:
+
+    ```rust
+    pub fn cast_mut<A: NoUninit + AnyBitPattern, B: NoUninit + AnyBitPattern>(
+        a: &mut A,
+    ) -> &mut B;
+    pub fn cast_ref<A: NoUninit, B: AnyBitPattern>(a: &A) -> &B;
+    pub fn cast_slice<A: NoUninit, B: AnyBitPattern>(a: &[A]) -> &[B];
+    pub fn cast_slice_mut<A: NoUninit + AnyBitPattern, B: NoUninit + AnyBitPattern>(
+        a: &mut [A],
+    ) -> &mut [B];
+    ```
+
+    It is acceptable for these calls to panic only on inputs that would make
+    the corresponding source access undefined behavior, such as a misaligned
+    dereference. Do not avoid `bytemuck` merely because such undefined inputs
+    can panic. For defined inputs, scalar reference casts require equal source
+    and destination sizes, and slice casts require the total byte length to
+    form a whole number of destination elements. These signatures are
+    reference material only. Do not define or import the functions, and do not
+    declare an `extern crate`. Call them through their fully qualified paths,
+    such as `bytemuck::cast_ref(e)`.
+12. Do not introduce an explicit `unsafe` block or a statement or expression
     attribute other than the required `#[proctor(N)]` labels.
-12. Return exactly one Rust code block delimited by triple-backtick fences.
+13. Return exactly one Rust code block delimited by triple-backtick fences.
     Include all requested functions and no prose. Do not use tilde or
     longer-backtick fences.
 

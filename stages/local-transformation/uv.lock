@@ -88,10 +88,14 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "proctor" },
+    { name = "tomli-w" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "proctor", editable = "../../" }]
+requires-dist = [
+    { name = "proctor", editable = "../../" },
+    { name = "tomli-w", specifier = ">=1.2.0" },
+]
 
 [[package]]
 name = "markupsafe"

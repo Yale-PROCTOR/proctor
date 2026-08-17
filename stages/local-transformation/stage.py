@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any, Literal, cast
 
+import tomli_w
+
 from model import (
     ContextOverflow,
     CallableCorrespondence,
@@ -64,6 +66,13 @@ STAGE_ID = "local_transformation"
 STAGE_VERSION = "0.1.0"
 MAX_REPAIRS = 10
 CONTEXT_LIMIT = 100_000
+REQUIRED_CRATES_IO_DEPENDENCIES = (
+    ("bytemuck", "1.25.2", (1, 25, 2, 1)),
+    ("xj_scanf", "0.2.6", (0, 2, 6, 1)),
+    ("proctor-libc", "0.1.0", (0, 1, 0, 1)),
+)
+NON_REGISTRY_DEPENDENCY_KEYS = {"git", "path", "workspace"}
+XJ_SCANF_FOREIGN_FUNCTION_NAMES = frozenset({"scanf", "fscanf", "sscanf"})
 
 
 @dataclass
@@ -120,6 +129,16 @@ class AcceptedStatementPair:
     after_statement: str
 
 
+def _uses_xj_scanf_guidance(
+    members: tuple[int, ...], records_by_id: dict[int, ItemRecord]
+) -> bool:
+    return any(
+        name in XJ_SCANF_FOREIGN_FUNCTION_NAMES
+        for item_id in members
+        for name in records_by_id[item_id].foreign_function_names
+    )
+
+
 def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise StageFailure("stage config must be an object")
@@ -166,6 +185,135 @@ def _library_relative_path(project: Path) -> Path:
     if not source.is_file():
         raise StageFailure(f"Cargo library source is not a regular file: {source}")
     return relative
+
+
+def _cargo_version_key(version: str) -> tuple[int, int, int, int] | None:
+    match = re.fullmatch(
+        r"(\d+)(?:\.(\d+))?(?:\.(\d+))?"
+        r"(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?",
+        version,
+    )
+    if match is None:
+        return None
+    major, minor, patch, prerelease = match.groups()
+    return (
+        int(major),
+        int(minor or 0),
+        int(patch or 0),
+        0 if prerelease is not None else 1,
+    )
+
+
+def _cargo_requirement_needs_upgrade(
+    requirement: str, minimum_version_key: tuple[int, int, int, int]
+) -> bool:
+    lower_bounds: list[tuple[int, int, int, int]] = []
+    for raw_comparator in requirement.split(","):
+        comparator = re.fullmatch(
+            r"\s*(>=|<=|>|<|=|\^|~)?\s*"
+            r"((?:\d+|[xX*])(?:\.(?:\d+|[xX*])){0,2}"
+            r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\s*",
+            raw_comparator,
+        )
+        if comparator is None:
+            return True
+        operator, version = comparator.groups()
+        if operator in {"<", "<="}:
+            continue
+
+        wildcard_parts = version.split(".")
+        if any(part in {"x", "X", "*"} for part in wildcard_parts):
+            numeric_parts: list[int] = []
+            for part in wildcard_parts:
+                if part in {"x", "X", "*"}:
+                    break
+                numeric_parts.append(int(part))
+            numeric_parts.extend([0] * (3 - len(numeric_parts)))
+            lower_bounds.append(
+                (numeric_parts[0], numeric_parts[1], numeric_parts[2], 1)
+            )
+            continue
+
+        version_key = _cargo_version_key(version)
+        if version_key is None:
+            return True
+        lower_bounds.append(version_key)
+
+    return not any(bound >= minimum_version_key for bound in lower_bounds)
+
+
+def _ensure_crates_io_dependency(
+    dependencies: dict[str, Any],
+    name: str,
+    minimum_version: str,
+    minimum_version_key: tuple[int, int, int, int],
+) -> bool:
+    aliases = sorted(
+        dependency_name
+        for dependency_name, value in dependencies.items()
+        if dependency_name != name
+        and isinstance(value, dict)
+        and value.get("package") == name
+    )
+    if aliases:
+        raise StageFailure(
+            f"Cargo {name} dependency must use the name {name}, not {aliases}"
+        )
+
+    dependency = dependencies.get(name)
+    changed = False
+    if dependency is None:
+        dependencies[name] = minimum_version
+        changed = True
+    elif isinstance(dependency, str):
+        if _cargo_requirement_needs_upgrade(dependency, minimum_version_key):
+            dependencies[name] = minimum_version
+            changed = True
+    elif isinstance(dependency, dict):
+        package = dependency.get("package")
+        if package is not None and package != name:
+            raise StageFailure(
+                f"Cargo dependency named {name} aliases a different package"
+            )
+        registry = dependency.get("registry")
+        if NON_REGISTRY_DEPENDENCY_KEYS & dependency.keys() or registry not in {
+            None,
+            "crates-io",
+        }:
+            return changed
+        version_value = dependency.get("version")
+        if version_value is None:
+            dependency["version"] = minimum_version
+            changed = True
+        elif not isinstance(version_value, str):
+            raise StageFailure(f"Cargo {name} dependency version must be a string")
+        elif _cargo_requirement_needs_upgrade(version_value, minimum_version_key):
+            dependency["version"] = minimum_version
+            changed = True
+    else:
+        raise StageFailure(f"Cargo {name} dependency must be a string or table")
+
+    return changed
+
+
+def _ensure_required_dependencies(project: Path) -> None:
+    manifest = project / "Cargo.toml"
+    try:
+        cargo = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise StageFailure(f"working Cargo.toml is invalid: {exc}") from exc
+
+    dependencies = cargo.setdefault("dependencies", {})
+    if not isinstance(dependencies, dict):
+        raise StageFailure("Cargo [dependencies] must be a table")
+
+    changed = False
+    for name, minimum_version, minimum_version_key in REQUIRED_CRATES_IO_DEPENDENCIES:
+        changed |= _ensure_crates_io_dependency(
+            dependencies, name, minimum_version, minimum_version_key
+        )
+    if changed:
+        manifest.write_text(tomli_w.dumps(cargo), encoding="utf-8")
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -1143,6 +1291,7 @@ def _process_scc(
         )
         raise StageFailure(f"duplicate function names inside SCC: {detail}")
 
+    use_xj_scanf_guidance = _uses_xj_scanf_guidance(members, records_by_id)
     context: str | None = None
     applied_views = {
         item_id: cast(SkeletonView, records_by_id[item_id].applied)
@@ -1177,6 +1326,7 @@ def _process_scc(
                     transformation_targets=targets,
                     failed_transformation=latest_failed,
                     diagnostics=latest_diagnostics,
+                    use_xj_scanf_guidance=use_xj_scanf_guidance,
                 )
             )
             request = llm_request(rendered, run_id=stage_input.run_id, members=members)
@@ -1386,6 +1536,7 @@ def run_stage(
         if current.exists():
             shutil.rmtree(current)
         shutil.copytree(source, current)
+        _ensure_required_dependencies(current)
         active_tools.prepare(current, ("expand", "unexpand"), True)
         library_source = current / library_relative
         if not library_source.is_file():

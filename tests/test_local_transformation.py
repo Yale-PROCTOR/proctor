@@ -78,6 +78,9 @@ STAGE_DIR = Path(__file__).parents[1] / "stages" / "local-transformation"
 PROMPT_GOLDEN = (
     Path(__file__).parent / "fixtures" / "local_transformation_prompt_golden.md"
 )
+XJ_SCANF_GUIDANCE_MARKER = (
+    "When a listed foreign reference is `scanf`, `fscanf`, or `sscanf`"
+)
 
 _load_and_validate_replacement_metadata_impl = _load_and_validate_replacement_metadata
 _load_replacement_statement_pairs_impl = _load_replacement_statement_pairs
@@ -1459,14 +1462,144 @@ def test_repair_prompt_contains_only_latest_failure():
     assert "second bad code" in rendered.text and "first bad code" not in rendered.text
 
 
-def test_version_1_prompt_has_exact_hierarchy_and_advisory():
+@pytest.mark.parametrize("name", ["scanf", "fscanf", "sscanf"])
+def test_xj_scanf_guidance_activation_uses_exact_foreign_names(name):
+    records = loaded(
+        [fn_record(0, "target", "target", [], foreign_function_names=[name])]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    assert stage_module._uses_xj_scanf_guidance((0,), records_by_id) is True
+
+
+@pytest.mark.parametrize(
+    "name", ["free", "vscanf", "c_scanf", "__isoc99_scanf", "Scanf"]
+)
+def test_xj_scanf_guidance_does_not_activate_for_other_foreign_names(name):
+    records = loaded(
+        [fn_record(0, "target", "target", [], foreign_function_names=[name])]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    assert stage_module._uses_xj_scanf_guidance((0,), records_by_id) is False
+
+
+def test_xj_scanf_guidance_ignores_nonmember_metadata():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "member",
+                "member",
+                [1],
+                foreign_function_names=["free"],
+            ),
+            fn_record(
+                1,
+                "dependency",
+                "dependency",
+                [],
+                foreign_function_names=["scanf"],
+            ),
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    assert stage_module._uses_xj_scanf_guidance((0,), records_by_id) is False
+
+
+def test_active_xj_scanf_guidance_has_documented_function_interface():
+    rendered = render_prompt(
+        PromptRenderInput("", "TARGETS", use_xj_scanf_guidance=True)
+    )
+    text = rendered.text
+
+    assert rendered.id == "local_transformation" and rendered.version == 1
+    assert text.count(XJ_SCANF_GUIDANCE_MARKER) == 1
+    assert (
+        "`xj_scanf::legacy::scanf`, `xj_scanf::legacy::brscanf`, or\n"
+        "    `xj_scanf::legacy::bscanf`, respectively"
+    ) in text
+    assert (
+        "pub fn scanf(\n"
+        "        format: &str,\n"
+        "        args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],\n"
+        "    ) -> i32;"
+    ) in text
+    assert (
+        "pub fn brscanf<R: std::io::BufRead>(\n"
+        "        reader: R,\n"
+        "        format: &str,\n"
+        "        args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],\n"
+        "    ) -> i32;"
+    ) in text
+    assert (
+        "pub fn bscanf(\n"
+        "        input: &[u8],\n"
+        "        format: &str,\n"
+        "        args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],\n"
+        "    ) -> i32;"
+    ) in text
+    for specifier in (
+        "%d",
+        "%i",
+        "%o",
+        "%u",
+        "%x",
+        "%X",
+        "%f",
+        "%F",
+        "%e",
+        "%E",
+        "%g",
+        "%G",
+        "%a",
+        "%A",
+        "%c",
+        "%s",
+        "%[...]",
+        "%[^...]",
+        "%n",
+        "%%",
+    ):
+        assert f"`{specifier}`" in text
+    assert "`*` suppresses assignment" in text
+    assert "a decimal\n    field width limits the bytes scanned" in text
+    assert "the length modifiers are `hh`\n    for integer `char`" in text
+    assert "`h` for integer `short`" in text
+    assert "`l` for integer `long` or\n    floating-point `double`" in text
+    assert "`ll` for integer `long long`" in text
+    assert "`L` for\n    floating-point `long double`" in text
+    assert "`j` for integer `intmax_t`" in text
+    assert "`t` for integer\n    `ptrdiff_t`" in text
+    assert "`z` for integer `size_t`" in text
+    assert (
+        "implemented for `i8`, `i16`, `i32`,\n"
+        "    `i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`, `char`, "
+        "`String`,\n"
+        "    `Vec<u8>`, and `&mut [u8]`"
+    ) in text
+    assert "`0` when available input fails the first conversion" in text
+    assert "`-1` for EOF before any conversion" in text
+    assert 'xj_scanf::legacy::bscanf(input, "%d %f", &mut [&mut x, &mut y])' in text
+    assert (
+        "Do not define or import any\n    item for these calls, including `ScanTarget`"
+        in text
+    )
+    assert not any(
+        line.strip().startswith("use xj_scanf") for line in text.splitlines()
+    )
+    assert "macro" not in text.lower()
+
+
+def test_version_1_prompt_has_exact_hierarchy_and_safe_cast_guidance():
     kind_records = {record.id: record for record in item_kind_records()}
     dependency_entries, _ = dependency_context((4,), kind_records)
     foreign_records = {record.id: record for record in foreign_function_records()}
     target_entries = render_transformation_targets((1,), foreign_records)
     rendered = render_prompt(PromptRenderInput(dependency_entries, target_entries))
     expected = (
-        PROMPT_GOLDEN.read_text()
+        (PROMPT_GOLDEN.read_text() + "\n")
         .replace("{{ dependency_context }}", dependency_entries)
         .replace("{{ transformation_targets }}", target_entries)
     )
@@ -1474,8 +1607,10 @@ def test_version_1_prompt_has_exact_hierarchy_and_advisory():
     assert rendered.content_hash == hashlib.sha256(expected.encode()).hexdigest()
     assert (
         rendered.content_hash
-        == "c121eec81f2aaa7eb3955448c5eb6075780a97f5e2784ffae9a3df8b781ee174"
+        == "73125072b42094c0fb7030c748037c584319251ab6aeeb20f4253b9228a084de"
     )
+    assert rendered.version == 1
+    assert XJ_SCANF_GUIDANCE_MARKER not in rendered.text
     preservation_instruction = (
         "Complete every generated `todo!()` hole. Preserve every complete labeled "
         "statement already present in the Target Skeleton exactly as provided."
@@ -1487,8 +1622,25 @@ def test_version_1_prompt_has_exact_hierarchy_and_advisory():
     )
     assert rendered.text.count(preservation_instruction) == 1
     assert rendered.text.count(advisory) == 1
-    assert "11. Do not introduce an explicit `unsafe` block" in rendered.text
-    assert "12. Return exactly one Rust code block" in rendered.text
+    assert rendered.text.count("pub fn cast_mut") == 1
+    assert rendered.text.count("pub fn cast_ref") == 1
+    assert rendered.text.count("pub fn cast_slice<") == 1
+    assert rendered.text.count("pub fn cast_slice_mut") == 1
+    assert rendered.text.count("bytemuck::cast_ref(e)") == 1
+    assert "inputs on which\n    the source behavior is defined" in rendered.text
+    assert "such as a misaligned\n    dereference" in rendered.text
+    assert (
+        "Do not avoid `bytemuck` merely because such undefined inputs" in rendered.text
+    )
+    assert (
+        "scalar reference casts require equal source\n    and destination sizes"
+        in rendered.text
+    )
+    assert "slice casts require the total byte length" in rendered.text
+    assert "Do not define or import the functions" in rendered.text
+    assert "declare an `extern crate`" in rendered.text
+    assert "12. Do not introduce an explicit `unsafe` block" in rendered.text
+    assert "13. Return exactly one Rust code block" in rendered.text
     assert (
         f"## Dependency Context\n\n{dependency_entries}\n\n"
         f"## Transformation Targets\n\n{target_entries}"
@@ -2586,6 +2738,269 @@ def test_preparation_and_initialization_event_order_is_exact(
     assert commands == [expected]
 
 
+@pytest.mark.parametrize(
+    ("dependency", "expected"),
+    [
+        (None, "1.25.2"),
+        ('"1.24.0"', "1.25.2"),
+        ('"^1.24"', "1.25.2"),
+        ('"1.25.2-alpha.1"', "1.25.2"),
+        ('"1.25.2"', "1.25.2"),
+        ('"1.26.0"', "1.26.0"),
+        ('">=1.20, <2"', "1.25.2"),
+        ('"<1.25.2"', "1.25.2"),
+        ('">1.25.1"', "1.25.2"),
+        ('">=1.25.2, <2"', ">=1.25.2, <2"),
+        ('">1.25.2"', ">1.25.2"),
+        ('"1.*"', "1.25.2"),
+        ('"2.*"', "2.*"),
+        (
+            '{ version = "1.20.0", features = ["derive"], default-features = false }',
+            {
+                "version": "1.25.2",
+                "features": ["derive"],
+                "default-features": False,
+            },
+        ),
+        (
+            '{ version = "1.30.0", features = ["must_cast"] }',
+            {"version": "1.30.0", "features": ["must_cast"]},
+        ),
+        (
+            '{ workspace = true, features = ["derive"] }',
+            {"workspace": True, "features": ["derive"]},
+        ),
+        (
+            '{ git = "https://example.invalid/bytemuck", version = "1.20.0", features = ["derive"] }',
+            {
+                "git": "https://example.invalid/bytemuck",
+                "version": "1.20.0",
+                "features": ["derive"],
+            },
+        ),
+        (
+            '{ path = "../bytemuck", version = "1.20.0", features = ["derive"] }',
+            {
+                "path": "../bytemuck",
+                "version": "1.20.0",
+                "features": ["derive"],
+            },
+        ),
+        (
+            '{ registry = "private", version = "1.20.0", features = ["derive"] }',
+            {
+                "registry": "private",
+                "version": "1.20.0",
+                "features": ["derive"],
+            },
+        ),
+        (
+            '{ registry = "crates-io", version = "1.20.0", features = ["derive"] }',
+            {
+                "registry": "crates-io",
+                "version": "1.25.2",
+                "features": ["derive"],
+            },
+        ),
+        (
+            '{ package = "bytemuck", version = "1.20.0", features = ["derive"] }',
+            {
+                "package": "bytemuck",
+                "version": "1.25.2",
+                "features": ["derive"],
+            },
+        ),
+    ],
+)
+def test_bytemuck_dependency_is_normalized_before_preparation(
+    tmp_path, dependency, expected
+):
+    import tomllib
+
+    value = stage_input(tmp_path)
+    manifest = (
+        "[package]\n"
+        'name = "p"\n'
+        'version = "0.1.0"\n\n'
+        "[lib]\n"
+        'path = "lib.rs"\n\n'
+        "[dependencies]\n"
+        'serde = { version = "1", features = ["derive"] }\n'
+    )
+    if dependency is not None:
+        manifest += f"bytemuck = {dependency}\n"
+    source_manifest = value.inputs.rust_project / "Cargo.toml"
+    source_manifest.write_text(manifest, encoding="utf-8")
+
+    prepared_manifests = []
+
+    class InspectingTools(FakeTools):
+        def prepare(self, current, passes, use_print):
+            prepared_manifests.append(
+                tomllib.loads((current / "Cargo.toml").read_text(encoding="utf-8"))
+            )
+            super().prepare(current, passes, use_print)
+
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=InspectingTools())
+
+    assert output.status == "success"
+    assert source_manifest.read_text(encoding="utf-8") == manifest
+    assert len(prepared_manifests) == 1
+    prepared = prepared_manifests[0]
+    assert prepared["dependencies"]["bytemuck"] == expected
+    assert prepared["dependencies"]["xj_scanf"] == "0.2.6"
+    assert prepared["dependencies"]["proctor-libc"] == "0.1.0"
+    assert prepared["dependencies"]["serde"] == {
+        "version": "1",
+        "features": ["derive"],
+    }
+    published = tomllib.loads(
+        (value.outputs.rust_project / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    assert published == prepared
+
+
+def test_required_dependency_table_is_created_when_absent(tmp_path):
+    import tomllib
+
+    value = stage_input(tmp_path)
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=FakeTools())
+
+    assert output.status == "success"
+    source = tomllib.loads(
+        (value.inputs.rust_project / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    published = tomllib.loads(
+        (value.outputs.rust_project / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    assert "dependencies" not in source
+    assert published["dependencies"] == {
+        "bytemuck": "1.25.2",
+        "xj_scanf": "0.2.6",
+        "proctor-libc": "0.1.0",
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "alias", "version"),
+    [
+        ("bytemuck", "bm", "1.20.0"),
+        ("xj_scanf", "scanf", "0.2.0"),
+        ("proctor-libc", "libc", "0.0.1"),
+    ],
+)
+def test_aliased_required_dependency_fails_before_preparation(
+    tmp_path, name, alias, version
+):
+    value = stage_input(tmp_path)
+    (value.inputs.rust_project / "Cargo.toml").write_text(
+        '[lib]\npath = "lib.rs"\n\n'
+        "[dependencies]\n"
+        f'{alias} = {{ package = "{name}", version = "{version}" }}\n',
+        encoding="utf-8",
+    )
+
+    tools = FakeTools()
+
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+
+    assert output.status == "failure"
+    assert (
+        f"{name} dependency must use the name {name}, not ['{alias}']" in output.error
+    )
+    assert [event[0] for event in tools.events] == ["build_tools"]
+
+
+@pytest.mark.parametrize("name", ["bytemuck", "xj_scanf", "proctor-libc"])
+def test_required_dependency_name_collision_fails_before_preparation(tmp_path, name):
+    value = stage_input(tmp_path)
+    (value.inputs.rust_project / "Cargo.toml").write_text(
+        '[lib]\npath = "lib.rs"\n\n'
+        "[dependencies]\n"
+        f'{name} = {{ package = "another-crate", version = "1.0.0" }}\n',
+        encoding="utf-8",
+    )
+    tools = FakeTools()
+
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+
+    assert output.status == "failure"
+    assert f"dependency named {name} aliases a different package" in output.error
+    assert [event[0] for event in tools.events] == ["build_tools"]
+
+
+@pytest.mark.parametrize(
+    ("name", "minimum_version", "lower_version"),
+    [
+        ("bytemuck", "1.25.2", "1.20.0"),
+        ("xj_scanf", "0.2.6", "0.2.0"),
+        ("proctor-libc", "0.1.0", "0.0.1"),
+    ],
+)
+def test_required_dependency_table_upgrade_preserves_other_fields(
+    tmp_path, name, minimum_version, lower_version
+):
+    import tomllib
+
+    value = stage_input(tmp_path)
+    manifest = (
+        '[lib]\npath = "lib.rs"\n\n'
+        "[dependencies]\n"
+        f'{name} = {{ version = "{lower_version}", features = ["derive"], '
+        "default-features = false }\n"
+    )
+    source_manifest = value.inputs.rust_project / "Cargo.toml"
+    source_manifest.write_text(manifest, encoding="utf-8")
+
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=FakeTools())
+
+    assert output.status == "success"
+    assert source_manifest.read_text(encoding="utf-8") == manifest
+    published = tomllib.loads(
+        (value.outputs.rust_project / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    assert published["dependencies"][name] == {
+        "version": minimum_version,
+        "features": ["derive"],
+        "default-features": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "minimum_version"),
+    [
+        ("bytemuck", "1.25.2"),
+        ("xj_scanf", "0.2.6"),
+        ("proctor-libc", "0.1.0"),
+    ],
+)
+def test_required_dependency_table_without_version_adds_minimum(
+    tmp_path, name, minimum_version
+):
+    import tomllib
+
+    value = stage_input(tmp_path)
+    manifest = (
+        '[lib]\npath = "lib.rs"\n\n'
+        "[dependencies]\n"
+        f'{name} = {{ default-features = false }}\n'
+    )
+    source_manifest = value.inputs.rust_project / "Cargo.toml"
+    source_manifest.write_text(manifest, encoding="utf-8")
+
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=FakeTools())
+
+    assert output.status == "success"
+    assert source_manifest.read_text(encoding="utf-8") == manifest
+    published = tomllib.loads(
+        (value.outputs.rust_project / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    assert published["dependencies"][name] == {
+        "version": minimum_version,
+        "default-features": False,
+    }
+
+
 def test_normalized_initial_build_failure_aborts_without_llm(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
@@ -3183,6 +3598,46 @@ def test_validator_invalid_consumes_one_repair_then_succeeds(tmp_path):
     assert json.dumps(INVALID) in client.requests[1].messages[0].content
 
 
+def test_xj_scanf_guidance_is_consistent_across_initial_and_repair_prompts(tmp_path):
+    tools = FakeTools(
+        skeletons=[
+            fn_record(
+                0,
+                "target",
+                "target",
+                [1],
+                foreign_function_names=["sscanf"],
+            ),
+            fn_record(
+                1,
+                "peer",
+                "peer",
+                [0],
+                foreign_function_names=["scanf"],
+            ),
+        ],
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[INVALID, VALID],
+        candidates=["candidate\n"],
+    )
+    client = FakeClient([response(), response()])
+
+    _, output = run_fake(tmp_path, tools, client)
+
+    assert output.status == "success"
+    assert len(client.requests) == 2
+    for request in client.requests:
+        assert request.messages[0].content.count(XJ_SCANF_GUIDANCE_MARKER) == 1
+        assert request.metadata.prompt_version == 1
+    assert (
+        "The previous transformation failed."
+        not in client.requests[0].messages[0].content
+    )
+    assert (
+        "The previous transformation failed." in client.requests[1].messages[0].content
+    )
+
+
 def test_missing_fence_consumes_repair_without_validator_call(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
@@ -3518,6 +3973,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
     )
     project = tomllib.loads((STAGE_DIR / "pyproject.toml").read_text())
     assert "proctor" in project["project"]["dependencies"]
+    assert "tomli-w>=1.2.0" in project["project"]["dependencies"]
     assert project["tool"]["uv"]["sources"]["proctor"]["path"] == "../.."
     assert (STAGE_DIR / "uv.lock").is_file()
 

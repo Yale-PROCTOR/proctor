@@ -31,6 +31,7 @@ class PromptRenderInput:
     transformation_targets: str
     failed_transformation: str | None = None
     diagnostics: str | None = None
+    use_xj_scanf_guidance: bool = False
 
 
 def extract_code_block(response: str) -> Extraction:
@@ -174,6 +175,7 @@ def render_prompt(
         dependency_context=value.dependency_context,
         transformation_targets=value.transformation_targets,
         repair_context=repair,
+        use_xj_scanf_guidance=value.use_xj_scanf_guidance,
     )
 
 

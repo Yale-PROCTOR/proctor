@@ -50,9 +50,33 @@ Requirements:
 10. For each listed foreign-function reference, prefer a behavior-equivalent
     safe Rust function or method when one is available; otherwise preserve the
     foreign call.
-11. Do not introduce an explicit `unsafe` block or a statement or expression
+11. When casting between references or slices, avoid unsafe code by using these
+    `bytemuck` functions whenever they preserve behavior for inputs on which
+    the source behavior is defined:
+
+    ```rust
+    pub fn cast_mut<A: NoUninit + AnyBitPattern, B: NoUninit + AnyBitPattern>(
+        a: &mut A,
+    ) -> &mut B;
+    pub fn cast_ref<A: NoUninit, B: AnyBitPattern>(a: &A) -> &B;
+    pub fn cast_slice<A: NoUninit, B: AnyBitPattern>(a: &[A]) -> &[B];
+    pub fn cast_slice_mut<A: NoUninit + AnyBitPattern, B: NoUninit + AnyBitPattern>(
+        a: &mut [A],
+    ) -> &mut [B];
+    ```
+
+    It is acceptable for these calls to panic only on inputs that would make
+    the corresponding source access undefined behavior, such as a misaligned
+    dereference. Do not avoid `bytemuck` merely because such undefined inputs
+    can panic. For defined inputs, scalar reference casts require equal source
+    and destination sizes, and slice casts require the total byte length to
+    form a whole number of destination elements. These signatures are
+    reference material only. Do not define or import the functions, and do not
+    declare an `extern crate`. Call them through their fully qualified paths,
+    such as `bytemuck::cast_ref(e)`.
+12. Do not introduce an explicit `unsafe` block or a statement or expression
     attribute other than the required `#[proctor(N)]` labels.
-12. Return exactly one Rust code block delimited by triple-backtick fences.
+13. Return exactly one Rust code block delimited by triple-backtick fences.
     Include all requested functions and no prose. Do not use tilde or
     longer-backtick fences.
 
@@ -116,4 +140,3 @@ unsafe fn read_value(mut p: &[i32], mut q: Option<&i32>) -> i32 {
 ## Transformation Targets
 
 {{ transformation_targets }}
-
