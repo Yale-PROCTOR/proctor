@@ -770,11 +770,7 @@ def test_dual_view_loader_keeps_tail_children_in_their_control_branch():
 @pytest.mark.parametrize("declaration", ["let value: i32;", "let pointer: *mut i32;"])
 def test_dual_view_loader_accepts_initializerless_local_declarations(declaration):
     record = fn_record(0, "declaration", "declaration", [])
-    skeleton = (
-        "unsafe fn declaration() {\n"
-        f"    #[proctor(0)]\n    {declaration}\n"
-        "}"
-    )
+    skeleton = f"unsafe fn declaration() {{\n    #[proctor(0)]\n    {declaration}\n}}"
     record["baseline"]["skeleton"] = skeleton
     record["applied"] = copy.deepcopy(record["baseline"])
     assert loaded([record])[0].baseline.transform_labels == (0,)
@@ -810,9 +806,7 @@ def test_dual_view_loader_tracks_let_else_child_slots():
         {
             "label": 0,
             "disposition": "transform",
-            "children": [
-                {"label": 1, "disposition": "transform", "children": []}
-            ],
+            "children": [{"label": 1, "disposition": "transform", "children": []}],
         },
         {"label": 2, "disposition": "transform", "children": []},
     ]
@@ -890,9 +884,7 @@ def test_dual_view_loader_distinguishes_expression_and_jump_payloads(jump):
         {
             "label": 0,
             "disposition": "transform",
-            "children": [
-                {"label": 1, "disposition": "transform", "children": []}
-            ],
+            "children": [{"label": 1, "disposition": "transform", "children": []}],
         }
     ]
     record["applied"] = copy.deepcopy(record["baseline"])
@@ -964,9 +956,9 @@ def test_dual_view_loader_enforces_cross_view_disposition_transitions():
 
     preserved_transform = fn_record(0, "open", "open", [])
     preserved_transform["applied"] = copy.deepcopy(preserved_transform["baseline"])
-    preserved_transform["applied"]["statement_dispositions"][0][
-        "disposition"
-    ] = "preserve"
+    preserved_transform["applied"]["statement_dispositions"][0]["disposition"] = (
+        "preserve"
+    )
     preserved_transform["applied"]["needs_transformation"] = False
     preserved_transform["applied"]["statement_pair_metadata"] = []
     with pytest.raises(SkeletonError, match="preserves transformable"):
@@ -974,9 +966,9 @@ def test_dual_view_loader_enforces_cross_view_disposition_transitions():
 
     preserved_shell = nested_view_record()
     for view_name in ("baseline", "applied"):
-        preserved_shell[view_name]["statement_dispositions"][0][
-            "disposition"
-        ] = "preserve_shell"
+        preserved_shell[view_name]["statement_dispositions"][0]["disposition"] = (
+            "preserve_shell"
+        )
         preserved_shell[view_name]["statement_pair_metadata"] = [
             entry
             for entry in preserved_shell[view_name]["statement_pair_metadata"]
@@ -987,9 +979,7 @@ def test_dual_view_loader_enforces_cross_view_disposition_transitions():
     assert parsed.applied.transform_labels == (1, 2)
 
     changed_shell = copy.deepcopy(preserved_shell)
-    changed_shell["applied"]["statement_dispositions"][0][
-        "disposition"
-    ] = "transform"
+    changed_shell["applied"]["statement_dispositions"][0]["disposition"] = "transform"
     changed_shell["applied"]["statement_pair_metadata"].insert(
         0,
         {
@@ -1017,9 +1007,7 @@ def test_dual_view_loader_accepts_nested_transform_and_rule_transitions(
     record = nested_view_record()
     applied = record["applied"]
     applied["statement_dispositions"][0]["disposition"] = outer
-    applied["statement_dispositions"][0]["children"][0][
-        "disposition"
-    ] = first_child
+    applied["statement_dispositions"][0]["children"][0]["disposition"] = first_child
     metadata_by_label = {
         entry["label"]: entry for entry in applied["statement_pair_metadata"]
     }
@@ -1473,7 +1461,55 @@ def test_xj_scanf_guidance_activation_uses_exact_foreign_names(name):
 
 
 @pytest.mark.parametrize(
-    "name", ["free", "vscanf", "c_scanf", "__isoc99_scanf", "Scanf"]
+    ("foreign_function_names", "reference_line"),
+    [
+        (
+            ["rust_scanf", "scanf"],
+            "Foreign function references: `rust_scanf`, `scanf`",
+        ),
+        (
+            ["fscanf", "rust_fscanf"],
+            "Foreign function references: `fscanf`, `rust_fscanf`",
+        ),
+        (
+            ["rust_sscanf", "sscanf"],
+            "Foreign function references: `rust_sscanf`, `sscanf`",
+        ),
+    ],
+)
+def test_linked_scan_symbol_keeps_rust_name_and_activates_guidance(
+    foreign_function_names, reference_line
+):
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                foreign_function_names=foreign_function_names,
+            )
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    use_guidance = stage_module._uses_xj_scanf_guidance((0,), records_by_id)
+    assert use_guidance is True
+    targets = render_transformation_targets((0,), records_by_id)
+    assert [
+        line
+        for line in targets.splitlines()
+        if line.startswith("Foreign function references:")
+    ] == [reference_line]
+    rendered = render_prompt(
+        PromptRenderInput("", targets, use_xj_scanf_guidance=use_guidance)
+    )
+    assert rendered.text.count(XJ_SCANF_GUIDANCE_MARKER) == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["free", "vscanf", "c_scanf", "rust_scanf", "__isoc99_scanf", "Scanf"],
 )
 def test_xj_scanf_guidance_does_not_activate_for_other_foreign_names(name):
     records = loaded(
@@ -2443,6 +2479,51 @@ def run_fake(tmp_path, tools, client, **kwargs):
     return value, output
 
 
+def anchorless_rule_set(tmp_path):
+    path = tmp_path / "anchorless-rules.json"
+    i32 = {"kind": "primitive", "name": "i32"}
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "rules": [
+                    {
+                        "source_pattern": {
+                            "kind": "call",
+                            "callee": {
+                                "kind": "path",
+                                "value": {
+                                    "kind": "foreign_function",
+                                    "symbol": "ping",
+                                },
+                            },
+                            "arguments": [],
+                        },
+                        "target_pattern": {
+                            "kind": "literal",
+                            "value": {
+                                "kind": "integer",
+                                "value": "0",
+                                "type": "i32",
+                            },
+                        },
+                        "pointer_anchors": [],
+                        "lhs": False,
+                        "source_type": i32,
+                        "source_adjusted_type": i32,
+                        "target_type": i32,
+                        "target_adjusted_type": i32,
+                    }
+                ],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 TOOL_OPERATIONS = (
     "deps_crate cargo build",
     "release cargo build --bin crat",
@@ -2983,7 +3064,7 @@ def test_required_dependency_table_without_version_adds_minimum(
     manifest = (
         '[lib]\npath = "lib.rs"\n\n'
         "[dependencies]\n"
-        f'{name} = {{ default-features = false }}\n'
+        f"{name} = {{ default-features = false }}\n"
     )
     source_manifest = value.inputs.rust_project / "Cargo.toml"
     source_manifest.write_text(manifest, encoding="utf-8")
@@ -3130,6 +3211,7 @@ def test_applied_view_projection_is_consistent_across_tool_requests():
 
 
 def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_path):
+    rule_set = anchorless_rule_set(tmp_path)
     record = apply_rules(
         fn_record(0, "target", "target", []),
         rule_labels=[0],
@@ -3140,14 +3222,43 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
         builds=[CommandResult(0), CommandResult(0)],
         candidates=["mechanically fixed\n"],
     )
-    value, output = run_fake(tmp_path, tools, FakeClient([]))
+    value, output = run_fake(tmp_path, tools, FakeClient([]), rule_set=rule_set)
     assert output.status == "success"
+    assert json.loads(rule_set.read_text())["rules"][0]["pointer_anchors"] == []
+    skeleton = next(event for event in tools.events if event[0] == "make_skeleton")
+    assert skeleton[3] == rule_set
     replacement = next(event for event in tools.events if event[0] == "replace")
     assert replacement[2]["items"][0]["view"] == record["applied"]
     assert replacement[2]["transformation"] == record["applied"]["skeleton"]
     assert not [event for event in tools.events if event[0] == "validate"]
     assert not [event for event in tools.events if event[0] == "extract_observations"]
+    merge = next(event for event in tools.events if event[0] == "merge_observations")
+    assert merge[1] == ()
     assert (value.outputs.rust_project / "lib.rs").read_text() == "mechanically fixed\n"
+    assert output.metrics == {
+        "function_count": 1,
+        "scc_count": 1,
+        "llm_generation_calls": 0,
+        "repair_calls": 0,
+        "structural_failures": 0,
+        "compilation_failures": 0,
+        "cargo_builds": 2,
+    }
+    assert json.loads(
+        (value.outputs.artifacts_dir / "statistics.json").read_text()
+    ) == {
+        "schema_version": 1,
+        "function_scc_count": 1,
+        "llm_transformation_calls": 0,
+        "llm_repair_calls": 0,
+        "statements": {
+            "total": 1,
+            "preserve": 0,
+            "preserve_shell": 0,
+            "rule_applied": 1,
+            "transform": 0,
+        },
+    }
 
 
 def test_failed_applied_build_falls_back_once_to_baseline_with_shared_budget(tmp_path):
@@ -3248,6 +3359,7 @@ def test_statistics_count_recursive_final_views_across_all_functions(tmp_path):
 
 
 def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_path):
+    rule_set = anchorless_rule_set(tmp_path)
     first = apply_rules(
         fn_record(0, "first", "first", [1]),
         rule_labels=[0],
@@ -3261,9 +3373,10 @@ def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_p
         candidates=["bad mixed applied\n", "good whole baseline\n"],
     )
     client = FakeClient([response(), response()])
-    _, output = run_fake(tmp_path, tools, client)
+    _, output = run_fake(tmp_path, tools, client, rule_set=rule_set)
     assert output.status == "success"
     replacements = [event for event in tools.events if event[0] == "replace"]
+    assert len(replacements) == 2
     assert [item["view"] for item in replacements[0][2]["items"]] == [
         first["applied"],
         second["applied"],
@@ -3275,6 +3388,11 @@ def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_p
     assert "unsafe fn target()" in client.requests[1].messages[0].content
     assert "out0" in client.requests[1].messages[0].content
     assert "err0" in client.requests[1].messages[0].content
+    assert len(client.requests) == 2
+    assert (
+        len([event for event in tools.events if event[0] == "extract_observations"])
+        == 1
+    )
     assert output.metrics == {
         "function_count": 2,
         "scc_count": 1,
@@ -5138,6 +5256,121 @@ def test_extraction_runs_only_after_successful_build(tmp_path):
     assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
 
 
+def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_path):
+    rule_set = anchorless_rule_set(tmp_path)
+    record = fn_record(
+        0,
+        "target",
+        "target",
+        [],
+        statement_pair_metadata=[_pointer_metadata()],
+    )
+    sidecars = [
+        {
+            "schema_version": 1,
+            "statements": [
+                {
+                    "item_id": 0,
+                    "path": "target",
+                    "label": 0,
+                    "after_statement": "#[proctor(0)]\ncargo_rejected();",
+                }
+            ],
+        },
+        {
+            "schema_version": 1,
+            "statements": [
+                {
+                    "item_id": 0,
+                    "path": "target",
+                    "label": 0,
+                    "after_statement": "#[proctor(0)]\naccepted();",
+                }
+            ],
+        },
+    ]
+    accepted_observation = {
+        "producer": "accepted",
+        "source_expression": {"sentinel": "source"},
+        "target_expression": {"sentinel": "target"},
+        "pointer_anchors": [],
+    }
+
+    class AcceptedOnlyTools(FakeTools):
+        def merge_observations(self, inputs, output):
+            assert len(inputs) == 1
+            extracted = json.loads(inputs[0].read_text())
+            assert extracted == {
+                "schema_version": 1,
+                "observations": [accepted_observation],
+            }
+            super().merge_observations(inputs, output)
+
+    tools = AcceptedOnlyTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(101), CommandResult(0)],
+        validators=[INVALID, VALID, VALID],
+        candidates=["cargo rejected source\n", "accepted source\n"],
+        sidecars=sidecars,
+        observations=[{"schema_version": 1, "observations": [accepted_observation]}],
+    )
+    client = FakeClient([response(), response(), response()])
+    value, output = run_fake(
+        tmp_path,
+        tools,
+        client,
+        rule_set=rule_set,
+    )
+
+    assert output.status == "success"
+    operations = [event[0] for event in tools.events]
+    assert operations.count("validate") == 3
+    assert operations.count("replace") == 2
+    assert operations.count("cargo_build") == 3
+    assert operations.count("extract_observations") == 1
+    assert operations.index("extract_observations") > max(
+        index
+        for index, operation in enumerate(operations)
+        if operation == "cargo_build"
+    )
+    assert operations.count("merge_observations") == 1
+    published = json.loads(
+        (value.outputs.artifacts_dir / "observations.json").read_text()
+    )
+    assert published == {
+        "schema_version": 1,
+        "observations": [accepted_observation],
+    }
+    report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
+    assert "accepted();" in report
+    assert "cargo_rejected();" not in report
+    assert len(client.requests) == 3
+    assert output.metrics == {
+        "function_count": 1,
+        "scc_count": 1,
+        "llm_generation_calls": 3,
+        "repair_calls": 2,
+        "structural_failures": 1,
+        "compilation_failures": 1,
+        "cargo_builds": 3,
+    }
+    assert json.loads(
+        (value.outputs.artifacts_dir / "statistics.json").read_text()
+    ) == {
+        "schema_version": 1,
+        "function_scc_count": 1,
+        "llm_transformation_calls": 1,
+        "llm_repair_calls": 2,
+        "statements": {
+            "total": 1,
+            "preserve": 0,
+            "preserve_shell": 0,
+            "rule_applied": 0,
+            "transform": 1,
+        },
+    }
+
+
 @pytest.mark.parametrize(
     "failure",
     [StageFailure("extract failed"), "{ malformed"],
@@ -5235,6 +5468,7 @@ def test_mechanical_scc_promotes_correspondence_without_extracting(tmp_path):
 
 
 def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
+    rule_set = anchorless_rule_set(tmp_path)
     records = [
         fn_record(0, "leaf", "leaf", []),
         fn_record(1, "root", "root", [0]),
@@ -5256,12 +5490,45 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
         tmp_path,
         tools,
         FakeClient([response("leaf"), response("root")]),
+        rule_set=rule_set,
     )
     assert output.status == "success"
+    replacements = [event for event in tools.events if event[0] == "replace"]
+    assert [event[2]["items"][0]["id"] for event in replacements] == [0, 1]
+    merge = next(event for event in tools.events if event[0] == "merge_observations")
+    assert [path.name for path in merge[1]] == ["000000.json", "000001.json"]
+    assert [json.loads(path.read_text()) for path in merge[1]] == [
+        {"schema_version": 1, "observations": [leaf, leaf]},
+        {"schema_version": 1, "observations": [root0, root1]},
+    ]
     published = json.loads(
         (value.outputs.artifacts_dir / "observations.json").read_text()
     )
     assert published["observations"] == [leaf, leaf, root0, root1]
+    assert output.metrics == {
+        "function_count": 2,
+        "scc_count": 2,
+        "llm_generation_calls": 2,
+        "repair_calls": 0,
+        "structural_failures": 0,
+        "compilation_failures": 0,
+        "cargo_builds": 3,
+    }
+    assert json.loads(
+        (value.outputs.artifacts_dir / "statistics.json").read_text()
+    ) == {
+        "schema_version": 1,
+        "function_scc_count": 2,
+        "llm_transformation_calls": 2,
+        "llm_repair_calls": 0,
+        "statements": {
+            "total": 2,
+            "preserve": 0,
+            "preserve_shell": 0,
+            "rule_applied": 0,
+            "transform": 2,
+        },
+    }
 
 
 def test_malformed_sidecar_is_fatal_before_candidate_installation(tmp_path):
@@ -5502,6 +5769,78 @@ def test_nonempty_artifact_is_pretty_deterministic_and_data_only(tmp_path):
     assert not (value.outputs.rust_project / "observations.json").exists()
     assert "observations.json" not in output.logs
     assert "proctor" not in path.read_text().lower()
+
+
+def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
+    rule_set = anchorless_rule_set(tmp_path)
+    observation = {
+        "source_expression": {"sentinel": "accepted"},
+        "target_expression": {"opaque": True},
+        "pointer_anchors": [],
+    }
+    merged = '{"schema_version":1,"observations":[{"merged":true}]}\n'
+
+    class OpaqueTools(FakeTools):
+        def merge_observations(self, inputs, output):
+            self.events.append(("merge_observations", inputs, output))
+            assert len(inputs) == 1
+            raw = inputs[0].read_text()
+            assert '"pointer_anchors": []' in raw
+            assert '"sentinel": "accepted"' in raw
+            output.write_text(merged, encoding="utf-8")
+
+    tools = OpaqueTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[VALID],
+        candidates=["accepted source\n"],
+        observations=[{"schema_version": 1, "observations": [observation]}],
+    )
+    value, output = run_fake(
+        tmp_path,
+        tools,
+        FakeClient([response()]),
+        rule_set=rule_set,
+    )
+
+    assert output.status == "success"
+    assert (value.outputs.artifacts_dir / "observations.json").read_text() == merged
+    assert [event[0] for event in tools.events] == [
+        "build_tools",
+        "prepare",
+        "make_skeleton",
+        "normalize",
+        "cargo_build",
+        "validate",
+        "replace",
+        "cargo_build",
+        "extract_observations",
+        "merge_observations",
+    ]
+    assert output.metrics == {
+        "function_count": 1,
+        "scc_count": 1,
+        "llm_generation_calls": 1,
+        "repair_calls": 0,
+        "structural_failures": 0,
+        "compilation_failures": 0,
+        "cargo_builds": 2,
+    }
+    assert json.loads(
+        (value.outputs.artifacts_dir / "statistics.json").read_text()
+    ) == {
+        "schema_version": 1,
+        "function_scc_count": 1,
+        "llm_transformation_calls": 1,
+        "llm_repair_calls": 0,
+        "statements": {
+            "total": 1,
+            "preserve": 0,
+            "preserve_shell": 0,
+            "rule_applied": 0,
+            "transform": 1,
+        },
+    }
 
 
 def test_merged_observation_output_is_published_as_opaque_bytes(tmp_path):
