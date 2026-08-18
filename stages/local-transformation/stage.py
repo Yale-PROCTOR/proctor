@@ -702,7 +702,7 @@ def _load_replacement_statement_pairs(
     expected: dict[tuple[int, int], str] = {
         (item_id, label): records_by_id[item_id].path
         for item_id in members
-        for label in views_by_id[item_id].transform_labels
+        for label in views_by_id[item_id].report_labels
     }
     result: list[ReplacementStatementPair] = []
     previous: tuple[int, int] | None = None
@@ -1075,6 +1075,7 @@ def _statistics_json(state: RunState) -> str:
         "preserve_shell": 0,
         "rule_applied": 0,
         "transform": 0,
+        "mechanical": 0,
     }
 
     def count(nodes: tuple[StatementDisposition, ...]) -> None:
@@ -1106,14 +1107,17 @@ def _publish_final_outputs(
     report_path: Path,
     report: str,
     observations_path: Path | None = None,
-    observations: str | Path = '{\n  "schema_version": 1,\n  "observations": []\n}\n',
+    observations: str | Path = (
+        '{\n  "schema_version": 1,\n  "observations": [],\n'
+        '  "printf_observations": []\n}\n'
+    ),
     statistics_path: Path | None = None,
     statistics: str = (
         '{\n  "schema_version": 1,\n  "function_scc_count": 0,\n'
         '  "llm_transformation_calls": 0,\n  "llm_repair_calls": 0,\n'
         '  "statements": {\n    "total": 0,\n    "preserve": 0,\n'
         '    "preserve_shell": 0,\n    "rule_applied": 0,\n'
-        '    "transform": 0\n  }\n}\n'
+        '    "transform": 0,\n    "mechanical": 0\n  }\n}\n'
     ),
 ) -> None:
     observations_path = observations_path or report_path.with_name("observations.json")

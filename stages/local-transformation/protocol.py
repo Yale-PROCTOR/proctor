@@ -128,6 +128,14 @@ def skeleton_view_value(value: SkeletonView) -> dict[str, object]:
             {
                 "label": statement.label,
                 "before_statement": statement.before_statement,
+                "printf_template": (
+                    None
+                    if statement.printf_template is None
+                    else {
+                        "rust_format": statement.printf_template.rust_format,
+                        "argument_count": statement.printf_template.argument_count,
+                    }
+                ),
                 "pointer_variables_complete": statement.pointer_variables_complete,
                 "pointer_variables": [
                     {

@@ -234,11 +234,18 @@ class PointerVariableMetadata:
 
 
 @dataclass(frozen=True)
+class PrintfTemplateMetadata:
+    rust_format: str
+    argument_count: int
+
+
+@dataclass(frozen=True)
 class StatementPairMetadata:
     label: int
     before_statement: str
     pointer_variables_complete: bool
     pointer_variables: tuple[PointerVariableMetadata, ...]
+    printf_template: PrintfTemplateMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +273,14 @@ class SkeletonView:
             return tuple(labels)
 
         return visit(self.statement_dispositions)
+
+    @property
+    def report_labels(self) -> tuple[int, ...]:
+        return tuple(
+            node.label
+            for node in _walk_dispositions(self.statement_dispositions)
+            if node.disposition in {"transform", "mechanical"}
+        )
 
     @property
     def contains_rule_application(self) -> bool:
@@ -442,6 +457,7 @@ def _statement_pair_metadata(
         expected_statement_keys = {
             "label",
             "before_statement",
+            "printf_template",
             "pointer_variables_complete",
             "pointer_variables",
         }
@@ -458,6 +474,30 @@ def _statement_pair_metadata(
         if before_statement.endswith(("\r", "\n")):
             raise SkeletonError(
                 f"{statement_where}.before_statement must not end in a newline"
+            )
+        printf_template_value = statement["printf_template"]
+        printf_template: PrintfTemplateMetadata | None
+        if printf_template_value is None:
+            printf_template = None
+        else:
+            if not isinstance(printf_template_value, dict) or set(
+                printf_template_value
+            ) != {"rust_format", "argument_count"}:
+                raise SkeletonError(
+                    f"{statement_where}.printf_template must be null or contain exactly "
+                    "['argument_count', 'rust_format']"
+                )
+            rust_format = printf_template_value["rust_format"]
+            if not isinstance(rust_format, str):
+                raise SkeletonError(
+                    f"{statement_where}.printf_template.rust_format must be a string"
+                )
+            printf_template = PrintfTemplateMetadata(
+                rust_format=rust_format,
+                argument_count=_u32(
+                    printf_template_value["argument_count"],
+                    f"{statement_where}.printf_template.argument_count",
+                ),
             )
         complete = statement["pointer_variables_complete"]
         if not isinstance(complete, bool):
@@ -522,6 +562,7 @@ def _statement_pair_metadata(
             StatementPairMetadata(
                 label=label,
                 before_statement=before_statement,
+                printf_template=printf_template,
                 pointer_variables_complete=complete,
                 pointer_variables=tuple(variables),
             )
@@ -566,18 +607,19 @@ def _statement_dispositions(
                 "preserve_shell",
                 "transform",
                 "rule_applied",
+                "mechanical",
             }:
                 raise SkeletonError(
                     f"{item_where}.disposition must be 'preserve', "
-                    "'preserve_shell', 'transform', or 'rule_applied'"
+                    "'preserve_shell', 'transform', 'rule_applied', or 'mechanical'"
                 )
             children = load_nodes(item["children"], f"{item_where}.children")
-            if disposition == "preserve" and any(
+            if disposition in {"preserve", "mechanical"} and any(
                 descendant.disposition != "preserve"
                 for descendant in _walk_dispositions(children)
             ):
                 raise SkeletonError(
-                    f"{item_where} preserve node has a non-preserve descendant"
+                    f"{item_where} {disposition} node has a non-preserve descendant"
                 )
             result.append(
                 StatementDisposition(
@@ -638,15 +680,21 @@ def _load_skeleton_view(value: Any, record_id: int, view_name: str) -> SkeletonV
     metadata = _statement_pair_metadata(
         value["statement_pair_metadata"],
         record_id,
-        transform_labels,
+        tuple(
+            node.label
+            for node in _walk_dispositions(dispositions)
+            if node.disposition in {"transform", "mechanical"}
+        ),
         field=f"{view_name}.statement_pair_metadata",
     )
-    return SkeletonView(
+    view = SkeletonView(
         skeleton=skeleton,
         needs_transformation=needs,
         statement_dispositions=dispositions,
         statement_pair_metadata=metadata,
     )
+    _validate_printf_template_metadata(record_id, view_name, view)
+    return view
 
 
 def _view_topology(view: SkeletonView) -> tuple[tuple[int, tuple[int, ...]], ...]:
@@ -664,12 +712,162 @@ class _SkeletonStatementShape:
     declaration: tuple[str, ...]
     control: tuple[Any, ...]
     child_slots: tuple[tuple[int, str], ...]
+    payload: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class _SkeletonShape:
     signature: tuple[str, ...]
     statements: tuple[_SkeletonStatementShape, ...]
+
+
+def _decode_canonical_rust_string(token: str, where: str) -> str:
+    if len(token) < 2 or token[0] != '"' or token[-1] != '"':
+        raise SkeletonError(f"{where} format must be one ordinary Rust string literal")
+    result: list[str] = []
+    value = token[1:-1]
+    index = 0
+    simple = {
+        '"': '"',
+        "'": "'",
+        "\\": "\\",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "0": "\0",
+    }
+    while index < len(value):
+        character = value[index]
+        if character != "\\":
+            if character in "\r\n":
+                raise SkeletonError(f"{where} format literal is not canonical")
+            result.append(character)
+            index += 1
+            continue
+        index += 1
+        if index >= len(value):
+            raise SkeletonError(f"{where} format literal has an incomplete escape")
+        escape = value[index]
+        if escape in simple:
+            result.append(simple[escape])
+            index += 1
+            continue
+        if escape == "x" and index + 2 < len(value):
+            digits = value[index + 1 : index + 3]
+            try:
+                result.append(chr(int(digits, 16)))
+            except ValueError as error:
+                raise SkeletonError(
+                    f"{where} format literal has an invalid byte escape"
+                ) from error
+            index += 3
+            continue
+        if escape == "u" and index + 1 < len(value) and value[index + 1] == "{":
+            close = value.find("}", index + 2)
+            if close == -1:
+                raise SkeletonError(
+                    f"{where} format literal has an incomplete Unicode escape"
+                )
+            digits = value[index + 2 : close].replace("_", "")
+            try:
+                codepoint = int(digits, 16)
+                if not digits or codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                    raise ValueError
+                result.append(chr(codepoint))
+            except ValueError as error:
+                raise SkeletonError(
+                    f"{where} format literal has an invalid Unicode escape"
+                ) from error
+            index = close + 1
+            continue
+        raise SkeletonError(f"{where} format literal has an unsupported escape")
+    return "".join(result)
+
+
+def _implicit_format_argument_count(value: str) -> int | None:
+    index = 0
+    count = 0
+    while index < len(value):
+        if value.startswith("{{", index) or value.startswith("}}", index):
+            index += 2
+        elif value[index] == "{":
+            close = value.find("}", index + 1)
+            if close == -1:
+                return None
+            field = value[index + 1 : close]
+            if field and not field.startswith(":"):
+                return None
+            count += 1
+            index = close + 1
+        elif value[index] == "}":
+            return None
+        else:
+            index += 1
+    return count
+
+
+def _printf_template_payload(
+    payload: tuple[str, ...], where: str
+) -> tuple[str, int] | None:
+    prefix = ("::", "std", "::", "print", "!", "(")
+    if len(payload) < 9 or payload[:6] != prefix or payload[-2:] != (")", ";"):
+        return None
+    body = payload[6:-2]
+    rust_format = _decode_canonical_rust_string(body[0], where)
+    remaining = body[1:]
+    count = 0
+    while remaining:
+        if len(remaining) < 5 or remaining[:5] != (",", "todo", "!", "(", ")"):
+            raise SkeletonError(
+                f"{where} value arguments must be exact todo!() placeholders"
+            )
+        count += 1
+        remaining = remaining[5:]
+    return rust_format, count
+
+
+def _validate_printf_template_metadata(
+    record_id: int, view_name: str, view: SkeletonView
+) -> None:
+    shape = _skeleton_shape(view.skeleton, record_id, view_name)
+    dispositions = {
+        node.label: node.disposition
+        for node in _walk_dispositions(view.statement_dispositions)
+    }
+    shapes = {statement.label: statement for statement in shape.statements}
+    for metadata in view.statement_pair_metadata:
+        where = f"record {record_id} {view_name} printf template label {metadata.label}"
+        statement = shapes.get(metadata.label)
+        if statement is None:
+            raise SkeletonError(
+                f"record {record_id} {view_name} skeleton labels do not match its "
+                "disposition topology"
+            )
+        looks_like_print = statement.payload[:6] == (
+            "::",
+            "std",
+            "::",
+            "print",
+            "!",
+            "(",
+        )
+        if metadata.printf_template is None:
+            if looks_like_print:
+                raise SkeletonError(f"{where} has no trusted printf metadata")
+            continue
+        parsed = _printf_template_payload(statement.payload, where)
+        if parsed is None:
+            raise SkeletonError(f"{where} is not one canonical print template")
+        rust_format, argument_count = parsed
+        if (
+            rust_format != metadata.printf_template.rust_format
+            or argument_count != metadata.printf_template.argument_count
+            or _implicit_format_argument_count(rust_format) != argument_count
+        ):
+            raise SkeletonError(f"{where} contradicts its trusted metadata")
+        disposition = dispositions[metadata.label]
+        if (disposition == "mechanical") != (argument_count == 0):
+            raise SkeletonError(f"{where} argument count contradicts its disposition")
 
 
 _RUST_MULTI_PUNCTUATION = (
@@ -1082,6 +1280,7 @@ def _skeleton_shape(skeleton: str, record_id: int, view_name: str) -> _SkeletonS
             int,
             int,
             int,
+            int,
             str,
             tuple[str, ...],
             tuple[tuple[str, int, int], ...],
@@ -1096,13 +1295,13 @@ def _skeleton_shape(skeleton: str, record_id: int, view_name: str) -> _SkeletonS
         end, root, declaration, slots = _statement_end(
             tokens, start, statement_limit, f"{where} label {label}"
         )
-        intervals.append((label, marker_index, end, root, declaration, slots))
+        intervals.append((label, marker_index, start, end, root, declaration, slots))
 
     parent_by_label: dict[int, int | None] = {}
-    for label, marker_index, _, _, _, _ in intervals:
+    for label, marker_index, _, _, _, _, _ in intervals:
         containers = [
             (other_label, other_marker)
-            for other_label, other_marker, other_end, _, _, _ in intervals
+            for other_label, other_marker, _, other_end, _, _, _ in intervals
             if other_marker < marker_index < other_end
         ]
         parent_by_label[label] = (
@@ -1110,11 +1309,11 @@ def _skeleton_shape(skeleton: str, record_id: int, view_name: str) -> _SkeletonS
         )
 
     statements: list[_SkeletonStatementShape] = []
-    for label, marker_index, end, root, declaration, slots in intervals:
+    for label, marker_index, start, end, root, declaration, slots in intervals:
         parent = parent_by_label[label]
         direct_children = [
             (child_label, child_marker)
-            for child_label, child_marker, _, _, _, _ in intervals
+            for child_label, child_marker, _, _, _, _, _ in intervals
             if parent_by_label[child_label] == label
         ]
         child_slots: list[tuple[int, str]] = []
@@ -1146,6 +1345,7 @@ def _skeleton_shape(skeleton: str, record_id: int, view_name: str) -> _SkeletonS
                 declaration=declaration,
                 control=control,
                 child_slots=tuple(child_slots),
+                payload=tokens[start:end],
             )
         )
     return _SkeletonShape(signature=tokens[:body_open], statements=tuple(statements))
@@ -1202,6 +1402,10 @@ def _validate_cross_view_invariants(
                 f"record {record_id} applied view changes preserved-shell label "
                 f"{before.label}"
             )
+        if (before.disposition == "mechanical") != (after.disposition == "mechanical"):
+            raise SkeletonError(
+                f"record {record_id} applied view changes mechanical label {before.label}"
+            )
         if after.disposition == "rule_applied" and before.disposition != "transform":
             raise SkeletonError(
                 f"record {record_id} rule-applied label {after.label} was not transformable"
@@ -1209,16 +1413,70 @@ def _validate_cross_view_invariants(
         if before.disposition == "transform" and after.disposition in {
             "preserve",
             "preserve_shell",
+            "mechanical",
         }:
             raise SkeletonError(
                 f"record {record_id} applied view preserves transformable label "
                 f"{after.label}"
             )
+        if before.disposition == "transform" and after.disposition == "transform":
+            baseline_template = next(
+                metadata.printf_template
+                for metadata in baseline.statement_pair_metadata
+                if metadata.label == before.label
+            )
+            applied_template = next(
+                metadata.printf_template
+                for metadata in applied.statement_pair_metadata
+                if metadata.label == after.label
+            )
+            if baseline_template != applied_template:
+                raise SkeletonError(
+                    f"record {record_id} printf metadata differs between skeleton views "
+                    f"at label {before.label}"
+                )
     if baseline_shape.signature != applied_shape.signature:
         raise SkeletonError(f"record {record_id} baseline/applied signatures differ")
     for before_shape, after_shape in zip(
         baseline_shape.statements, applied_shape.statements, strict=True
     ):
+        disposition = next(
+            node.disposition
+            for node in baseline_nodes
+            if node.label == before_shape.label
+        )
+        if disposition == "mechanical":
+            if before_shape.payload != after_shape.payload:
+                raise SkeletonError(
+                    f"record {record_id} mechanical label {before_shape.label} "
+                    "differs between skeleton views"
+                )
+            payload = before_shape.payload
+            if (
+                len(payload) != 9
+                or payload[:6] != ("::", "std", "::", "print", "!", "(")
+                or not payload[6].startswith('"')
+                or payload[7:] != (")", ";")
+            ):
+                raise SkeletonError(
+                    f"record {record_id} mechanical label {before_shape.label} "
+                    "is not one canonical zero-argument print statement"
+                )
+            baseline_metadata = next(
+                metadata
+                for metadata in baseline.statement_pair_metadata
+                if metadata.label == before_shape.label
+            )
+            applied_metadata = next(
+                metadata
+                for metadata in applied.statement_pair_metadata
+                if metadata.label == before_shape.label
+            )
+            if baseline_metadata != applied_metadata:
+                raise SkeletonError(
+                    f"record {record_id} mechanical label {before_shape.label} "
+                    "has different report metadata between skeleton views"
+                )
         if (
             before_shape.root != after_shape.root
             or before_shape.control != after_shape.control
