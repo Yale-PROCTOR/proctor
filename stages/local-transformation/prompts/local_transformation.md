@@ -2,7 +2,7 @@
 id = "local_transformation"
 version = 1
 description = "Transform one Rust function SCC against Crat skeletons."
-variables = ["dependency_context", "transformation_targets", "repair_context", "use_xj_scanf_guidance"]
+variables = ["dependency_context", "transformation_targets", "repair_context", "use_xj_scanf_guidance", "libc_guidance"]
 +++
 You are transforming unsafe Rust functions generated from C.
 
@@ -110,7 +110,9 @@ Requirements:
 
     ```rust
     xj_scanf::legacy::bscanf(input, "%d %f", &mut [&mut x, &mut y])
-    ```{% endif %}
+    ```{% endif %}{% if libc_guidance %}
+
+    {{ libc_guidance | replace('\n', '\n    ') }}{% endif %}
 11. When casting between references or slices, avoid unsafe code by using these
     `bytemuck` functions whenever they preserve behavior for inputs on which
     the source behavior is defined:

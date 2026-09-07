@@ -15,6 +15,7 @@ from typing import Any, Literal, cast
 
 import tomli_w
 
+from libc_guidance import render_libc_guidance
 from model import (
     ContextOverflow,
     CallableCorrespondence,
@@ -134,6 +135,16 @@ def _uses_xj_scanf_guidance(
 ) -> bool:
     return any(
         name in XJ_SCANF_FOREIGN_FUNCTION_NAMES
+        for item_id in members
+        for name in records_by_id[item_id].foreign_function_names
+    )
+
+
+def _libc_guidance(
+    members: tuple[int, ...], records_by_id: dict[int, ItemRecord]
+) -> str:
+    return render_libc_guidance(
+        name
         for item_id in members
         for name in records_by_id[item_id].foreign_function_names
     )
@@ -1296,6 +1307,7 @@ def _process_scc(
         raise StageFailure(f"duplicate function names inside SCC: {detail}")
 
     use_xj_scanf_guidance = _uses_xj_scanf_guidance(members, records_by_id)
+    libc_guidance = _libc_guidance(members, records_by_id)
     context: str | None = None
     applied_views = {
         item_id: cast(SkeletonView, records_by_id[item_id].applied)
@@ -1331,6 +1343,7 @@ def _process_scc(
                     failed_transformation=latest_failed,
                     diagnostics=latest_diagnostics,
                     use_xj_scanf_guidance=use_xj_scanf_guidance,
+                    libc_guidance=libc_guidance,
                 )
             )
             request = llm_request(rendered, run_id=stage_input.run_id, members=members)

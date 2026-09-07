@@ -56,6 +56,11 @@ from protocol import (
     validate_command,
     validation_request,
 )
+from libc_guidance import (
+    LIBC_FOREIGN_FUNCTION_NAMES,
+    LIBC_GUIDANCE,
+    render_libc_guidance,
+)
 import stage as stage_module
 from stage import (
     AcceptedStatementPair,
@@ -82,6 +87,52 @@ PROMPT_GOLDEN = (
 )
 XJ_SCANF_GUIDANCE_MARKER = (
     "When a listed foreign reference is `scanf`, `fscanf`, or `sscanf`"
+)
+LIBC_GUIDANCE_MARKER = "The following `proctor_libc` equivalents are available."
+
+LIBC_ACTIVATORS = (
+    ("fgetc", "fgetc"),
+    ("getc", "fgetc"),
+    ("fgets", "fgets"),
+    ("fputc", "fputc"),
+    ("putc", "fputc"),
+    ("fputs", "fputs"),
+    ("fread", "fread"),
+    ("fseek", "fseek"),
+    ("ftell", "ftell"),
+    ("fwrite", "fwrite"),
+    ("getchar", "getchar"),
+    ("putchar", "putchar"),
+    ("puts", "puts"),
+    ("remove", "remove"),
+    ("rename", "rename"),
+    ("rewind", "rewind"),
+    ("atof", "atof"),
+    ("atoi", "atoi"),
+    ("atol", "atol"),
+    ("strtod", "strtod"),
+    ("strtof", "strtof"),
+    ("strtol", "strtol"),
+    ("strtold", "strtold"),
+    ("strtoul", "strtoul"),
+    ("memchr", "memchr"),
+    ("memcmp", "memcmp"),
+    ("strcat", "strcat"),
+    ("strchr", "strchr"),
+    ("strcmp", "strcmp"),
+    ("strcpy", "strcpy"),
+    ("strcspn", "strcspn"),
+    ("strdup", "strdup"),
+    ("strlen", "strlen"),
+    ("strncat", "strncat"),
+    ("strncmp", "strncmp"),
+    ("strncpy", "strncpy"),
+    ("strndup", "strndup"),
+    ("strrchr", "strrchr"),
+    ("strspn", "strspn"),
+    ("strstr", "strstr"),
+    ("strcasecmp", "strcasecmp"),
+    ("strncasecmp", "strncasecmp"),
 )
 
 _load_and_validate_replacement_metadata_impl = _load_and_validate_replacement_metadata
@@ -1600,6 +1651,209 @@ def test_repair_prompt_contains_only_latest_failure():
         PromptRenderInput("D", "T", "second bad code", "second diagnostics")
     )
     assert "second bad code" in rendered.text and "first bad code" not in rendered.text
+
+
+def test_libc_guidance_catalog_has_all_activators_and_reference_signatures():
+    assert len(LIBC_GUIDANCE) == 40
+    assert LIBC_FOREIGN_FUNCTION_NAMES == frozenset(
+        name for name, _replacement in LIBC_ACTIVATORS
+    )
+    assert sum(len(entry.references) for entry in LIBC_GUIDANCE) == 44
+    assert all(
+        reference.documentation and reference.signature.endswith(";")
+        for entry in LIBC_GUIDANCE
+        for reference in entry.references
+    )
+
+
+@pytest.mark.parametrize(("foreign_name", "replacement"), LIBC_ACTIVATORS)
+def test_libc_guidance_activation_uses_exact_foreign_names(foreign_name, replacement):
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                foreign_function_names=[foreign_name],
+            )
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    guidance = stage_module._libc_guidance((0,), records_by_id)
+
+    assert guidance.count(LIBC_GUIDANCE_MARKER) == 1
+    assert guidance.count(f"`proctor_libc::{replacement}`") == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "free",
+        "memchr_mut",
+        "strstr_mut",
+        "vstrlen",
+        "rust_strlen",
+        "__builtin_strlen",
+        "Strlen",
+    ],
+)
+def test_libc_guidance_does_not_activate_for_other_foreign_names(name):
+    records = loaded(
+        [fn_record(0, "target", "target", [], foreign_function_names=[name])]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    assert stage_module._libc_guidance((0,), records_by_id) == ""
+
+
+def test_linked_libc_symbol_keeps_rust_name_and_activates_guidance():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                foreign_function_names=["rust_strlen", "strlen"],
+            )
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    targets = render_transformation_targets((0,), records_by_id)
+    guidance = stage_module._libc_guidance((0,), records_by_id)
+    rendered = render_prompt(PromptRenderInput("", targets, libc_guidance=guidance))
+
+    assert "Foreign function references: `rust_strlen`, `strlen`" in targets
+    assert rendered.text.count(LIBC_GUIDANCE_MARKER) == 1
+    assert rendered.text.count("`proctor_libc::strlen`") == 1
+
+
+def test_libc_guidance_ignores_nonmember_metadata():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "member",
+                "member",
+                [1],
+                foreign_function_names=["free"],
+            ),
+            fn_record(
+                1,
+                "dependency",
+                "dependency",
+                [],
+                foreign_function_names=["strlen"],
+            ),
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    assert stage_module._libc_guidance((0,), records_by_id) == ""
+
+
+def test_libc_guidance_order_and_deduplication_are_catalog_driven():
+    forward = render_libc_guidance(["strlen", "getc", "strlen", "fgetc"])
+    reverse = render_libc_guidance(["fgetc", "strlen", "getc", "strlen"])
+
+    assert forward == reverse
+    assert forward.count("`proctor_libc::fgetc`") == 1
+    assert forward.count("`proctor_libc::strlen`") == 1
+    assert forward.index("`proctor_libc::fgetc`") < forward.index(
+        "`proctor_libc::strlen`"
+    )
+
+
+@pytest.mark.parametrize(
+    ("foreign_names", "replacement"),
+    [(["fgetc", "getc", "getc"], "fgetc"), (["fputc", "putc", "putc"], "fputc")],
+)
+def test_libc_guidance_coalesces_stdio_aliases(foreign_names, replacement):
+    guidance = render_libc_guidance(foreign_names)
+
+    assert guidance.count(f"`proctor_libc::{replacement}`") == 1
+    assert guidance.count("```rust") == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "foreign_name",
+        "immutable_documentation",
+        "immutable_signature",
+        "mutable_documentation",
+        "mutable_signature",
+    ),
+    [
+        (
+            "memchr",
+            "Finds `c`, converted to `u8`, in `buf` and returns its suffix, or `None` if not found.",
+            "pub fn memchr(buf: &[u8], c: i32) -> Option<&[u8]>;",
+            "Finds `c`, converted to `u8`, in `buf` and returns its mutable suffix, or `None` if not found.",
+            "pub fn memchr_mut(buf: &mut [u8], c: i32) -> Option<&mut [u8]>;",
+        ),
+        (
+            "strchr",
+            "Finds `c`, converted to `i8`, in null-terminated `s` and returns its suffix, or `None` if not found.",
+            "pub fn strchr(s: &[i8], c: i32) -> Option<&[i8]>;",
+            "Finds `c`, converted to `i8`, in null-terminated `s` and returns its mutable suffix, or `None` if not found.",
+            "pub fn strchr_mut(s: &mut [i8], c: i32) -> Option<&mut [i8]>;",
+        ),
+        (
+            "strrchr",
+            "Finds the last `c`, converted to `i8`, in null-terminated `s` and returns its suffix, or `None` if not found.",
+            "pub fn strrchr(s: &[i8], c: i32) -> Option<&[i8]>;",
+            "Finds the last `c`, converted to `i8`, in null-terminated `s` and returns its mutable suffix, or `None` if not found.",
+            "pub fn strrchr_mut(s: &mut [i8], c: i32) -> Option<&mut [i8]>;",
+        ),
+        (
+            "strstr",
+            "Finds null-terminated `s2` in null-terminated `s1` and returns its suffix, or `None` if not found.",
+            "pub fn strstr<'s>(s1: &'s [i8], s2: &[i8]) -> Option<&'s [i8]>;",
+            "Finds null-terminated `s2` in null-terminated `s1` and returns its mutable suffix, or `None` if not found.",
+            "pub fn strstr_mut<'s>(s1: &'s mut [i8], s2: &[i8]) -> Option<&'s mut [i8]>;",
+        ),
+    ],
+)
+def test_libc_guidance_shows_both_const_and_mutable_references(
+    foreign_name,
+    immutable_documentation,
+    immutable_signature,
+    mutable_documentation,
+    mutable_signature,
+):
+    guidance = render_libc_guidance([foreign_name])
+
+    assert guidance.count("```rust") == 2
+    assert (
+        f"`proctor_libc::{foreign_name}` or `proctor_libc::{foreign_name}_mut`"
+        in guidance
+    )
+    for expected in (
+        immutable_documentation,
+        immutable_signature,
+        mutable_documentation,
+        mutable_signature,
+    ):
+        assert expected in guidance
+
+
+def test_active_libc_guidance_is_reference_only_and_fully_qualified():
+    guidance = render_libc_guidance(["fgets"])
+    rendered = render_prompt(PromptRenderInput("", "TARGETS", libc_guidance=guidance))
+
+    assert rendered.id == "local_transformation" and rendered.version == 1
+    assert rendered.text.count(LIBC_GUIDANCE_MARKER) == 1
+    assert "`proctor_libc::fgets`" in rendered.text
+    assert "signatures are reference material only" in rendered.text
+    assert "do not define or import any item" in rendered.text
+    assert "Call each function through its fully qualified path" in rendered.text
+    assert not any(
+        line.strip().startswith("use proctor_libc")
+        for line in rendered.text.splitlines()
+    )
 
 
 @pytest.mark.parametrize("name", ["scanf", "fscanf", "sscanf"])
@@ -4336,6 +4590,54 @@ def test_xj_scanf_guidance_is_consistent_across_initial_and_repair_prompts(tmp_p
     assert (
         "The previous transformation failed." in client.requests[1].messages[0].content
     )
+
+
+def test_libc_guidance_is_consistent_across_repair_and_rule_fallback_prompts(
+    tmp_path,
+):
+    record = apply_rules(
+        fn_record(
+            0,
+            "target",
+            "target",
+            [],
+            foreign_function_names=["strlen"],
+            transformation_labels=[0, 1],
+        ),
+        rule_labels=[0],
+        transform_labels=[1],
+    )
+    tools = FakeTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(101, "out", "err"), CommandResult(0)],
+        validators=[INVALID, VALID, VALID],
+        candidates=["bad applied\n", "good baseline\n"],
+    )
+    client = FakeClient([response(), response(), response()])
+
+    _, output = run_fake(tmp_path, tools, client)
+
+    assert output.status == "success"
+    assert len(client.requests) == 3
+    for request in client.requests:
+        text = request.messages[0].content
+        assert text.count(LIBC_GUIDANCE_MARKER) == 1
+        assert text.count("`proctor_libc::strlen`") == 1
+        assert request.metadata.prompt_version == 1
+    assert (
+        "The previous transformation failed."
+        not in client.requests[0].messages[0].content
+    )
+    assert all(
+        "The previous transformation failed." in request.messages[0].content
+        for request in client.requests[1:]
+    )
+    validations = [event for event in tools.events if event[0] == "validate"]
+    assert [entry[1]["expected_functions"][0]["view"] for entry in validations] == [
+        record["applied"],
+        record["applied"],
+        record["baseline"],
+    ]
 
 
 def test_missing_fence_consumes_repair_without_validator_call(tmp_path):
