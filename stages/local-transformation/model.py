@@ -307,6 +307,7 @@ class ItemRecord:
     source_signature: str | None = None
     target_signature: str | None = None
     foreign_function_names: tuple[str, ...] = ()
+    foreign_static_names: tuple[str, ...] = ()
     declaration: str | None = None
     definition: str | None = None
 
@@ -365,31 +366,26 @@ def _dependencies(data: dict[str, Any], key: str, record_id: int) -> tuple[int, 
     return result
 
 
-def _foreign_function_names(data: dict[str, Any], record_id: int) -> tuple[str, ...]:
-    value = data.get("foreign_function_names")
+def _foreign_names(data: dict[str, Any], key: str, record_id: int) -> tuple[str, ...]:
+    value = data.get(key)
     if not isinstance(value, list):
-        raise SkeletonError(
-            f"record {record_id} field 'foreign_function_names' must be an array"
-        )
+        raise SkeletonError(f"record {record_id} field {key!r} must be an array")
     result: list[str] = []
     for item in value:
         if not isinstance(item, str):
             raise SkeletonError(
-                f"record {record_id} field 'foreign_function_names' entries "
-                "must be strings"
+                f"record {record_id} field {key!r} entries must be strings"
             )
         if not item:
             raise SkeletonError(
-                f"record {record_id} field 'foreign_function_names' entries "
-                "must not be empty"
+                f"record {record_id} field {key!r} entries must not be empty"
             )
         result.append(item)
     for previous, current in pairwise(result):
         if current <= previous:
             detail = "duplicate" if current == previous else "out-of-order"
             raise SkeletonError(
-                f"record {record_id} field 'foreign_function_names' has {detail} "
-                f"name {current!r}"
+                f"record {record_id} field {key!r} has {detail} name {current!r}"
             )
     return tuple(result)
 
@@ -1517,6 +1513,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             "source_signature",
             "target_signature",
             "foreign_function_names",
+            "foreign_static_names",
             "signature_dependencies",
             "dependencies",
         }
@@ -1541,7 +1538,12 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             applied=applied,
             source_signature=_string(data, "source_signature", record_id),
             target_signature=_string(data, "target_signature", record_id),
-            foreign_function_names=_foreign_function_names(data, record_id),
+            foreign_function_names=_foreign_names(
+                data, "foreign_function_names", record_id
+            ),
+            foreign_static_names=_foreign_names(
+                data, "foreign_static_names", record_id
+            ),
             signature_dependencies=signature_dependencies,
             dependencies=dependencies,
         )
@@ -1730,6 +1732,9 @@ def render_transformation_targets(
         if record.foreign_function_names:
             names = ", ".join(f"`{name}`" for name in record.foreign_function_names)
             foreign_references = f"Foreign function references: {names}\n\n"
+        if record.foreign_static_names:
+            names = ", ".join(f"`{name}`" for name in record.foreign_static_names)
+            foreign_references += f"Foreign static references: {names}\n\n"
         entries.append(
             f"### Function `{record.name}`\n\n"
             f"{foreign_references}"

@@ -74,6 +74,11 @@ REQUIRED_CRATES_IO_DEPENDENCIES = (
 )
 NON_REGISTRY_DEPENDENCY_KEYS = {"git", "path", "workspace"}
 XJ_SCANF_FOREIGN_FUNCTION_NAMES = frozenset({"scanf", "fscanf", "sscanf"})
+FOREIGN_STATIC_IO_REPLACEMENTS = (
+    ("stdout", "std::io::stdout()"),
+    ("stderr", "std::io::stderr()"),
+    ("stdin", "std::io::stdin()"),
+)
 
 
 @dataclass
@@ -148,6 +153,39 @@ def _libc_guidance(
         for item_id in members
         for name in records_by_id[item_id].foreign_function_names
     )
+
+
+def _foreign_static_guidance(
+    members: tuple[int, ...], records_by_id: dict[int, ItemRecord]
+) -> str:
+    names = {
+        name
+        for item_id in members
+        for name in records_by_id[item_id].foreign_static_names
+    }
+    replacements = [
+        (name, replacement)
+        for name, replacement in FOREIGN_STATIC_IO_REPLACEMENTS
+        if name in names
+    ]
+    if not replacements:
+        return ""
+    mappings = "; ".join(
+        f"replace `{name}` with fully qualified `{replacement}`"
+        for name, replacement in replacements
+    )
+    guidance = (
+        "For each listed foreign-static reference named below, preserve the "
+        "foreign static unless converting that use to Rust I/O. When converting "
+        f"it, {mappings}."
+    )
+    if "stdin" in names:
+        guidance += (
+            " `Stdin` itself does not implement `BufRead`, so use "
+            "`std::io::stdin().lock()` instead only when the chosen Rust I/O "
+            "function requires a `BufRead` stream."
+        )
+    return guidance
 
 
 def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]:
@@ -1308,6 +1346,7 @@ def _process_scc(
 
     use_xj_scanf_guidance = _uses_xj_scanf_guidance(members, records_by_id)
     libc_guidance = _libc_guidance(members, records_by_id)
+    foreign_static_guidance = _foreign_static_guidance(members, records_by_id)
     context: str | None = None
     applied_views = {
         item_id: cast(SkeletonView, records_by_id[item_id].applied)
@@ -1344,6 +1383,7 @@ def _process_scc(
                     diagnostics=latest_diagnostics,
                     use_xj_scanf_guidance=use_xj_scanf_guidance,
                     libc_guidance=libc_guidance,
+                    foreign_static_guidance=foreign_static_guidance,
                 )
             )
             request = llm_request(rendered, run_id=stage_input.run_id, members=members)

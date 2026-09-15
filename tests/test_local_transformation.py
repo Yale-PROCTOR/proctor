@@ -89,6 +89,9 @@ XJ_SCANF_GUIDANCE_MARKER = (
     "When a listed foreign reference is `scanf`, `fscanf`, or `sscanf`"
 )
 LIBC_GUIDANCE_MARKER = "The following `proctor_libc` equivalents are available."
+FOREIGN_STATIC_GUIDANCE_MARKER = (
+    "preserve the foreign static unless converting that use to Rust I/O"
+)
 
 LIBC_ACTIVATORS = (
     ("fgetc", "fgetc"),
@@ -180,6 +183,7 @@ def fn_record(
     transformation_labels: list[int] | None = None,
     statement_pair_metadata: list[dict[str, object]] | None = None,
     foreign_function_names: list[str] | None = None,
+    foreign_static_names: list[str] | None = None,
 ) -> dict[str, object]:
     labels = (
         ([0] if needs_transformation else [])
@@ -232,6 +236,9 @@ def fn_record(
         "target_signature": f"unsafe fn {name}()",
         "foreign_function_names": (
             [] if foreign_function_names is None else foreign_function_names
+        ),
+        "foreign_static_names": (
+            [] if foreign_static_names is None else foreign_static_names
         ),
         "signature_dependencies": (
             [] if signature_dependencies is None else signature_dependencies
@@ -1244,30 +1251,37 @@ def test_function_records_and_python_helpers_add_statement_pair_metadata():
         "source_signature",
         "target_signature",
         "foreign_function_names",
+        "foreign_static_names",
         "signature_dependencies",
         "dependencies",
     ]
     assert plain["baseline"]["statement_pair_metadata"]
     assert plain["foreign_function_names"] == []
+    assert plain["foreign_static_names"] == []
     assert scalar_records()[0].foreign_function_names == ()
+    assert scalar_records()[0].foreign_static_names == ()
     assert foreign_function_records()[1].foreign_function_names == ("free", "strlen")
 
     point = type_record(1, "Point", "Struct", "struct Point;", [])
     assert "foreign_function_names" not in point
+    assert "foreign_static_names" not in point
     assert item_kind_records()[0].foreign_function_names == ()
+    assert item_kind_records()[0].foreign_static_names == ()
 
 
-def test_loader_requires_sorted_unique_nonempty_foreign_names():
+@pytest.mark.parametrize(
+    ("field", "attribute"),
+    [
+        ("foreign_function_names", "foreign_function_names"),
+        ("foreign_static_names", "foreign_static_names"),
+    ],
+)
+def test_loader_requires_sorted_unique_nonempty_foreign_names(field, attribute):
     plain = fn_record(0, "scalar", "scalar", [])
-    foreign = fn_record(
-        0,
-        "parser::scan",
-        "scan",
-        [],
-        foreign_function_names=["free", "strlen"],
-    )
-    assert loaded([plain])[0].foreign_function_names == ()
-    assert loaded([foreign])[0].foreign_function_names == ("free", "strlen")
+    foreign = fn_record(0, "parser::scan", "scan", [])
+    foreign[field] = ["free", "strlen"]
+    assert getattr(loaded([plain])[0], attribute) == ()
+    assert getattr(loaded([foreign])[0], attribute) == ("free", "strlen")
 
     malformed_values = (
         None,
@@ -1280,15 +1294,17 @@ def test_loader_requires_sorted_unique_nonempty_foreign_names():
     for value in malformed_values:
         malformed = copy.deepcopy(foreign)
         if value is None:
-            del malformed["foreign_function_names"]
+            del malformed[field]
         else:
-            malformed["foreign_function_names"] = value
+            malformed[field] = value
         with pytest.raises(SkeletonError):
             loaded([malformed])
 
     non_function = type_record(1, "Point", "Struct", "struct Point;", [])
     assert "foreign_function_names" not in non_function
+    assert "foreign_static_names" not in non_function
     assert loaded([non_function])[0].foreign_function_names == ()
+    assert loaded([non_function])[0].foreign_static_names == ()
 
 
 def test_ids_and_same_namespace_paths_are_valid_and_unique():
@@ -1574,6 +1590,29 @@ def test_targets_use_final_names_and_omit_empty_foreign_line():
     assert text == "\n\n".join(entries)
 
 
+def test_targets_render_foreign_functions_and_statics_as_distinct_lines():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                foreign_function_names=["fputs"],
+                foreign_static_names=["rust_stdout", "stdout"],
+            )
+        ]
+    )
+
+    text = render_transformation_targets((0,), {0: records[0]})
+
+    assert (
+        "Foreign function references: `fputs`\n\n"
+        "Foreign static references: `rust_stdout`, `stdout`\n\n"
+        "Source:"
+    ) in text
+
+
 def test_noncolliding_dependencies_use_kind_and_final_name():
     records = {record.id: record for record in item_kind_records()}
     text, selected = dependency_context((4,), records)
@@ -1729,6 +1768,86 @@ def test_linked_libc_symbol_keeps_rust_name_and_activates_guidance():
     assert "Foreign function references: `rust_strlen`, `strlen`" in targets
     assert rendered.text.count(LIBC_GUIDANCE_MARKER) == 1
     assert rendered.text.count("`proctor_libc::strlen`") == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement", "uses_lock_guidance"),
+    [
+        ("stdout", "std::io::stdout()", False),
+        ("stderr", "std::io::stderr()", False),
+        ("stdin", "std::io::stdin()", True),
+    ],
+)
+def test_foreign_static_guidance_uses_exact_names(
+    name, replacement, uses_lock_guidance
+):
+    records = loaded(
+        [fn_record(0, "target", "target", [], foreign_static_names=[name])]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    guidance = stage_module._foreign_static_guidance((0,), records_by_id)
+    rendered = render_prompt(
+        PromptRenderInput("", "TARGETS", foreign_static_guidance=guidance)
+    )
+
+    assert rendered.text.count(FOREIGN_STATIC_GUIDANCE_MARKER) == 1
+    assert f"replace `{name}` with fully qualified `{replacement}`" in rendered.text
+    assert ("`std::io::stdin().lock()`" in rendered.text) is uses_lock_guidance
+    assert ("does not implement `BufRead`" in rendered.text) is uses_lock_guidance
+    assert ("requires a `BufRead` stream" in rendered.text) is uses_lock_guidance
+
+
+@pytest.mark.parametrize(
+    "name", ["rust_stdin", "STDIN", "stdin_extra", "stdout_stream", "standard_error"]
+)
+def test_foreign_static_guidance_does_not_activate_for_other_names(name):
+    records = loaded(
+        [fn_record(0, "target", "target", [], foreign_static_names=[name])]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    assert stage_module._foreign_static_guidance((0,), records_by_id) == ""
+
+
+def test_linked_foreign_static_symbol_activates_guidance_and_keeps_rust_name():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                foreign_static_names=["rust_stdin", "stdin"],
+            )
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    targets = render_transformation_targets((0,), records_by_id)
+    guidance = stage_module._foreign_static_guidance((0,), records_by_id)
+
+    assert "Foreign static references: `rust_stdin`, `stdin`" in targets
+    assert "`std::io::stdin()`" in guidance
+    assert "`std::io::stdin().lock()`" in guidance
+
+
+def test_foreign_static_guidance_ignores_nonmember_metadata():
+    records = loaded(
+        [
+            fn_record(0, "member", "member", [1]),
+            fn_record(
+                1,
+                "dependency",
+                "dependency",
+                [],
+                foreign_static_names=["stdout"],
+            ),
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    assert stage_module._foreign_static_guidance((0,), records_by_id) == ""
 
 
 def test_libc_guidance_ignores_nonmember_metadata():
@@ -2201,7 +2320,10 @@ def test_replacement_request_is_exact_and_member_ordered():
 
 
 def test_foreign_metadata_does_not_change_graph_or_tool_requests():
-    records = foreign_function_records()
+    records = tuple(
+        replace(record, foreign_static_names=("stdout",)) if record.id == 2 else record
+        for record in foreign_function_records()
+    )
     records_by_id = {record.id: record for record in records}
     assert function_graph(records) == {0: set(), 1: {0}, 2: set(), 3: {0}}
 
@@ -2220,6 +2342,8 @@ def test_foreign_metadata_does_not_change_graph_or_tool_requests():
     assert replacement["transformation"] == transformation
     assert "foreign_function_names" not in validation["expected_functions"][0]
     assert "foreign_function_names" not in replacement["items"][0]
+    assert "foreign_static_names" not in validation["expected_functions"][0]
+    assert "foreign_static_names" not in replacement["items"][0]
     assert list(validation["expected_functions"][0]) == [
         "id",
         "name",
@@ -4590,6 +4714,37 @@ def test_xj_scanf_guidance_is_consistent_across_initial_and_repair_prompts(tmp_p
     assert (
         "The previous transformation failed." in client.requests[1].messages[0].content
     )
+
+
+def test_foreign_static_guidance_is_consistent_across_initial_and_repair_prompts(
+    tmp_path,
+):
+    tools = FakeTools(
+        skeletons=[
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                foreign_static_names=["stdin"],
+            )
+        ],
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[INVALID, VALID],
+        candidates=["candidate\n"],
+    )
+    client = FakeClient([response(), response()])
+
+    _, output = run_fake(tmp_path, tools, client)
+
+    assert output.status == "success"
+    assert len(client.requests) == 2
+    for request in client.requests:
+        text = request.messages[0].content
+        assert text.count(FOREIGN_STATIC_GUIDANCE_MARKER) == 1
+        assert "`std::io::stdin()`" in text
+        assert "`std::io::stdin().lock()`" in text
+        assert request.metadata.prompt_version == 1
 
 
 def test_libc_guidance_is_consistent_across_repair_and_rule_fallback_prompts(
