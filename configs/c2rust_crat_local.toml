@@ -44,6 +44,7 @@ passes = [
   "extern",
   "preprocess",
   "enum",
+  "prepare",
   "simpl",
   "unsafe",
   "unexpand",

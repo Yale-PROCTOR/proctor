@@ -29,11 +29,38 @@ ADAPTER = _load_adapter()
 def test_default_pass_plan_is_unchanged() -> None:
     plan = ADAPTER.resolve_pass_plan({})
 
-    assert [plugin for plugin, _ in plan] == list(ADAPTER.PLUGINS)
+    assert [plugin for plugin, _ in plan] == [
+        "expand",
+        "extern",
+        "preprocess",
+        "outparam",
+        "punning",
+        "enum",
+        "pointer",
+        "io",
+        "libc",
+        "static",
+        "simpl",
+        "interface",
+        "unsafe",
+        "unexpand",
+        "split",
+        "bin",
+    ]
+    assert "prepare" not in [plugin for plugin, _ in plan]
     assert dict(plan)["extern"] == [
         "--extern-ignore-return-type",
         "--extern-ignore-param-type",
     ]
+    assert dict(plan)["outparam"] == ["--outparam-simplify"]
+    assert dict(plan)["io"] == ["--io-assume-to-str-ok"]
+    assert dict(plan)["unsafe"] == [
+        "--unsafe-remove-unused",
+        "--unsafe-remove-no-mangle",
+        "--unsafe-replace-pub",
+        "--unsafe-remove-extern-c",
+    ]
+    assert dict(plan)["unexpand"] == ["--unexpand-use-print"]
 
 
 def test_final_pass_still_selects_canonical_prefix() -> None:
@@ -48,6 +75,34 @@ def test_final_pass_still_selects_canonical_prefix() -> None:
         "enum",
         "pointer",
     ]
+
+
+def test_prepare_is_an_explicit_opt_in_branch() -> None:
+    assert ADAPTER.resolve_pass_plan({"final_pass": "prepare"}) == [
+        ("expand", []),
+        (
+            "extern",
+            ["--extern-ignore-return-type", "--extern-ignore-param-type"],
+        ),
+        ("preprocess", []),
+        ("outparam", ["--outparam-simplify"]),
+        ("punning", []),
+        ("enum", []),
+        ("prepare", []),
+    ]
+    assert ADAPTER.resolve_pass_plan({"passes": ["enum", "prepare", "simpl"]}) == [
+        ("enum", []),
+        ("prepare", []),
+        ("simpl", []),
+    ]
+
+
+def test_prepare_arguments_use_generic_replacement_semantics() -> None:
+    assert ADAPTER.resolve_pass_plan(
+        {"passes": ["prepare"], "pass_args": {"prepare": ["--generic"]}}
+    ) == [("prepare", ["--generic"])]
+    with pytest.raises(ADAPTER.StageFailure, match="passes not selected"):
+        ADAPTER.resolve_pass_plan({"passes": ["enum"], "pass_args": {"prepare": []}})
 
 
 def test_custom_sequence_and_replacement_arguments() -> None:
@@ -101,6 +156,58 @@ def test_run_pass_uses_resolved_arguments(
 
     assert produced == output_root / input_dir.name
     assert commands[0][7:-1] == ["--custom-option"]
+
+
+def test_run_pass_selects_prepare_without_special_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_dir = tmp_path / "input"
+    output_root = tmp_path / "output"
+    input_dir.mkdir()
+    commands: list[list[str]] = []
+
+    def fake_run_logged(command: list[str], *_args: object, **_kwargs: object) -> None:
+        commands.append(command)
+        (output_root / input_dir.name).mkdir(parents=True)
+
+    monkeypatch.setattr(ADAPTER, "run_logged", fake_run_logged)
+    ADAPTER.run_pass(
+        Path("/crat"),
+        {},
+        "prepare",
+        [],
+        input_dir,
+        output_root,
+        tmp_path / "crat.log",
+    )
+
+    assert "--pass" in commands[0]
+    assert commands[0][commands[0].index("--pass") + 1] == "prepare"
+    assert commands[0][7:-1] == []
+
+
+def test_local_pipeline_selects_prepare_in_exact_order() -> None:
+    import tomllib
+
+    config = tomllib.loads(
+        (REPO / "configs" / "c2rust_crat_local.toml").read_text(encoding="utf-8")
+    )
+    crat = config["stages"]["crat"]["config"]
+
+    assert crat["passes"] == [
+        "expand",
+        "extern",
+        "preprocess",
+        "enum",
+        "prepare",
+        "simpl",
+        "unsafe",
+        "unexpand",
+        "split",
+        "bin",
+    ]
+    assert "libc" not in crat["passes"]
+    assert "pass_args" not in crat
 
 
 @pytest.mark.parametrize(

@@ -32,6 +32,7 @@ PLUGINS: dict[str, tuple[str, list[str]]] = {
     "outparam": ("preprocess", ["--outparam-simplify"]),
     "punning": ("outparam", []),
     "enum": ("punning", []),
+    "prepare": ("enum", []),
     "pointer": ("enum", []),
     "io": ("pointer", ["--io-assume-to-str-ok"]),
     "libc": ("io", []),
