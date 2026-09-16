@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -19,7 +20,10 @@ PRINTF_ADAPTERS = (
         "signed",
         "d/i",
         "proctor_libc::printf::signed(value)",
-        "Use for signed decimal conversions.",
+        "Use for signed conversions with integer precision or space-sign "
+        "behavior, and conservatively for any signed specifier not proven "
+        "native-safe. Pass ordinary signed conversions as their correctly "
+        "converted value.",
     ),
     PrintfAdapter(
         "unsigned",
@@ -98,6 +102,9 @@ _SPACE_SIGN_FAMILIES = {
     "hex_float",
 }
 _FLAGS = frozenset("-+ 0#'")
+_NATIVE_SIGNED_SPECIFIER = re.compile(
+    r"%[-+0]*[0-9]*(?:hh|h|ll|l|j|z|t)?[di]", re.ASCII
+)
 
 
 def classify_printf_specifiers(
@@ -129,10 +136,29 @@ def classify_printf_specifiers(
 
 
 def render_printf_guidance(specifiers: Iterable[str]) -> str:
+    specifiers = tuple(specifiers)
     families, space_sign = classify_printf_specifiers(specifiers)
     if not families:
         return ""
     selected = {family for family in families}
+    signed_specifiers = tuple(
+        specifier
+        for specifier in specifiers
+        if _FAMILY_BY_CONVERSION[specifier[-1]] == "signed"
+    )
+    if signed_specifiers and all(
+        _NATIVE_SIGNED_SPECIFIER.fullmatch(specifier) for specifier in signed_specifiers
+    ):
+        selected.remove("signed")
+    generic_guidance = (
+        "The target skeleton's Rust format string, static width, precision, "
+        "formatting trait, and number of argument slots are trusted and must not "
+        "change; preserve the source order of consuming values: fill the existing "
+        "argument slots in order and do not swap slots. Pass each value after the C "
+        "length conversion."
+    )
+    if not selected:
+        return generic_guidance
     accepted_types = []
     if "signed" in selected:
         accepted_types.append(
@@ -170,11 +196,7 @@ def render_printf_guidance(specifiers: Iterable[str]) -> str:
             "precedence when both flags occur."
         )
     return (
-        "The target skeleton's Rust format string, static width, precision, "
-        "formatting trait, and number of argument slots are trusted and must not "
-        "change; preserve the source order of consuming values: fill the existing "
-        "argument slots in order and do not swap slots. Pass each value after the C "
-        "length conversion. Use the fully qualified call expressions below and let "
+        generic_guidance + " Use the fully qualified call expressions below and let "
         "Rust infer their return types; do not define or import any item for these "
         "calls, including traits or adapter types."
         + cast_warning

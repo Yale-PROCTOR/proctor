@@ -1727,7 +1727,7 @@ def test_version_one_prompt_has_exact_format_guidance_slot_and_metadata():
         PromptRenderInput(
             "DEPENDENCY",
             "TARGETS",
-            printf_guidance=render_printf_guidance(["%d"]),
+            printf_guidance=render_printf_guidance(["% d"]),
         )
     )
     wrapper_paths = tuple(
@@ -1777,7 +1777,6 @@ def test_libc_guidance_catalog_has_all_activators_and_reference_signatures():
 @pytest.mark.parametrize(
     ("specifiers", "family"),
     [
-        (["%d", "%lli"], "signed"),
         (["%#o", "%08x", "%X", "%u"], "unsigned"),
         (["%f"], "fixed"),
         (["%LF"], "fixed_upper"),
@@ -1836,6 +1835,113 @@ def test_printf_guidance_selects_only_the_terminal_conversion_family(
             assert other_type_group not in guidance
     assert ("unsupported `i128` or `u128`" in guidance) is (
         family in {"signed", "unsigned"}
+    )
+
+
+def test_printf_classifier_keeps_native_signed_family_without_adapter_guidance():
+    families, space_sign = classify_printf_specifiers(["%d", "%lli"])
+    assert families == ("signed",)
+    assert not space_sign
+
+    guidance = render_printf_guidance(["%d", "%lli"])
+    assert "Rust format string, static width, precision, formatting trait" in guidance
+    assert "proctor_libc::printf::signed" not in guidance
+    assert "`i8`, `i16`, `i32`, `i64`, and `isize`" not in guidance
+
+
+@pytest.mark.parametrize(
+    "specifier",
+    [
+        "%d",
+        "%i",
+        "%hhd",
+        "%hd",
+        "%ld",
+        "%lld",
+        "%jd",
+        "%zd",
+        "%td",
+        "%8d",
+        "%-8d",
+        "%+8d",
+        "%08d",
+        "%+-08d",
+        "%0-+008lld",
+        "%--++00i",
+    ],
+)
+def test_printf_guidance_omits_adapter_for_proven_native_signed_specifiers(specifier):
+    guidance = render_printf_guidance([specifier])
+
+    assert guidance
+    for invariant in (
+        "Rust format string, static width, precision, formatting trait",
+        "number of argument slots are trusted and must not change",
+        "preserve the source order of consuming values",
+        "Pass each value after the C length conversion",
+    ):
+        assert invariant in guidance
+    for signed_specific in (
+        "proctor_libc::printf::signed",
+        "`i8`, `i16`, `i32`, `i64`, and `isize`",
+        "unsupported `i128` or `u128`",
+        "fully qualified call expressions below",
+    ):
+        assert signed_specific not in guidance
+
+
+@pytest.mark.parametrize(
+    "specifier",
+    [
+        "%.d",
+        "%.0d",
+        "%.5d",
+        "%08.5d",
+        "%-08.5i",
+        "% d",
+        "%+ d",
+        "%*d",
+        "%d%d",
+        "%bogusd",
+    ],
+)
+def test_printf_guidance_retains_adapter_for_unproven_signed_specifiers(specifier):
+    guidance = render_printf_guidance([specifier])
+
+    assert "`proctor_libc::printf::signed(value)`" in guidance
+    assert "`i8`, `i16`, `i32`, `i64`, and `isize`" in guidance
+    assert "unsupported `i128` or `u128`" in guidance
+    assert (
+        "signed conversions with integer precision or space-sign behavior" in guidance
+    )
+    assert (
+        "Pass ordinary signed conversions as their correctly converted value"
+        in guidance
+    )
+
+
+def test_printf_guidance_omits_only_universally_safe_signed_family():
+    safe_and_float = render_printf_guidance(["%d", "%E"])
+    assert "proctor_libc::printf::signed" not in safe_and_float
+    assert "`i8`, `i16`, `i32`, `i64`, and `isize`" not in safe_and_float
+    assert "unsupported `i128` or `u128`" not in safe_and_float
+    assert "`proctor_libc::printf::scientific(value)`" in safe_and_float
+    assert "`f32`, `f64`, and `f128::f128`" in safe_and_float
+
+    safe_and_unsigned = render_printf_guidance(["%d", "%u"])
+    assert "proctor_libc::printf::signed" not in safe_and_unsigned
+    assert "`proctor_libc::printf::unsigned(value)`" in safe_and_unsigned
+    assert "unsupported `i128` or `u128`" in safe_and_unsigned
+
+    mixed_signed = render_printf_guidance(["%d", "%.0d"])
+    assert mixed_signed.count("proctor_libc::printf::signed(value)") == 1
+    assert (
+        "signed conversions with integer precision or space-sign behavior"
+        in mixed_signed
+    )
+    assert (
+        "Pass ordinary signed conversions as their correctly converted value"
+        in mixed_signed
     )
 
 
@@ -1978,6 +2084,46 @@ def test_printf_guidance_unions_only_scc_members_in_catalog_order():
         for entry in LIBC_GUIDANCE
         for reference in entry.references
     )
+
+
+def test_printf_guidance_signed_safety_is_universal_within_current_scc():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "first_safe",
+                "first_safe",
+                [1, 2],
+                printf_format_specifiers=["%d"],
+            ),
+            fn_record(
+                1,
+                "second_safe",
+                "second_safe",
+                [0],
+                printf_format_specifiers=["%lld"],
+            ),
+            fn_record(
+                2,
+                "unsafe_nonmember",
+                "unsafe_nonmember",
+                [],
+                printf_format_specifiers=["%.0d"],
+            ),
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    safe = stage_module._printf_guidance((0, 1), records_by_id)
+    assert safe == stage_module._printf_guidance((1, 0), records_by_id)
+    assert safe
+    assert "proctor_libc::printf::signed" not in safe
+    assert "`i8`, `i16`, `i32`, `i64`, and `isize`" not in safe
+
+    mixed = stage_module._printf_guidance((0, 1, 2), records_by_id)
+    assert mixed == stage_module._printf_guidance((2, 1, 0), records_by_id)
+    assert mixed.count("proctor_libc::printf::signed(value)") == 1
+    assert "signed conversions with integer precision or space-sign behavior" in mixed
 
 
 def test_printf_guidance_member_union_is_stable_in_catalog_order():
@@ -5357,7 +5503,7 @@ def test_printf_guidance_is_identical_across_initial_validation_and_build_repair
         argument_count=1,
         rule_applied=True,
     )
-    rule_member["printf_format_specifiers"] = ["%#x"]
+    rule_member["printf_format_specifiers"] = ["%#x", "%d"]
     llm_member = printf_record(
         1,
         "llm_member",
