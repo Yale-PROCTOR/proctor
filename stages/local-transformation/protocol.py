@@ -33,6 +33,7 @@ class PromptRenderInput:
     diagnostics: str | None = None
     use_xj_scanf_guidance: bool = False
     libc_guidance: str = ""
+    printf_guidance: str = ""
     foreign_static_guidance: str = ""
 
 
@@ -187,6 +188,7 @@ def render_prompt(
         repair_context=repair,
         use_xj_scanf_guidance=value.use_xj_scanf_guidance,
         libc_guidance=value.libc_guidance,
+        printf_guidance=value.printf_guidance,
         foreign_static_guidance=value.foreign_static_guidance,
     )
 

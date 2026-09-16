@@ -16,6 +16,7 @@ from typing import Any, Literal, cast
 import tomli_w
 
 from libc_guidance import render_libc_guidance
+from printf_guidance import render_printf_guidance
 from model import (
     ContextOverflow,
     CallableCorrespondence,
@@ -67,10 +68,11 @@ STAGE_ID = "local_transformation"
 STAGE_VERSION = "0.1.0"
 MAX_REPAIRS = 10
 CONTEXT_LIMIT = 100_000
+CARGO_VERSION_COMPONENT_MAX = (1 << 64) - 1
 REQUIRED_CRATES_IO_DEPENDENCIES = (
     ("bytemuck", "1.25.2", (1, 25, 2, 1)),
     ("xj_scanf", "0.2.6", (0, 2, 6, 1)),
-    ("proctor-libc", "0.1.0", (0, 1, 0, 1)),
+    ("proctor-libc", "0.3.0", (0, 3, 0, 1)),
 )
 NON_REGISTRY_DEPENDENCY_KEYS = {"git", "path", "workspace"}
 XJ_SCANF_FOREIGN_FUNCTION_NAMES = frozenset({"scanf", "fscanf", "sscanf"})
@@ -79,6 +81,10 @@ FOREIGN_STATIC_IO_REPLACEMENTS = (
     ("stderr", "std::io::stderr()"),
     ("stdin", "std::io::stdin()"),
 )
+
+
+class DependencyNormalizationFailure(StageFailure):
+    """A manifest-policy failure whose message is part of the stage contract."""
 
 
 @dataclass
@@ -152,6 +158,16 @@ def _libc_guidance(
         name
         for item_id in members
         for name in records_by_id[item_id].foreign_function_names
+    )
+
+
+def _printf_guidance(
+    members: tuple[int, ...], records_by_id: dict[int, ItemRecord]
+) -> str:
+    return render_printf_guidance(
+        specifier
+        for item_id in members
+        for specifier in records_by_id[item_id].printf_format_specifiers
     )
 
 
@@ -245,12 +261,15 @@ def _cargo_version_key(version: str) -> tuple[int, int, int, int] | None:
     if match is None:
         return None
     major, minor, patch, prerelease = match.groups()
-    return (
+    key = (
         int(major),
         int(minor or 0),
         int(patch or 0),
         0 if prerelease is not None else 1,
     )
+    if any(component > CARGO_VERSION_COMPONENT_MAX for component in key[:3]):
+        return None
+    return key
 
 
 def _cargo_requirement_needs_upgrade(
@@ -270,13 +289,19 @@ def _cargo_requirement_needs_upgrade(
         if operator in {"<", "<="}:
             continue
 
-        wildcard_parts = version.split(".")
+        wildcard_core = version.split("-", 1)[0].split("+", 1)[0]
+        wildcard_parts = wildcard_core.split(".")
         if any(part in {"x", "X", "*"} for part in wildcard_parts):
+            if wildcard_core != version:
+                return True
             numeric_parts: list[int] = []
             for part in wildcard_parts:
                 if part in {"x", "X", "*"}:
                     break
-                numeric_parts.append(int(part))
+                component = int(part)
+                if component > CARGO_VERSION_COMPONENT_MAX:
+                    return True
+                numeric_parts.append(component)
             numeric_parts.extend([0] * (3 - len(numeric_parts)))
             lower_bounds.append(
                 (numeric_parts[0], numeric_parts[1], numeric_parts[2], 1)
@@ -335,12 +360,16 @@ def _ensure_crates_io_dependency(
             dependency["version"] = minimum_version
             changed = True
         elif not isinstance(version_value, str):
-            raise StageFailure(f"Cargo {name} dependency version must be a string")
+            raise DependencyNormalizationFailure(
+                f"Cargo {name} dependency version must be a string"
+            )
         elif _cargo_requirement_needs_upgrade(version_value, minimum_version_key):
             dependency["version"] = minimum_version
             changed = True
     else:
-        raise StageFailure(f"Cargo {name} dependency must be a string or table")
+        raise DependencyNormalizationFailure(
+            f"Cargo {name} dependency must be a string or table"
+        )
 
     return changed
 
@@ -350,11 +379,13 @@ def _ensure_required_dependencies(project: Path) -> None:
     try:
         cargo = tomllib.loads(manifest.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
-        raise StageFailure(f"working Cargo.toml is invalid: {exc}") from exc
+        raise DependencyNormalizationFailure(
+            f"working Cargo.toml is invalid: {exc}"
+        ) from exc
 
     dependencies = cargo.setdefault("dependencies", {})
     if not isinstance(dependencies, dict):
-        raise StageFailure("Cargo [dependencies] must be a table")
+        raise DependencyNormalizationFailure("Cargo [dependencies] must be a table")
 
     changed = False
     for name, minimum_version, minimum_version_key in REQUIRED_CRATES_IO_DEPENDENCIES:
@@ -371,7 +402,17 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 
 def _validate_boundaries(
     stage_input: StageInput, stage_dir: Path
-) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path | None, dict[str, Any]]:
+) -> tuple[
+    Path,
+    Path,
+    Path,
+    Path | None,
+    Path,
+    Path,
+    Path,
+    Path | None,
+    dict[str, Any],
+]:
     config = _effective_config(stage_input.config, stage_dir)
     source = stage_input.inputs.rust_project
     destination = stage_input.outputs.rust_project
@@ -500,7 +541,12 @@ def _validate_boundaries(
         for name, boundary in boundaries.items():
             if _paths_overlap(rule_resolved, boundary):
                 raise StageFailure(f"inputs.rule_set overlaps {name}")
-    library_relative = _library_relative_path(source)
+    try:
+        library_relative = _library_relative_path(source)
+    except StageFailure as error:
+        if not str(error).startswith("input Cargo.toml is invalid:"):
+            raise
+        library_relative = None
     return (
         source,
         destination,
@@ -1346,6 +1392,7 @@ def _process_scc(
 
     use_xj_scanf_guidance = _uses_xj_scanf_guidance(members, records_by_id)
     libc_guidance = _libc_guidance(members, records_by_id)
+    printf_guidance = _printf_guidance(members, records_by_id)
     foreign_static_guidance = _foreign_static_guidance(members, records_by_id)
     context: str | None = None
     applied_views = {
@@ -1383,6 +1430,7 @@ def _process_scc(
                     diagnostics=latest_diagnostics,
                     use_xj_scanf_guidance=use_xj_scanf_guidance,
                     libc_guidance=libc_guidance,
+                    printf_guidance=printf_guidance,
                     foreign_static_guidance=foreign_static_guidance,
                 )
             )
@@ -1594,6 +1642,8 @@ def run_stage(
             shutil.rmtree(current)
         shutil.copytree(source, current)
         _ensure_required_dependencies(current)
+        if library_relative is None:
+            library_relative = _library_relative_path(current)
         active_tools.prepare(current, ("expand", "unexpand"), True)
         library_source = current / library_relative
         if not library_source.is_file():
@@ -1675,6 +1725,8 @@ def run_stage(
             _statistics_json(state),
         )
         return _output("success", state, destination=destination)
+    except DependencyNormalizationFailure as exc:
+        return _output("failure", state, error=str(exc))
     except (
         StageFailure,
         SkeletonError,

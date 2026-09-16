@@ -189,58 +189,71 @@ LIBC_GUIDANCE = (
     LibcGuidance(
         ("strtod",),
         "strtod",
-        _reference(
-            "Converts the initial floating-point number in `buf` to an `f64`.\n\n"
-            "Returns the converted value, the unconsumed suffix, and the conversion\n"
-            "status. `StrtoFloatError::OutOfRange` is the only error variant and reports\n"
-            "overflow or inexact underflow.",
-            "pub fn strtod(buf: &[i8]) -> ((f64, &[i8]), Result<(), StrtoFloatError>);",
+        (
+            FunctionReference(
+                "Converts the initial floating-point number in `buf` to an `f64` and returns the immutable unconsumed suffix as `&[i8]` with the conversion status. `StrtoFloatError::OutOfRange` is the only error variant and reports overflow or inexact underflow.",
+                "pub fn strtod(buf: &[i8]) -> ((f64, &[i8]), Result<(), StrtoFloatError>);",
+            ),
+            FunctionReference(
+                "Converts a mutable buffer with the same value and status semantics and returns the mutable unconsumed suffix as `&mut [i8]`. Choose this mutable variant only when the transformed input and required returned suffix need mutable borrowing; use the shared variant otherwise.",
+                "pub fn strtod_mut(buf: &mut [i8]) -> ((f64, &mut [i8]), Result<(), StrtoFloatError>);",
+            ),
         ),
     ),
     LibcGuidance(
         ("strtof",),
         "strtof",
-        _reference(
-            "Converts the initial floating-point number in `buf` to an `f32`.\n\n"
-            "Returns the converted value, the unconsumed suffix, and the conversion\n"
-            "status. `StrtoFloatError::OutOfRange` is the only error variant and reports\n"
-            "overflow or inexact underflow.",
-            "pub fn strtof(buf: &[i8]) -> ((f32, &[i8]), Result<(), StrtoFloatError>);",
+        (
+            FunctionReference(
+                "Converts the initial floating-point number in `buf` to an `f32` and returns the immutable unconsumed suffix as `&[i8]` with the conversion status. `StrtoFloatError::OutOfRange` is the only error variant and reports overflow or inexact underflow.",
+                "pub fn strtof(buf: &[i8]) -> ((f32, &[i8]), Result<(), StrtoFloatError>);",
+            ),
+            FunctionReference(
+                "Converts a mutable buffer with the same value and status semantics and returns the mutable unconsumed suffix as `&mut [i8]`. Choose this mutable variant only when the transformed input and required returned suffix need mutable borrowing; use the shared variant otherwise.",
+                "pub fn strtof_mut(buf: &mut [i8]) -> ((f32, &mut [i8]), Result<(), StrtoFloatError>);",
+            ),
         ),
     ),
     LibcGuidance(
         ("strtol",),
         "strtol",
-        _reference(
-            "Converts the initial integer in `buf` using `base`.\n\n"
-            "Returns the converted value, the unconsumed suffix, and the conversion\n"
-            "status. `StrtoIntError::InvalidBase` and `StrtoIntError::OutOfRange` are the\n"
-            "only error variants; they report an unsupported base and overflow,\n"
-            "respectively.",
-            "pub fn strtol(buf: &[i8], base: i32) -> ((i64, &[i8]), Result<(), StrtoIntError>);",
+        (
+            FunctionReference(
+                "Converts the initial integer in `buf` using `base` and returns the immutable unconsumed suffix as `&[i8]` with the conversion status. `StrtoIntError::InvalidBase` reports an unsupported base and `StrtoIntError::OutOfRange` reports overflow.",
+                "pub fn strtol(buf: &[i8], base: i32) -> ((i64, &[i8]), Result<(), StrtoIntError>);",
+            ),
+            FunctionReference(
+                "Converts a mutable buffer with the same value and status semantics and returns the mutable unconsumed suffix as `&mut [i8]`. Choose this mutable variant only when the transformed input and required returned suffix need mutable borrowing; use the shared variant otherwise.",
+                "pub fn strtol_mut(buf: &mut [i8], base: i32) -> ((i64, &mut [i8]), Result<(), StrtoIntError>);",
+            ),
         ),
     ),
     LibcGuidance(
         ("strtold",),
         "strtold",
-        _reference(
-            "Converts the initial floating-point number in `buf` to [`struct@f128::f128`].\n\n"
-            "Returns the converted value, the unconsumed suffix, and the conversion\n"
-            "status. `StrtoFloatError::OutOfRange` is the only error variant and reports\n"
-            "overflow or inexact underflow.",
-            "pub fn strtold(buf: &[i8]) -> ((f128::f128, &[i8]), Result<(), StrtoFloatError>);",
+        (
+            FunctionReference(
+                "Converts the initial floating-point number in `buf` to `f128::f128` and returns the immutable unconsumed suffix as `&[i8]` with the conversion status. `StrtoFloatError::OutOfRange` is the only error variant and reports overflow or inexact underflow.",
+                "pub fn strtold(buf: &[i8]) -> ((f128::f128, &[i8]), Result<(), StrtoFloatError>);",
+            ),
+            FunctionReference(
+                "Converts a mutable buffer with the same value and status semantics and returns the mutable unconsumed suffix as `&mut [i8]`. Choose this mutable variant only when the transformed input and required returned suffix need mutable borrowing; use the shared variant otherwise.",
+                "pub fn strtold_mut(buf: &mut [i8]) -> ((f128::f128, &mut [i8]), Result<(), StrtoFloatError>);",
+            ),
         ),
     ),
     LibcGuidance(
         ("strtoul",),
         "strtoul",
-        _reference(
-            "Converts the initial unsigned integer in `buf` using `base`.\n\n"
-            "Returns the converted value, the unconsumed suffix, and the conversion\n"
-            "status. `StrtoIntError::InvalidBase` and `StrtoIntError::OutOfRange` are the\n"
-            "only error variants; they report an unsupported base and overflow,\n"
-            "respectively.",
-            "pub fn strtoul(buf: &[i8], base: i32) -> ((u64, &[i8]), Result<(), StrtoIntError>);",
+        (
+            FunctionReference(
+                "Converts the initial unsigned integer in `buf` using `base` and returns the immutable unconsumed suffix as `&[i8]` with the conversion status. `StrtoIntError::InvalidBase` reports an unsupported base and `StrtoIntError::OutOfRange` reports overflow.",
+                "pub fn strtoul(buf: &[i8], base: i32) -> ((u64, &[i8]), Result<(), StrtoIntError>);",
+            ),
+            FunctionReference(
+                "Converts a mutable buffer with the same value and status semantics and returns the mutable unconsumed suffix as `&mut [i8]`. Choose this mutable variant only when the transformed input and required returned suffix need mutable borrowing; use the shared variant otherwise.",
+                "pub fn strtoul_mut(buf: &mut [i8], base: i32) -> ((u64, &mut [i8]), Result<(), StrtoIntError>);",
+            ),
         ),
     ),
     LibcGuidance(

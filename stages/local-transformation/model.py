@@ -306,6 +306,7 @@ class ItemRecord:
     applied: SkeletonView | None = None
     source_signature: str | None = None
     target_signature: str | None = None
+    printf_format_specifiers: tuple[str, ...] = ()
     foreign_function_names: tuple[str, ...] = ()
     foreign_static_names: tuple[str, ...] = ()
     declaration: str | None = None
@@ -1512,15 +1513,20 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             "applied",
             "source_signature",
             "target_signature",
+            "printf_format_specifiers",
             "foreign_function_names",
             "foreign_static_names",
             "signature_dependencies",
             "dependencies",
         }
-        if set(data) != required:
+        missing = sorted(required - set(data))
+        if missing:
             raise SkeletonError(
-                f"record {record_id} must contain exactly {sorted(required)}"
+                f"record {record_id} is missing required fields {missing}"
             )
+        unknown = sorted(set(data) - required)
+        if unknown:
+            raise SkeletonError(f"record {record_id} contains unknown fields {unknown}")
         dependencies = _dependencies(data, "dependencies", record_id)
         signature_dependencies = _dependencies(
             data, "signature_dependencies", record_id
@@ -1538,6 +1544,9 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             applied=applied,
             source_signature=_string(data, "source_signature", record_id),
             target_signature=_string(data, "target_signature", record_id),
+            printf_format_specifiers=_foreign_names(
+                data, "printf_format_specifiers", record_id
+            ),
             foreign_function_names=_foreign_names(
                 data, "foreign_function_names", record_id
             ),

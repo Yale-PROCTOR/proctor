@@ -61,6 +61,7 @@ from libc_guidance import (
     LIBC_GUIDANCE,
     render_libc_guidance,
 )
+from printf_guidance import classify_printf_specifiers, render_printf_guidance
 import stage as stage_module
 from stage import (
     AcceptedStatementPair,
@@ -182,6 +183,7 @@ def fn_record(
     needs_transformation: bool = True,
     transformation_labels: list[int] | None = None,
     statement_pair_metadata: list[dict[str, object]] | None = None,
+    printf_format_specifiers: list[str] | None = None,
     foreign_function_names: list[str] | None = None,
     foreign_static_names: list[str] | None = None,
 ) -> dict[str, object]:
@@ -234,6 +236,9 @@ def fn_record(
         "applied": view,
         "source_signature": f"unsafe fn {name}()",
         "target_signature": f"unsafe fn {name}()",
+        "printf_format_specifiers": (
+            [] if printf_format_specifiers is None else printf_format_specifiers
+        ),
         "foreign_function_names": (
             [] if foreign_function_names is None else foreign_function_names
         ),
@@ -750,7 +755,7 @@ def test_top_level_and_kind_shapes_fail_clearly():
     for text in ("[", "{}", '[{"id":0,"path":"f","kind":"Module"}]'):
         with pytest.raises(SkeletonError):
             load_skeletons(text)
-    with pytest.raises(SkeletonError, match="must contain exactly"):
+    with pytest.raises(SkeletonError, match="is missing required fields"):
         load_skeletons('[{"id":0,"path":"f","kind":"Fn","name":"f"}]')
 
 
@@ -1250,20 +1255,24 @@ def test_function_records_and_python_helpers_add_statement_pair_metadata():
         "applied",
         "source_signature",
         "target_signature",
+        "printf_format_specifiers",
         "foreign_function_names",
         "foreign_static_names",
         "signature_dependencies",
         "dependencies",
     ]
     assert plain["baseline"]["statement_pair_metadata"]
+    assert plain["printf_format_specifiers"] == []
     assert plain["foreign_function_names"] == []
     assert plain["foreign_static_names"] == []
     assert scalar_records()[0].foreign_function_names == ()
+    assert scalar_records()[0].printf_format_specifiers == ()
     assert scalar_records()[0].foreign_static_names == ()
     assert foreign_function_records()[1].foreign_function_names == ("free", "strlen")
 
     point = type_record(1, "Point", "Struct", "struct Point;", [])
     assert "foreign_function_names" not in point
+    assert "printf_format_specifiers" not in point
     assert "foreign_static_names" not in point
     assert item_kind_records()[0].foreign_function_names == ()
     assert item_kind_records()[0].foreign_static_names == ()
@@ -1272,6 +1281,7 @@ def test_function_records_and_python_helpers_add_statement_pair_metadata():
 @pytest.mark.parametrize(
     ("field", "attribute"),
     [
+        ("printf_format_specifiers", "printf_format_specifiers"),
         ("foreign_function_names", "foreign_function_names"),
         ("foreign_static_names", "foreign_static_names"),
     ],
@@ -1302,9 +1312,28 @@ def test_loader_requires_sorted_unique_nonempty_foreign_names(field, attribute):
 
     non_function = type_record(1, "Point", "Struct", "struct Point;", [])
     assert "foreign_function_names" not in non_function
+    assert "printf_format_specifiers" not in non_function
     assert "foreign_static_names" not in non_function
     assert loaded([non_function])[0].foreign_function_names == ()
     assert loaded([non_function])[0].foreign_static_names == ()
+
+
+def test_printf_format_specifier_wire_rejects_boolean_and_unknown_key_exactly():
+    boolean = fn_record(0, "scalar", "scalar", [])
+    boolean["printf_format_specifiers"] = True
+    with pytest.raises(SkeletonError) as error:
+        loaded([boolean])
+    assert str(error.value) == (
+        "record 0 field 'printf_format_specifiers' must be an array"
+    )
+
+    unknown = fn_record(0, "scalar", "scalar", [])
+    unknown["printf_format_specifier"] = []
+    with pytest.raises(SkeletonError) as error:
+        loaded([unknown])
+    assert str(error.value) == (
+        "record 0 contains unknown fields ['printf_format_specifier']"
+    )
 
 
 def test_ids_and_same_namespace_paths_are_valid_and_unique():
@@ -1685,6 +1714,52 @@ def test_initial_prompt_uses_versioned_template_and_empty_repair():
     assert request.metadata.item == "0,3"
 
 
+def test_version_one_prompt_has_exact_format_guidance_slot_and_metadata():
+    prompt_source = (STAGE_DIR / "prompts" / "local_transformation.md").read_text()
+    assert prompt_source.splitlines()[4] == (
+        'variables = ["dependency_context", "transformation_targets", '
+        '"repair_context", "use_xj_scanf_guidance", "libc_guidance", '
+        '"printf_guidance", "foreign_static_guidance"]'
+    )
+
+    empty = render_prompt(PromptRenderInput("DEPENDENCY", "TARGETS"))
+    signed = render_prompt(
+        PromptRenderInput(
+            "DEPENDENCY",
+            "TARGETS",
+            printf_guidance=render_printf_guidance(["%d"]),
+        )
+    )
+    wrapper_paths = tuple(
+        f"proctor_libc::printf::{name}"
+        for name in (
+            "signed",
+            "unsigned",
+            "fixed",
+            "fixed_upper",
+            "scientific",
+            "general",
+            "general_upper",
+            "hex_float",
+            "byte_string",
+        )
+    )
+    assert not any(path in empty.text for path in wrapper_paths)
+    assert signed.text.count("proctor_libc::printf::signed") == 1
+    assert all(path not in signed.text for path in wrapper_paths[1:])
+    response_instruction = (
+        "Return exactly one Rust code block delimited by triple-backtick fences."
+    )
+    assert response_instruction in empty.text
+    assert response_instruction in signed.text
+
+    request = llm_request(signed, run_id="run", members=(0,))
+    assert request.metadata.prompt_id == "local_transformation"
+    assert request.metadata.prompt_version == 1
+    assert request.metadata.prompt_hash == signed.content_hash
+    assert empty.content_hash != signed.content_hash
+
+
 def test_repair_prompt_contains_only_latest_failure():
     rendered = render_prompt(
         PromptRenderInput("D", "T", "second bad code", "second diagnostics")
@@ -1697,11 +1772,259 @@ def test_libc_guidance_catalog_has_all_activators_and_reference_signatures():
     assert LIBC_FOREIGN_FUNCTION_NAMES == frozenset(
         name for name, _replacement in LIBC_ACTIVATORS
     )
-    assert sum(len(entry.references) for entry in LIBC_GUIDANCE) == 44
+
+
+@pytest.mark.parametrize(
+    ("specifiers", "family"),
+    [
+        (["%d", "%lli"], "signed"),
+        (["%#o", "%08x", "%X", "%u"], "unsigned"),
+        (["%f"], "fixed"),
+        (["%LF"], "fixed_upper"),
+        (["%LE", "%e"], "scientific"),
+        (["%g"], "general"),
+        (["%LG"], "general_upper"),
+        (["%LA", "%a"], "hex_float"),
+        (["%10.3s"], "byte_string"),
+    ],
+)
+def test_printf_guidance_selects_only_the_terminal_conversion_family(
+    specifiers, family
+):
+    families, space_sign = classify_printf_specifiers(specifiers)
+    assert families == (family,)
+    assert not space_sign
+    guidance = render_printf_guidance(specifiers)
+    selected = f"`proctor_libc::printf::{family}(value)`"
+    assert guidance.count(selected) == 1
+    for other in (
+        "signed",
+        "unsigned",
+        "fixed",
+        "fixed_upper",
+        "scientific",
+        "general",
+        "general_upper",
+        "hex_float",
+        "byte_string",
+    ):
+        path = f"`proctor_libc::printf::{other}(value)`"
+        if path != selected:
+            assert path not in guidance
+
+    signed_types = "`i8`, `i16`, `i32`, `i64`, and `isize`"
+    unsigned_types = "`u8`, `u16`, `u32`, `u64`, and `usize`"
+    floating_types = "`f32`, `f64`, and `f128::f128`"
+    byte_string_type = "`&[i8]`"
+    expected_type_group = (
+        signed_types
+        if family == "signed"
+        else unsigned_types
+        if family == "unsigned"
+        else byte_string_type
+        if family == "byte_string"
+        else floating_types
+    )
+    assert guidance.count(expected_type_group) == 1
+    for other_type_group in (
+        signed_types,
+        unsigned_types,
+        floating_types,
+        byte_string_type,
+    ):
+        if other_type_group != expected_type_group:
+            assert other_type_group not in guidance
+    assert ("unsupported `i128` or `u128`" in guidance) is (
+        family in {"signed", "unsigned"}
+    )
+
+
+def test_printf_guidance_is_minimal_fail_closed_and_space_aware():
+    for invalid in ["", "é%d", "text%d", "%q", "%%"]:
+        with pytest.raises(SkeletonError, match="printf_format_specifiers"):
+            classify_printf_specifiers([invalid])
+    assert classify_printf_specifiers(["%bogusf"])[0] == ("fixed",)
+    assert classify_printf_specifiers(["%*d"])[0] == ("signed",)
+    assert classify_printf_specifiers(["%d%d"])[0] == ("signed",)
+    guidance = render_printf_guidance(["%+ d", "% E", "%s"])
+    assert "`proctor_libc::printf::signed(value)`" in guidance
+    assert "chain `.space_sign()` directly on the adapter call result" in guidance
+    assert "+ takes precedence" in guidance
+    assert (
+        "preserve the source order of consuming values: fill the existing argument "
+        "slots in order and do not swap slots"
+    ) in guidance
+    assert "`proctor_libc::printf::byte_string(value)`" in guidance
+    assert "accepts exactly `&[i8]`" in guidance
+    assert "counts bytes" in guidance and "valid UTF-8" in guidance
+    assert ".space_sign()" not in render_printf_guidance(["%d", "%s"])
+
+
+@pytest.mark.parametrize(
+    ("specifier", "has_space_sign"),
+    [
+        ("%d", False),
+        ("% d", True),
+        ("%+d", False),
+        ("%+ d", True),
+        ("%08.3d", False),
+        ("% f", True),
+        ("% E", True),
+        ("% G", True),
+        ("% A", True),
+        ("% s", False),
+    ],
+)
+def test_printf_guidance_selects_space_sign_only_from_applicable_flag_prefixes(
+    specifier, has_space_sign
+):
+    guidance = render_printf_guidance([specifier])
+
+    assert (
+        "chain `.space_sign()` directly on the adapter call result" in guidance
+    ) is has_space_sign
+    assert (".space_sign()" in guidance) is has_space_sign
+    if specifier == "%+ d":
+        assert "+ takes precedence" in guidance
+
+
+def test_printf_guidance_all_families_is_concise_and_complete():
+    guidance = render_printf_guidance(
+        ["% d", "%u", "%f", "%F", "%e", "%g", "%G", "%a", "%s"]
+    )
+    for fragment in (
+        "fully qualified",
+        "after the C length conversion",
+        "do not define or import",
+        "let Rust infer their return types",
+        "Rust's e/E formatting trait",
+        "Rust's x/X formatting trait",
+        "`i8`, `i16`, `i32`, `i64`, and `isize`",
+        "`u8`, `u16`, `u32`, `u64`, and `usize`",
+        "`f32`, `f64`, and `f128::f128`",
+        "accepts exactly `&[i8]`",
+        "first NUL",
+        "counts bytes",
+        "valid UTF-8",
+        "preserve the source order of consuming values: fill the existing argument slots in order and do not swap slots",
+    ):
+        assert guidance.count(fragment) == 1, fragment
+    assert guidance.count("f128::f128") == 1
+    assert guidance.count("&[i8]") == 1
+    for call in (
+        "proctor_libc::printf::signed(value)",
+        "proctor_libc::printf::unsigned(value)",
+        "proctor_libc::printf::fixed(value)",
+        "proctor_libc::printf::fixed_upper(value)",
+        "proctor_libc::printf::scientific(value)",
+        "proctor_libc::printf::general(value)",
+        "proctor_libc::printf::general_upper(value)",
+        "proctor_libc::printf::hex_float(value)",
+        "proctor_libc::printf::byte_string(value)",
+    ):
+        assert guidance.count(call) == 1
+    for internal_name in (
+        "SignedValue",
+        "UnsignedValue",
+        "FixedValue",
+        "Signed<",
+        "Unsigned<",
+        "Fixed<",
+        "FixedUpper<",
+        "Scientific<",
+        "General<",
+        "GeneralUpper<",
+        "HexFloat<",
+        "ByteString",
+    ):
+        assert internal_name not in guidance
+    assert "unsupported `i128` or `u128`" in guidance
+    assert "Formatting adapters for C printf semantics" not in guidance
+    assert not any(
+        line.startswith(("use ", "fn ", "pub fn ")) for line in guidance.splitlines()
+    )
+
+
+def test_printf_guidance_unions_only_scc_members_in_catalog_order():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "member",
+                "member",
+                [1],
+                printf_format_specifiers=["% d", "%s"],
+            ),
+            fn_record(
+                1,
+                "dependency",
+                "dependency",
+                [],
+                printf_format_specifiers=["%E"],
+            ),
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+    member = stage_module._printf_guidance((0,), records_by_id)
+    dependency = stage_module._printf_guidance((1,), records_by_id)
+    assert "proctor_libc::printf::signed" in member
+    assert "proctor_libc::printf::byte_string" in member
+    assert "proctor_libc::printf::scientific" not in member
+    assert "proctor_libc::printf::scientific" in dependency
+    assert member == stage_module._printf_guidance((0,), records_by_id)
+    assert sum(len(entry.references) for entry in LIBC_GUIDANCE) == 49
     assert all(
         reference.documentation and reference.signature.endswith(";")
         for entry in LIBC_GUIDANCE
         for reference in entry.references
+    )
+
+
+def test_printf_guidance_member_union_is_stable_in_catalog_order():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "first",
+                "first",
+                [1],
+                printf_format_specifiers=["% d", "%s"],
+            ),
+            fn_record(
+                1,
+                "second",
+                "second",
+                [2],
+                printf_format_specifiers=["%#x", "%E"],
+            ),
+            fn_record(
+                2,
+                "third",
+                "third",
+                [0],
+                printf_format_specifiers=["%d", "%s"],
+            ),
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+
+    forward = stage_module._printf_guidance((0, 1, 2), records_by_id)
+    reverse = stage_module._printf_guidance((2, 1, 0), records_by_id)
+
+    assert forward == reverse
+    expected_paths = (
+        "proctor_libc::printf::signed",
+        "proctor_libc::printf::unsigned",
+        "proctor_libc::printf::scientific",
+        "proctor_libc::printf::byte_string",
+    )
+    for path in expected_paths:
+        assert forward.count(path) == 1
+    assert [forward.index(path) for path in expected_paths] == sorted(
+        forward.index(path) for path in expected_paths
+    )
+    assert (
+        forward.count("chain `.space_sign()` directly on the adapter call result") == 1
     )
 
 
@@ -1732,6 +2055,11 @@ def test_libc_guidance_activation_uses_exact_foreign_names(foreign_name, replace
         "free",
         "memchr_mut",
         "strstr_mut",
+        "strtod_mut",
+        "rust_strtod",
+        "vstrtod",
+        "Strtod",
+        "STRTOD",
         "vstrlen",
         "rust_strlen",
         "__builtin_strlen",
@@ -1959,6 +2287,78 @@ def test_libc_guidance_shows_both_const_and_mutable_references(
         assert expected in guidance
 
 
+@pytest.mark.parametrize(
+    ("name", "immutable_signature", "mutable_signature"),
+    [
+        (
+            "strtod",
+            "pub fn strtod(buf: &[i8]) -> ((f64, &[i8]), Result<(), StrtoFloatError>);",
+            "pub fn strtod_mut(buf: &mut [i8]) -> ((f64, &mut [i8]), Result<(), StrtoFloatError>);",
+        ),
+        (
+            "strtof",
+            "pub fn strtof(buf: &[i8]) -> ((f32, &[i8]), Result<(), StrtoFloatError>);",
+            "pub fn strtof_mut(buf: &mut [i8]) -> ((f32, &mut [i8]), Result<(), StrtoFloatError>);",
+        ),
+        (
+            "strtold",
+            "pub fn strtold(buf: &[i8]) -> ((f128::f128, &[i8]), Result<(), StrtoFloatError>);",
+            "pub fn strtold_mut(buf: &mut [i8]) -> ((f128::f128, &mut [i8]), Result<(), StrtoFloatError>);",
+        ),
+        (
+            "strtol",
+            "pub fn strtol(buf: &[i8], base: i32) -> ((i64, &[i8]), Result<(), StrtoIntError>);",
+            "pub fn strtol_mut(buf: &mut [i8], base: i32) -> ((i64, &mut [i8]), Result<(), StrtoIntError>);",
+        ),
+        (
+            "strtoul",
+            "pub fn strtoul(buf: &[i8], base: i32) -> ((u64, &[i8]), Result<(), StrtoIntError>);",
+            "pub fn strtoul_mut(buf: &mut [i8], base: i32) -> ((u64, &mut [i8]), Result<(), StrtoIntError>);",
+        ),
+    ],
+)
+def test_strto_guidance_shows_shared_and_mutable_suffixes(
+    name, immutable_signature, mutable_signature
+):
+    guidance = render_libc_guidance([name])
+    assert immutable_signature in guidance
+    assert mutable_signature in guidance
+    assert f"`proctor_libc::{name}` or `proctor_libc::{name}_mut`" in guidance
+    assert "immutable unconsumed suffix as `&[i8]`" in guidance
+    assert "mutable unconsumed suffix as `&mut [i8]`" in guidance
+    assert "Choose this mutable variant only when" in guidance
+    assert "proctor_libc::printf::" not in guidance
+    for other in {"strtod", "strtof", "strtold", "strtol", "strtoul"} - {name}:
+        assert f"`proctor_libc::{other}`" not in guidance
+        assert f"`proctor_libc::{other}_mut`" not in guidance
+
+    if name in {"strtod", "strtof", "strtold"}:
+        assert "StrtoFloatError::OutOfRange" in guidance
+        assert "overflow or inexact underflow" in guidance
+    else:
+        assert "StrtoIntError::InvalidBase" in guidance
+        assert "unsupported base" in guidance
+        assert "StrtoIntError::OutOfRange" in guidance
+        assert "overflow" in guidance
+
+
+def test_strto_guidance_union_is_deduplicated_in_catalog_order():
+    forward = render_libc_guidance(["strtoul", "strtod", "strtol", "strtod"])
+    reverse = render_libc_guidance(["strtod", "strtol", "strtod", "strtoul"])
+
+    assert forward == reverse
+    paths = (
+        "`proctor_libc::strtod`",
+        "`proctor_libc::strtol`",
+        "`proctor_libc::strtoul`",
+    )
+    assert [forward.index(path) for path in paths] == sorted(
+        forward.index(path) for path in paths
+    )
+    for path in paths:
+        assert forward.count(path) == 1
+
+
 def test_active_libc_guidance_is_reference_only_and_fully_qualified():
     guidance = render_libc_guidance(["fgets"])
     rendered = render_prompt(PromptRenderInput("", "TARGETS", libc_guidance=guidance))
@@ -1973,6 +2373,8 @@ def test_active_libc_guidance_is_reference_only_and_fully_qualified():
         line.strip().startswith("use proctor_libc")
         for line in rendered.text.splitlines()
     )
+    assert "mutable variant" not in guidance
+    assert "returned suffix" not in guidance
 
 
 @pytest.mark.parametrize("name", ["scanf", "fscanf", "sscanf"])
@@ -3486,7 +3888,7 @@ def test_bytemuck_dependency_is_normalized_before_preparation(
     prepared = prepared_manifests[0]
     assert prepared["dependencies"]["bytemuck"] == expected
     assert prepared["dependencies"]["xj_scanf"] == "0.2.6"
-    assert prepared["dependencies"]["proctor-libc"] == "0.1.0"
+    assert prepared["dependencies"]["proctor-libc"] == "0.3.0"
     assert prepared["dependencies"]["serde"] == {
         "version": "1",
         "features": ["derive"],
@@ -3514,7 +3916,7 @@ def test_required_dependency_table_is_created_when_absent(tmp_path):
     assert published["dependencies"] == {
         "bytemuck": "1.25.2",
         "xj_scanf": "0.2.6",
-        "proctor-libc": "0.1.0",
+        "proctor-libc": "0.3.0",
     }
 
 
@@ -3571,7 +3973,7 @@ def test_required_dependency_name_collision_fails_before_preparation(tmp_path, n
     [
         ("bytemuck", "1.25.2", "1.20.0"),
         ("xj_scanf", "0.2.6", "0.2.0"),
-        ("proctor-libc", "0.1.0", "0.0.1"),
+        ("proctor-libc", "0.3.0", "0.2.9"),
     ],
 )
 def test_required_dependency_table_upgrade_preserves_other_fields(
@@ -3608,7 +4010,7 @@ def test_required_dependency_table_upgrade_preserves_other_fields(
     [
         ("bytemuck", "1.25.2"),
         ("xj_scanf", "0.2.6"),
-        ("proctor-libc", "0.1.0"),
+        ("proctor-libc", "0.3.0"),
     ],
 )
 def test_required_dependency_table_without_version_adds_minimum(
@@ -3636,6 +4038,150 @@ def test_required_dependency_table_without_version_adds_minimum(
         "version": minimum_version,
         "default-features": False,
     }
+
+
+def test_normalization_changes_only_below_minimum_proctor_libc_when_all_required_exist(
+    tmp_path,
+):
+    import tomllib
+
+    value = stage_input(tmp_path)
+    manifest = (
+        '[lib]\npath = "lib.rs"\n\n[dependencies]\n'
+        'serde = { version = "1", features = ["derive"] }\n'
+        'bytemuck = { version = "1.25.2", features = ["derive"] }\n'
+        'xj_scanf = "0.2.6"\n'
+        'proctor-libc = "0.2.9"\n'
+    )
+    source_manifest = value.inputs.rust_project / "Cargo.toml"
+    source_manifest.write_text(manifest, encoding="utf-8")
+
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=FakeTools())
+
+    assert output.status == "success"
+    assert source_manifest.read_text(encoding="utf-8") == manifest
+    before = tomllib.loads(manifest)
+    after = tomllib.loads(
+        (value.outputs.rust_project / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    assert after["dependencies"].pop("proctor-libc") == "0.3.0"
+    assert before["dependencies"].pop("proctor-libc") == "0.2.9"
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("dependency", "expected"),
+    [
+        ('"0.0.1"', "0.3.0"),
+        ('"0.1.0"', "0.3.0"),
+        ('"0.2.9"', "0.3.0"),
+        ('"0.3.0-alpha.1"', "0.3.0"),
+        ('"0.4.0+??"', "0.3.0"),
+        ('"0.4.x-alpha"', "0.3.0"),
+        ('"0.4.*+meta"', "0.3.0"),
+        ('"18446744073709551616"', "0.3.0"),
+        ('"0.3"', "0.3"),
+        ('"^0.3.0"', "^0.3.0"),
+        ('">=0.3.0"', ">=0.3.0"),
+        ('"0.4"', "0.4"),
+        ('"1"', "1"),
+        ('"18446744073709551615"', "18446744073709551615"),
+        ('{ path = "../proctor-libc" }', {"path": "../proctor-libc"}),
+        (
+            '{ git = "https://example.invalid/proctor-libc" }',
+            {"git": "https://example.invalid/proctor-libc"},
+        ),
+        ("{ workspace = true }", {"workspace": True}),
+        (
+            '{ registry = "private", version = "0.1" }',
+            {"registry": "private", "version": "0.1"},
+        ),
+        (
+            '{ registry = 7, version = "0.1" }',
+            {"registry": 7, "version": "0.1"},
+        ),
+    ],
+)
+def test_proctor_libc_dependency_minimum_policy(tmp_path, dependency, expected):
+    import tomllib
+
+    value = stage_input(tmp_path)
+    manifest = (
+        f'[lib]\npath = "lib.rs"\n\n[dependencies]\nproctor-libc = {dependency}\n'
+    )
+    source_manifest = value.inputs.rust_project / "Cargo.toml"
+    source_manifest.write_text(manifest, encoding="utf-8")
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=FakeTools())
+    assert output.status == "success"
+    assert source_manifest.read_text(encoding="utf-8") == manifest
+    published = tomllib.loads(
+        (value.outputs.rust_project / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    assert published["dependencies"]["proctor-libc"] == expected
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected", "prefix"),
+    [
+        (
+            '[lib]\npath = "lib.rs"\n\n[dependencies',
+            "working Cargo.toml is invalid:",
+            True,
+        ),
+        (
+            'dependencies = 7\n\n[lib]\npath = "lib.rs"',
+            "Cargo [dependencies] must be a table",
+            False,
+        ),
+        (
+            '[lib]\npath = "lib.rs"\n\n[dependencies]\nproctor-libc = 7',
+            "Cargo proctor-libc dependency must be a string or table",
+            False,
+        ),
+        (
+            '[lib]\npath = "lib.rs"\n\n[dependencies]\nproctor-libc = { version = 7 }',
+            "Cargo proctor-libc dependency version must be a string",
+            False,
+        ),
+    ],
+)
+def test_malformed_dependency_manifest_fails_before_preparation(
+    tmp_path, manifest, expected, prefix
+):
+    value = stage_input(tmp_path)
+    source_manifest = value.inputs.rust_project / "Cargo.toml"
+    source_manifest.write_text(manifest, encoding="utf-8")
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    if prefix:
+        assert output.error.startswith(expected)
+    else:
+        assert output.error == expected
+    assert [event[0] for event in tools.events] == ["build_tools"]
+    assert source_manifest.read_text(encoding="utf-8") == manifest
+
+
+def test_non_string_canonical_package_field_preserves_stage_failure_diagnostic(
+    tmp_path,
+):
+    value = stage_input(tmp_path)
+    manifest = (
+        '[lib]\npath = "lib.rs"\n\n[dependencies]\n'
+        'proctor-libc = { package = 7, version = "0.1" }\n'
+    )
+    source_manifest = value.inputs.rust_project / "Cargo.toml"
+    source_manifest.write_text(manifest, encoding="utf-8")
+    tools = FakeTools()
+
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+
+    assert output.status == "failure"
+    assert output.error == (
+        "StageFailure: Cargo dependency named proctor-libc aliases a different package"
+    )
+    assert [event[0] for event in tools.events] == ["build_tools"]
+    assert source_manifest.read_text(encoding="utf-8") == manifest
 
 
 def test_normalized_initial_build_failure_aborts_without_llm(tmp_path):
@@ -3817,6 +4363,7 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
         argument_count=1,
         rule_applied=True,
     )
+    record["printf_format_specifiers"] = ["%#08.4x"]
     assert loaded([record])[0].applied.contains_rule_application
     tools = FakeTools(
         skeletons=[record],
@@ -4654,7 +5201,7 @@ def test_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
     client = FakeClient([])
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "failure"
-    assert "mechanical replacement rejected" in output.error
+    assert output.error == "StageFailure: mechanical replacement rejected"
     assert client.requests == []
     assert output.metrics["repair_calls"] == 0
     assert output.metrics["cargo_builds"] == 1
@@ -4756,7 +5303,7 @@ def test_libc_guidance_is_consistent_across_repair_and_rule_fallback_prompts(
             "target",
             "target",
             [],
-            foreign_function_names=["strlen"],
+            foreign_function_names=["strtod"],
             transformation_labels=[0, 1],
         ),
         rule_labels=[0],
@@ -4777,7 +5324,11 @@ def test_libc_guidance_is_consistent_across_repair_and_rule_fallback_prompts(
     for request in client.requests:
         text = request.messages[0].content
         assert text.count(LIBC_GUIDANCE_MARKER) == 1
-        assert text.count("`proctor_libc::strlen`") == 1
+        assert text.count("`proctor_libc::strtod`") == 1
+        assert text.count("`proctor_libc::strtod_mut`") == 1
+        assert "immutable unconsumed suffix as `&[i8]`" in text
+        assert "mutable unconsumed suffix as `&mut [i8]`" in text
+        assert "StrtoFloatError::OutOfRange" in text
         assert request.metadata.prompt_version == 1
     assert (
         "The previous transformation failed."
@@ -4793,6 +5344,228 @@ def test_libc_guidance_is_consistent_across_repair_and_rule_fallback_prompts(
         record["applied"],
         record["baseline"],
     ]
+
+
+def test_printf_guidance_is_identical_across_initial_validation_and_build_repairs(
+    tmp_path,
+):
+    rule_member = printf_record(
+        0,
+        "rule_member",
+        "rule_member",
+        [1],
+        argument_count=1,
+        rule_applied=True,
+    )
+    rule_member["printf_format_specifiers"] = ["%#x"]
+    llm_member = printf_record(
+        1,
+        "llm_member",
+        "llm_member",
+        [0],
+        argument_count=1,
+    )
+    llm_member["printf_format_specifiers"] = ["%E"]
+    tools = FakeTools(
+        skeletons=[rule_member, llm_member],
+        builds=[
+            CommandResult(0),
+            CommandResult(101, "cargo out", "cargo err"),
+            CommandResult(0),
+        ],
+        validators=[INVALID, VALID, VALID],
+        candidates=["rejected applied candidate\n", "accepted baseline candidate\n"],
+    )
+    client = FakeClient([response(), response(), response()])
+
+    _, output = run_fake(tmp_path, tools, client)
+
+    assert output.status == "success"
+    assert len(client.requests) == 3
+    rendered_guidance = []
+    for request in client.requests:
+        text = request.messages[0].content
+        rendered_guidance.append(
+            text[text.index("The target skeleton's Rust format string") :]
+        )
+        assert "`proctor_libc::printf::unsigned(value)`" in text
+        assert "`proctor_libc::printf::scientific(value)`" in text
+        assert "`proctor_libc::printf::signed(value)`" not in text
+        assert "`proctor_libc::printf::byte_string(value)`" not in text
+        assert "`u8`, `u16`, `u32`, `u64`, and `usize`" in text
+        assert "`f32`, `f64`, and `f128::f128`" in text
+        assert "`i8`, `i16`, `i32`, `i64`, and `isize`" not in text
+        assert "`&[i8]`" not in text
+        for internal_name in (
+            "SignedValue",
+            "UnsignedValue",
+            "FixedValue",
+            "Signed<",
+            "Unsigned<",
+            "Fixed<",
+            "FixedUpper<",
+            "Scientific<",
+            "General<",
+            "GeneralUpper<",
+            "HexFloat<",
+            "ByteString",
+        ):
+            assert internal_name not in text
+        assert request.metadata.prompt_id == "local_transformation"
+        assert request.metadata.prompt_version == 1
+    assert all(
+        guidance.partition("\n11. When casting between references or slices")[0]
+        == rendered_guidance[0].partition(
+            "\n11. When casting between references or slices"
+        )[0]
+        for guidance in rendered_guidance[1:]
+    )
+    assert (
+        "The previous transformation failed."
+        not in client.requests[0].messages[0].content
+    )
+    assert json.dumps(INVALID) in client.requests[1].messages[0].content
+    assert "cargo out" in client.requests[2].messages[0].content
+    assert "cargo err" in client.requests[2].messages[0].content
+    validations = [event for event in tools.events if event[0] == "validate"]
+    assert [
+        [item["view"] for item in event[1]["expected_functions"]]
+        for event in validations
+    ] == [
+        [rule_member["applied"], llm_member["applied"]],
+        [rule_member["applied"], llm_member["applied"]],
+        [rule_member["baseline"], llm_member["baseline"]],
+    ]
+
+
+def test_prepared_ctype_and_four_format_record_compose_through_stage_acceptance(
+    tmp_path,
+):
+    specifiers = ["% d", "%#08.4x", "%10.3s", "%E"]
+    record = fn_record(
+        0,
+        "render",
+        "render",
+        [],
+        printf_format_specifiers=specifiers,
+        statement_pair_metadata=[
+            _pointer_metadata(
+                before=(
+                    '#[proctor(0)]\nprintf(b"% d %#08.4x %E %10.3s\\n\\0", d, x, f, s);'
+                ),
+                printf_template={
+                    "rust_format": "{} {:#08.4x} {:.6E} {:10.3}\n",
+                    "argument_count": 4,
+                },
+            )
+        ],
+    )
+    for view_name in ("baseline", "applied"):
+        record[view_name]["skeleton"] = (
+            "unsafe fn render() {\n"
+            "    #[proctor(0)]\n"
+            '    ::std::print!("{} {:#08.4x} {:.6E} {:10.3}\\n", '
+            "todo!(), todo!(), todo!(), todo!());\n"
+            "}"
+        )
+
+    class ComposedTools(FakeTools):
+        def prepare(self, current, passes, use_print):
+            super().prepare(current, passes, use_print)
+            library = current / "lib.rs"
+            source = library.read_text(encoding="utf-8")
+            assert "isalpha(d)" in source
+            assert "% d %#08.4x %E %10.3s" in source
+            library.write_text(
+                source.replace("isalpha(d)", "::proctor_libc::isalpha(d)"),
+                encoding="utf-8",
+            )
+
+        def make_skeleton(self, current, output, rule_set=None):
+            source = (current / "lib.rs").read_text(encoding="utf-8")
+            assert "::proctor_libc::isalpha(d)" in source
+            super().make_skeleton(current, output, rule_set)
+
+    observations = [
+        {"format_specifier": specifier, "accepted": True}
+        for specifier in ("% d", "%#08.4x", "%E", "%10.3s")
+    ]
+    accepted_statement = (
+        '#[proctor(0)]\n::std::print!("{} {:#08.4x} {:.6E} {:10.3}\\n", '
+        "::proctor_libc::printf::signed(d).space_sign(), "
+        "::proctor_libc::printf::unsigned(x), "
+        "::proctor_libc::printf::scientific(f), "
+        "::proctor_libc::printf::byte_string(s));"
+    )
+    tools = ComposedTools(
+        skeletons=[record],
+        builds=[CommandResult(0), CommandResult(0)],
+        validators=[VALID],
+        candidates=[f"unsafe fn render() {{ {accepted_statement} }}\n"],
+        sidecars=[
+            {
+                "schema_version": 1,
+                "statements": [
+                    {
+                        "item_id": 0,
+                        "path": "render",
+                        "label": 0,
+                        "after_statement": accepted_statement,
+                    }
+                ],
+            }
+        ],
+        observations=[
+            {
+                "schema_version": 1,
+                "observations": [],
+                "printf_observations": observations,
+            }
+        ],
+    )
+    client = FakeClient(
+        [f"```rust\nunsafe fn render() {{\n    {accepted_statement}\n}}\n```"]
+    )
+    value = stage_input(tmp_path)
+    (value.inputs.rust_project / "lib.rs").write_text(
+        'unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }\n'
+        "fn isalpha(c: i32) -> i32 { c }\n"
+        "unsafe fn render(d: i32, x: u32, f: f64, s: *const i8) {\n"
+        "    let _ = isalpha(d);\n"
+        '    printf(b"% d %#08.4x %E %10.3s\\n\\0" as *const u8 as *const i8, '
+        "d, x, f, s);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=lambda settings, tracker: client,
+    )
+
+    assert output.status == "success"
+    assert len(client.requests) == 1
+    prompt = client.requests[0].messages[0].content
+    for wrapper in ("signed", "unsigned", "scientific", "byte_string"):
+        assert prompt.count(f"proctor_libc::printf::{wrapper}") == 1
+    assert "chain `.space_sign()` directly on the adapter call result" in prompt
+    replacement = next(event for event in tools.events if event[0] == "replace")
+    assert replacement[2]["items"][0]["view"]["statement_pair_metadata"][0][
+        "printf_template"
+    ] == {
+        "rust_format": "{} {:#08.4x} {:.6E} {:10.3}\n",
+        "argument_count": 4,
+    }
+    operations = [event[0] for event in tools.events]
+    assert operations.index("prepare") < operations.index("make_skeleton")
+    assert operations.index("make_skeleton") < operations.index("replace")
+    assert operations.index("replace") < operations.index("extract_observations")
+    merged = json.loads(
+        (value.outputs.artifacts_dir / "observations.json").read_text(encoding="utf-8")
+    )
+    assert merged["printf_observations"] == observations
 
 
 def test_missing_fence_consumes_repair_without_validator_call(tmp_path):
