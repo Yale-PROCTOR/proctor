@@ -2,7 +2,7 @@
 id = "local_transformation"
 version = 1
 description = "Transform one Rust function SCC against Crat skeletons."
-variables = ["dependency_context", "transformation_targets", "repair_context", "use_xj_scanf_guidance", "libc_guidance", "printf_guidance", "foreign_static_guidance"]
+variables = ["dependency_context", "transformation_targets", "repair_context", "use_xj_scanf_guidance", "libc_guidance", "printf_guidance", "proctor_libc_call_guidance", "foreign_static_guidance"]
 +++
 You are transforming unsafe Rust functions generated from C.
 
@@ -114,7 +114,9 @@ Requirements:
 
     {{ libc_guidance | replace('\n', '\n    ') }}{% endif %}{% if printf_guidance %}
 
-    {{ printf_guidance | replace('\n', '\n    ') }}{% endif %}{% if foreign_static_guidance %}
+    {{ printf_guidance | replace('\n', '\n    ') }}{% endif %}{% if proctor_libc_call_guidance %}
+
+    {{ proctor_libc_call_guidance | replace('\n', '\n    ') }}{% endif %}{% if foreign_static_guidance %}
 
     {{ foreign_static_guidance | replace('\n', '\n    ') }}{% endif %}
 11. When casting between references or slices, avoid unsafe code by using these

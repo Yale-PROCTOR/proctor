@@ -34,6 +34,7 @@ class PromptRenderInput:
     use_xj_scanf_guidance: bool = False
     libc_guidance: str = ""
     printf_guidance: str = ""
+    proctor_libc_call_guidance: str = ""
     foreign_static_guidance: str = ""
 
 
@@ -189,6 +190,7 @@ def render_prompt(
         use_xj_scanf_guidance=value.use_xj_scanf_guidance,
         libc_guidance=value.libc_guidance,
         printf_guidance=value.printf_guidance,
+        proctor_libc_call_guidance=value.proctor_libc_call_guidance,
         foreign_static_guidance=value.foreign_static_guidance,
     )
 

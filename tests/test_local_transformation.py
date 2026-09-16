@@ -184,6 +184,7 @@ def fn_record(
     transformation_labels: list[int] | None = None,
     statement_pair_metadata: list[dict[str, object]] | None = None,
     printf_format_specifiers: list[str] | None = None,
+    proctor_libc_function_paths: list[str] | None = None,
     foreign_function_names: list[str] | None = None,
     foreign_static_names: list[str] | None = None,
 ) -> dict[str, object]:
@@ -238,6 +239,9 @@ def fn_record(
         "target_signature": f"unsafe fn {name}()",
         "printf_format_specifiers": (
             [] if printf_format_specifiers is None else printf_format_specifiers
+        ),
+        "proctor_libc_function_paths": (
+            [] if proctor_libc_function_paths is None else proctor_libc_function_paths
         ),
         "foreign_function_names": (
             [] if foreign_function_names is None else foreign_function_names
@@ -1256,6 +1260,7 @@ def test_function_records_and_python_helpers_add_statement_pair_metadata():
         "source_signature",
         "target_signature",
         "printf_format_specifiers",
+        "proctor_libc_function_paths",
         "foreign_function_names",
         "foreign_static_names",
         "signature_dependencies",
@@ -1263,16 +1268,19 @@ def test_function_records_and_python_helpers_add_statement_pair_metadata():
     ]
     assert plain["baseline"]["statement_pair_metadata"]
     assert plain["printf_format_specifiers"] == []
+    assert plain["proctor_libc_function_paths"] == []
     assert plain["foreign_function_names"] == []
     assert plain["foreign_static_names"] == []
     assert scalar_records()[0].foreign_function_names == ()
     assert scalar_records()[0].printf_format_specifiers == ()
+    assert scalar_records()[0].proctor_libc_function_paths == ()
     assert scalar_records()[0].foreign_static_names == ()
     assert foreign_function_records()[1].foreign_function_names == ("free", "strlen")
 
     point = type_record(1, "Point", "Struct", "struct Point;", [])
     assert "foreign_function_names" not in point
     assert "printf_format_specifiers" not in point
+    assert "proctor_libc_function_paths" not in point
     assert "foreign_static_names" not in point
     assert item_kind_records()[0].foreign_function_names == ()
     assert item_kind_records()[0].foreign_static_names == ()
@@ -1282,6 +1290,7 @@ def test_function_records_and_python_helpers_add_statement_pair_metadata():
     ("field", "attribute"),
     [
         ("printf_format_specifiers", "printf_format_specifiers"),
+        ("proctor_libc_function_paths", "proctor_libc_function_paths"),
         ("foreign_function_names", "foreign_function_names"),
         ("foreign_static_names", "foreign_static_names"),
     ],
@@ -1313,6 +1322,7 @@ def test_loader_requires_sorted_unique_nonempty_foreign_names(field, attribute):
     non_function = type_record(1, "Point", "Struct", "struct Point;", [])
     assert "foreign_function_names" not in non_function
     assert "printf_format_specifiers" not in non_function
+    assert "proctor_libc_function_paths" not in non_function
     assert "foreign_static_names" not in non_function
     assert loaded([non_function])[0].foreign_function_names == ()
     assert loaded([non_function])[0].foreign_static_names == ()
@@ -1333,6 +1343,25 @@ def test_printf_format_specifier_wire_rejects_boolean_and_unknown_key_exactly():
         loaded([unknown])
     assert str(error.value) == (
         "record 0 contains unknown fields ['printf_format_specifier']"
+    )
+
+
+def test_proctor_libc_function_path_wire_is_strict_and_function_only():
+    boolean = fn_record(0, "scalar", "scalar", [])
+    boolean["proctor_libc_function_paths"] = True
+    with pytest.raises(SkeletonError) as error:
+        loaded([boolean])
+    assert str(error.value) == (
+        "record 0 field 'proctor_libc_function_paths' must be an array"
+    )
+
+    non_function = type_record(1, "Point", "Struct", "struct Point;", [])
+    non_function["proctor_libc_function_paths"] = []
+    with pytest.raises(SkeletonError) as error:
+        loaded([non_function])
+    assert str(error.value) == (
+        "record 1 must contain exactly "
+        "['definition', 'dependencies', 'id', 'kind', 'path']"
     )
 
 
@@ -1719,7 +1748,8 @@ def test_version_one_prompt_has_exact_format_guidance_slot_and_metadata():
     assert prompt_source.splitlines()[4] == (
         'variables = ["dependency_context", "transformation_targets", '
         '"repair_context", "use_xj_scanf_guidance", "libc_guidance", '
-        '"printf_guidance", "foreign_static_guidance"]'
+        '"printf_guidance", "proctor_libc_call_guidance", '
+        '"foreign_static_guidance"]'
     )
 
     empty = render_prompt(PromptRenderInput("DEPENDENCY", "TARGETS"))
@@ -2348,6 +2378,55 @@ def test_libc_guidance_ignores_nonmember_metadata():
     assert stage_module._libc_guidance((0,), records_by_id) == ""
 
 
+def test_proctor_libc_call_guidance_uses_only_current_scc_resolved_paths():
+    records = loaded(
+        [
+            fn_record(
+                0,
+                "target",
+                "target",
+                [1],
+                proctor_libc_function_paths=[
+                    "proctor_libc::isalpha",
+                    "proctor_libc::printf::signed",
+                ],
+            ),
+            fn_record(
+                1,
+                "dependency",
+                "dependency",
+                [],
+                proctor_libc_function_paths=["proctor_libc::isdigit"],
+            ),
+            fn_record(
+                2,
+                "peer",
+                "peer",
+                [0],
+                proctor_libc_function_paths=["proctor_libc::isalpha"],
+            ),
+        ]
+    )
+    records_by_id = {record.id: record for record in records}
+    guidance = stage_module._proctor_libc_call_guidance((2, 0), records_by_id)
+    assert guidance == stage_module._proctor_libc_call_guidance((0, 2), records_by_id)
+    assert guidance.count("`proctor_libc::isalpha`") == 1
+    assert "`proctor_libc::printf::signed`" in guidance
+    assert "proctor_libc::isdigit" not in guidance
+    assert "When rewriting a transformation region containing one" in guidance
+    assert "retain the same resolved `proctor_libc` callee" in guidance
+    assert "substituting, inlining, or reimplementing" in guidance
+    assert "do not require the same source spelling" in guidance
+    assert stage_module._proctor_libc_call_guidance((), records_by_id) == ""
+
+    empty = render_prompt(PromptRenderInput("DEPENDENCY", "TARGETS"))
+    assert "source calls in the current SCC" not in empty.text
+    rendered = render_prompt(
+        PromptRenderInput("DEPENDENCY", "TARGETS", proctor_libc_call_guidance=guidance)
+    )
+    assert guidance in rendered.text
+
+
 def test_libc_guidance_order_and_deduplication_are_catalog_driven():
     forward = render_libc_guidance(["strlen", "getc", "strlen", "fgetc"])
     reverse = render_libc_guidance(["fgetc", "strlen", "getc", "strlen"])
@@ -2869,7 +2948,13 @@ def test_replacement_request_is_exact_and_member_ordered():
 
 def test_foreign_metadata_does_not_change_graph_or_tool_requests():
     records = tuple(
-        replace(record, foreign_static_names=("stdout",)) if record.id == 2 else record
+        replace(
+            record,
+            foreign_static_names=("stdout",),
+            proctor_libc_function_paths=("proctor_libc::isalpha",),
+        )
+        if record.id == 2
+        else record
         for record in foreign_function_records()
     )
     records_by_id = {record.id: record for record in records}
@@ -2892,6 +2977,8 @@ def test_foreign_metadata_does_not_change_graph_or_tool_requests():
     assert "foreign_function_names" not in replacement["items"][0]
     assert "foreign_static_names" not in validation["expected_functions"][0]
     assert "foreign_static_names" not in replacement["items"][0]
+    assert "proctor_libc_function_paths" not in validation["expected_functions"][0]
+    assert "proctor_libc_function_paths" not in replacement["items"][0]
     assert list(validation["expected_functions"][0]) == [
         "id",
         "name",
@@ -4510,6 +4597,7 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
         rule_applied=True,
     )
     record["printf_format_specifiers"] = ["%#08.4x"]
+    record["proctor_libc_function_paths"] = ["proctor_libc::printf::unsigned"]
     assert loaded([record])[0].applied.contains_rule_application
     tools = FakeTools(
         skeletons=[record],
@@ -5078,7 +5166,16 @@ def test_build_failure_without_rule_application_repairs_in_same_view(tmp_path):
 
 def test_all_preserved_singleton_skips_llm_and_validator(tmp_path):
     tools = FakeTools(
-        skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
+        skeletons=[
+            fn_record(
+                0,
+                "target",
+                "target",
+                [],
+                needs_transformation=False,
+                proctor_libc_function_paths=["proctor_libc::isalpha"],
+            )
+        ],
         builds=[CommandResult(0), CommandResult(0)],
         candidates=["mechanical\n"],
     )
@@ -5504,6 +5601,7 @@ def test_printf_guidance_is_identical_across_initial_validation_and_build_repair
         rule_applied=True,
     )
     rule_member["printf_format_specifiers"] = ["%#x", "%d"]
+    rule_member["proctor_libc_function_paths"] = ["proctor_libc::isalpha"]
     llm_member = printf_record(
         1,
         "llm_member",
@@ -5512,6 +5610,10 @@ def test_printf_guidance_is_identical_across_initial_validation_and_build_repair
         argument_count=1,
     )
     llm_member["printf_format_specifiers"] = ["%E"]
+    llm_member["proctor_libc_function_paths"] = [
+        "proctor_libc::isalpha",
+        "proctor_libc::printf::scientific",
+    ]
     tools = FakeTools(
         skeletons=[rule_member, llm_member],
         builds=[
@@ -5542,6 +5644,9 @@ def test_printf_guidance_is_identical_across_initial_validation_and_build_repair
         assert "`f32`, `f64`, and `f128::f128`" in text
         assert "`i8`, `i16`, `i32`, `i64`, and `isize`" not in text
         assert "`&[i8]`" not in text
+        assert text.count("`proctor_libc::isalpha`") == 1
+        assert "`proctor_libc::printf::scientific`" in text
+        assert "When rewriting a transformation region containing one" in text
         for internal_name in (
             "SignedValue",
             "UnsignedValue",

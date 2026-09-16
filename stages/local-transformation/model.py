@@ -307,6 +307,7 @@ class ItemRecord:
     source_signature: str | None = None
     target_signature: str | None = None
     printf_format_specifiers: tuple[str, ...] = ()
+    proctor_libc_function_paths: tuple[str, ...] = ()
     foreign_function_names: tuple[str, ...] = ()
     foreign_static_names: tuple[str, ...] = ()
     declaration: str | None = None
@@ -1514,6 +1515,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             "source_signature",
             "target_signature",
             "printf_format_specifiers",
+            "proctor_libc_function_paths",
             "foreign_function_names",
             "foreign_static_names",
             "signature_dependencies",
@@ -1546,6 +1548,9 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             target_signature=_string(data, "target_signature", record_id),
             printf_format_specifiers=_foreign_names(
                 data, "printf_format_specifiers", record_id
+            ),
+            proctor_libc_function_paths=_foreign_names(
+                data, "proctor_libc_function_paths", record_id
             ),
             foreign_function_names=_foreign_names(
                 data, "foreign_function_names", record_id

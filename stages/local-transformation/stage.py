@@ -171,6 +171,30 @@ def _printf_guidance(
     )
 
 
+def _proctor_libc_call_guidance(
+    members: tuple[int, ...], records_by_id: dict[int, ItemRecord]
+) -> str:
+    paths = sorted(
+        {
+            path
+            for item_id in members
+            for path in records_by_id[item_id].proctor_libc_function_paths
+        }
+    )
+    if not paths:
+        return ""
+    identities = ", ".join(f"`{path}`" for path in paths)
+    return (
+        "The following source calls in the current SCC resolve to functions supplied "
+        f"by `proctor_libc`: {identities}. These calls implement this pipeline's "
+        "approved semantics safely and idiomatically. When rewriting a transformation "
+        "region containing one, retain the same resolved `proctor_libc` callee rather "
+        "than substituting, inlining, or reimplementing it. Adapt arguments and "
+        "surrounding code as required by the target types. The canonical paths identify "
+        "the resolved callees; they do not require the same source spelling."
+    )
+
+
 def _foreign_static_guidance(
     members: tuple[int, ...], records_by_id: dict[int, ItemRecord]
 ) -> str:
@@ -1393,6 +1417,7 @@ def _process_scc(
     use_xj_scanf_guidance = _uses_xj_scanf_guidance(members, records_by_id)
     libc_guidance = _libc_guidance(members, records_by_id)
     printf_guidance = _printf_guidance(members, records_by_id)
+    proctor_libc_call_guidance = _proctor_libc_call_guidance(members, records_by_id)
     foreign_static_guidance = _foreign_static_guidance(members, records_by_id)
     context: str | None = None
     applied_views = {
@@ -1431,6 +1456,7 @@ def _process_scc(
                     use_xj_scanf_guidance=use_xj_scanf_guidance,
                     libc_guidance=libc_guidance,
                     printf_guidance=printf_guidance,
+                    proctor_libc_call_guidance=proctor_libc_call_guidance,
                     foreign_static_guidance=foreign_static_guidance,
                 )
             )
