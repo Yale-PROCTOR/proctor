@@ -105,6 +105,18 @@ with no keys and no network. Unit tests can also inject a fake provider
 directly: `LlmClient(settings, provider=fake, sleep=lambda _: None)`
 (see `tests/test_llm.py`).
 
+## Running a pipeline with an LLM stage
+
+Any stage that uses the client picks up provider/model/pricing from the
+`[llm]` table (global, or a per-stage `[stages.<id>.llm]` override). Run
+one end-to-end and see cost via `proctor report`:
+
+```bash
+export ANTHROPIC_API_KEY=...        # or OPENAI_API_KEY, per api_key_env
+uv run proctor run -c configs/llm_example.toml --input-rust tests/e2e/fixtures/001_helloworld/c2rust
+uv run proctor report runs/ --group-by stage,model   # tokens + cost
+```
+
 ## Adding a provider
 
 One module in `providers/` with pure `build_payload`/`parse_http`
