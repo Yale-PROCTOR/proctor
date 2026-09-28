@@ -19,14 +19,15 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from proctor.testing.idiomaticity_eval import IdiomEvalError, measure_idiomaticity
-from proctor.testing.metrics import _measure, _pct
+from proctor.testing.metrics import StageMetrics, _measure, _pct
 from proctor.testing.unsafe_eval import UnsafeEvalError, measure_unsafe
 from proctor.testing.vector_compare import stage_rust_outputs
 
 
-def _vectors_cell(c: dict) -> str:
+def _vectors_cell(c: dict[str, Any]) -> str:
     total = c.get("passed", 0) + c.get("skipped", 0) + c.get("failed", 0)
     cell = f"{c.get('passed', 0)}/{total}"
     skip = c.get("skipped", 0)
@@ -38,11 +39,11 @@ def _vectors_cell(c: dict) -> str:
     return cell
 
 
-def _sorted_cases(d: dict) -> list[dict]:
+def _sorted_cases(d: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(d.get("cases", []), key=lambda c: c["case"])
 
 
-def _header(vj: Path, d: dict, note: str) -> None:
+def _header(vj: Path, d: dict[str, Any], note: str) -> None:
     print(f"verify + metrics: {vj}")
     print(
         f"{d.get('suite', '?')}   {d.get('cases_ok', 0)}/{d.get('cases_total', 0)} "
@@ -51,7 +52,7 @@ def _header(vj: Path, d: dict, note: str) -> None:
     print("=" * 78)
 
 
-def _final_report(vj: Path, d: dict, do_idiom: bool) -> int:
+def _final_report(vj: Path, d: dict[str, Any], do_idiom: bool) -> int:
     """One row per case: vectors + the final-stage translation's metrics."""
     _header(vj, d, "(metrics: final stage)")
     print(f"{'case':<26}{'vectors':<18}{'unsafe (score/KLOC)':<24}{'clippy':<8}")
@@ -98,12 +99,12 @@ def _final_report(vj: Path, d: dict, do_idiom: bool) -> int:
     return 0
 
 
-def _print_case_stages(leaf: str, vcell: str, rows: list) -> None:
+def _print_case_stages(leaf: str, vcell: str, rows: list[StageMetrics]) -> None:
     """Compact per-stage table for one case (no repeated footer)."""
-    have_u = [r for r in rows if r.unsafe]
-    base_u = have_u[0].unsafe.score if have_u else 0
-    have_i = [r for r in rows if r.idiom]
-    base_i = have_i[0].idiom.total if have_i else 0
+    u_scores = [r.unsafe.score for r in rows if r.unsafe]
+    base_u = u_scores[0] if u_scores else 0
+    i_totals = [r.idiom.total for r in rows if r.idiom]
+    base_i = i_totals[0] if i_totals else 0
 
     print(f"== {leaf} ==   vectors {vcell}")
     print(f"  {'stage':<22}{'unsafe (score/KLOC)':<26}{'clippy':<18}{'LOC':>6}")
@@ -123,7 +124,7 @@ def _print_case_stages(leaf: str, vcell: str, rows: list) -> None:
     print()
 
 
-def _per_stage_report(vj: Path, d: dict, do_idiom: bool) -> int:
+def _per_stage_report(vj: Path, d: dict[str, Any], do_idiom: bool) -> int:
     """A table per case with every stage, plus suite totals. Vectors (final
     stage only) are shown in each case header."""
     _header(vj, d, "(metrics: every stage; vectors = final stage)")

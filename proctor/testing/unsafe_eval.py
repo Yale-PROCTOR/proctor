@@ -17,6 +17,7 @@ import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 _TOOL_DIR = Path(__file__).resolve().parent.parent.parent / "tools" / "measure_unsafety"
 _BIN = _TOOL_DIR / "target" / "release" / "measure_unsafety"
@@ -58,7 +59,7 @@ class UnsafeReport:
     total_statements: int
     files_scanned: int = 0
     files_skipped: int = 0
-    raw: dict = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
 
     @property
     def per_kloc(self) -> float:
@@ -77,7 +78,7 @@ class UnsafeReport:
 
     @classmethod
     def from_stats(
-        cls, d: dict, *, files_scanned: int = 0, files_skipped: int = 0
+        cls, d: dict[str, Any], *, files_scanned: int = 0, files_skipped: int = 0
     ) -> UnsafeReport:
         return cls(
             score=d.get("unsafe_score", 0),

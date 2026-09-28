@@ -17,6 +17,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 _TOOL_DIR = (
     Path(__file__).resolve().parent.parent.parent / "tools" / "measure_idiomaticity"
@@ -40,7 +41,7 @@ class IdiomReport:
     by_group: dict[str, dict[str, int]]  # {group: {lint: count}}
     complexity: dict[int, int] = field(default_factory=dict)  # {cog-complexity: n fns}
     loc: int = 0  # source lines, for per-KLOC normalization (0 = unknown)
-    raw: dict = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total(self) -> int:

@@ -22,6 +22,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from proctor.testing.vector_compare import stage_rust_outputs
 from proctor.testing.vector_harness import VectorHarnessError
@@ -256,7 +257,7 @@ def _emit(
     write ``<junit>.json``. In gate mode, a row that fell back to crat is
     annotated with what abstraction_recovery scored."""
     tot_p = tot_s = tot_fs = tot_f = n_ok = n_fallback = 0
-    case_rows: list[dict] = []
+    case_rows: list[dict[str, Any]] = []
     for row in sorted(rows, key=lambda x: x.accepted.case):
         r = row.accepted
         leaf = r.case.split("/")[-1]

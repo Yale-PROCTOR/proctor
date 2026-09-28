@@ -21,6 +21,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from proctor.testing.idiomaticity_eval import (
     IdiomEvalError,
@@ -79,10 +80,10 @@ def _print_one(crate: Path, m: StageMetrics) -> None:
 
 
 def _print_stage_table(rows: list[StageMetrics]) -> None:
-    have_unsafe = [r for r in rows if r.unsafe]
-    base_u = have_unsafe[0].unsafe.score if have_unsafe else 0
-    have_idiom = [r for r in rows if r.idiom]
-    base_i = have_idiom[0].idiom.total if have_idiom else 0
+    u_scores = [r.unsafe.score for r in rows if r.unsafe]
+    base_u = u_scores[0] if u_scores else 0
+    i_totals = [r.idiom.total for r in rows if r.idiom]
+    base_i = i_totals[0] if i_totals else 0
 
     print(f"{'stage':<22}{'unsafe (score/KLOC)':<26}{'clippy (lints)':<22}{'LOC':>6}")
     print("-" * 76)
@@ -106,10 +107,10 @@ def _print_stage_table(rows: list[StageMetrics]) -> None:
     print(" % is vs the first stage — negative is an improvement)")
 
 
-def _to_json(rows: list[StageMetrics]) -> list[dict]:
+def _to_json(rows: list[StageMetrics]) -> list[dict[str, Any]]:
     out = []
     for r in rows:
-        d: dict = {"stage": r.stage}
+        d: dict[str, Any] = {"stage": r.stage}
         if r.unsafe:
             d["unsafe"] = {
                 "score": r.unsafe.score,

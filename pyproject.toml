@@ -35,6 +35,7 @@ extend-exclude = [
     "stages/c2rust",
     "tests/e2e/fixtures",
     "tools/tractor_runtests",
+    "tools/measure_idiomaticity",
     "tractor-test-corpus",
 ]
 
