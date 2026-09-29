@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from protocol import (
+    add_functions_command,
     extract_observations_command,
+    finalize_project_command,
+    make_initial_command,
     make_skeleton_command,
     merge_observations_command,
     normalize_safety_command,
@@ -272,6 +275,29 @@ class CratTools:
                 f"or symlink: {path}"
             )
 
+    @staticmethod
+    def _validate_project_outputs(
+        outputs: tuple[Path, ...],
+        projects: tuple[Path, ...],
+        inputs: tuple[Path, ...] = (),
+    ) -> None:
+        roots = tuple(project.resolve() for project in projects)
+        input_paths = {path.resolve() for path in inputs}
+        for output in outputs:
+            publication_path = output.parent.resolve() / output.name
+            target_path = output.resolve()
+            if (
+                any(
+                    publication_path.is_relative_to(root)
+                    or target_path.is_relative_to(root)
+                    for root in roots
+                )
+                or target_path in input_paths
+            ):
+                raise StageFailure(
+                    f"crat-tool output {output} overlaps an input project or file"
+                )
+
     def replace(
         self,
         current_project: Path,
@@ -330,6 +356,109 @@ class CratTools:
                     path.unlink()
             raise
 
+    def make_initial(self, analysis_project: Path, output: Path) -> None:
+        assert self.crat_tool is not None
+        self._validate_project_outputs((output,), (analysis_project,))
+        self._clear_replace_output(output)
+        try:
+            self._run(
+                "crat-tool make-initial",
+                make_initial_command(self.crat_tool, analysis_project, output),
+                env=self.environment,
+            )
+            self._require_regular_output("crat-tool make-initial", output)
+        except Exception:
+            if output.is_symlink() or output.is_file():
+                output.unlink()
+            raise
+
+    def add_functions(
+        self,
+        analysis_project: Path,
+        current_project: Path,
+        request: Path,
+        output: Path,
+        statement_pairs_output: Path,
+        observation_source_output: Path,
+        observation_metadata_output: Path,
+    ) -> None:
+        assert self.crat_tool is not None
+        paths = (
+            output,
+            statement_pairs_output,
+            observation_source_output,
+            observation_metadata_output,
+        )
+        if len(set(paths)) != len(paths):
+            raise StageFailure("crat-tool add-functions output paths must be distinct")
+        self._validate_project_outputs(
+            paths, (analysis_project, current_project), (request,)
+        )
+        for path in paths:
+            self._clear_replace_output(path)
+        try:
+            self._run(
+                "crat-tool add-functions",
+                add_functions_command(
+                    self.crat_tool,
+                    analysis_project,
+                    current_project,
+                    request,
+                    output,
+                    statement_pairs_output,
+                    observation_source_output,
+                    observation_metadata_output,
+                ),
+                env=self.environment,
+            )
+            for path in paths:
+                self._require_regular_output("crat-tool add-functions", path)
+        except Exception:
+            for path in paths:
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+            raise
+
+    def finalize_project(
+        self,
+        analysis_project: Path,
+        current_project: Path,
+        manifest: Path,
+        output: Path,
+        manifest_output: Path,
+    ) -> None:
+        assert self.crat_tool is not None
+        paths = (output, manifest_output)
+        if len(set(paths)) != len(paths):
+            raise StageFailure(
+                "crat-tool finalize-project output paths must be distinct"
+            )
+        self._validate_project_outputs(
+            paths, (analysis_project, current_project), (manifest,)
+        )
+        for path in paths:
+            self._clear_replace_output(path)
+        try:
+            self._run(
+                "crat-tool finalize-project",
+                finalize_project_command(
+                    self.crat_tool,
+                    analysis_project,
+                    current_project,
+                    manifest,
+                    output,
+                    manifest_output,
+                ),
+                env=self.environment,
+            )
+            for path in paths:
+                self._require_regular_output("crat-tool finalize-project", path)
+        except Exception:
+            for path in paths:
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+            raise
+
     def extract_observations(
         self,
         observation_source: Path,
@@ -357,10 +486,13 @@ class CratTools:
                 output.unlink()
             raise
 
-    def cargo_build(self, current_project: Path) -> CommandResult:
-        result = self.run_command(["cargo", "build"], cwd=current_project, env=None)
+    def cargo_build(
+        self, current_project: Path, *, library_only: bool = False
+    ) -> CommandResult:
+        command = ["cargo", "build", *(["--lib"] if library_only else [])]
+        result = self.run_command(command, cwd=current_project, env=None)
         with self.log_path.open("a", encoding="utf-8") as log:
-            log.write("$ cargo build\n")
+            log.write(f"$ {' '.join(command)}\n")
             log.write(result.stdout)
             log.write(result.stderr)
         return result
@@ -407,3 +539,52 @@ def install_candidate_transaction(
             f"stderr: {build_result.stderr!r}: {restore_error}"
         ) from restore_error
     return build_result
+
+
+def install_final_transaction(
+    library_source: Path,
+    candidate_source: Path,
+    manifest: Path,
+    candidate_manifest: Path,
+    rollback_dir: Path,
+    builder: Callable[[], CommandResult],
+) -> CommandResult:
+    for path in (candidate_source, candidate_manifest):
+        if path.is_symlink() or not path.is_file():
+            raise StageFailure(f"finalization output is not a regular file: {path}")
+    rollback_dir.mkdir(parents=True, exist_ok=True)
+    backups = (
+        (library_source, rollback_dir / "final-library.rollback", candidate_source),
+        (manifest, rollback_dir / "final-manifest.rollback", candidate_manifest),
+    )
+    for original, backup, _ in backups:
+        shutil.copy2(original, backup)
+    installed = 0
+
+    def restore(reason: str) -> None:
+        failures = []
+        for original, backup, _ in reversed(backups[:installed]):
+            try:
+                os.replace(backup, original)
+            except OSError as error:
+                failures.append(f"{original}: {error}")
+        if failures:
+            raise StageFailure(
+                f"failed to restore finalization files after {reason}: "
+                f"{'; '.join(failures)}"
+            )
+
+    try:
+        for original, _, candidate in backups:
+            os.replace(candidate, original)
+            installed += 1
+        result = builder()
+    except Exception as error:
+        restore(f"{type(error).__name__}: {error}")
+        raise
+    if result.returncode != 0:
+        restore(f"cargo build failure ({result.returncode})")
+        return result
+    for _, backup, _ in backups:
+        backup.unlink()
+    return result

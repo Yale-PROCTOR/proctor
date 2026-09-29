@@ -26,6 +26,7 @@ from proctor.llm.types import (
 
 from model import (
     ContextOverflow,
+    ObservationError,
     PointerVariableMetadata,
     PointerVariableOrigin,
     PrintfTemplateMetadata,
@@ -43,9 +44,12 @@ from model import (
 from protocol import (
     NO_FENCE_DIAGNOSTIC,
     PromptRenderInput,
+    add_functions_command,
     extract_code_block,
     extract_observations_command,
+    finalize_project_command,
     llm_request,
+    make_initial_command,
     make_skeleton_command,
     merge_observations_command,
     normalize_safety_command,
@@ -3089,6 +3093,83 @@ def test_command_builders_use_exact_four_output_and_extract_argv():
     ]
 
 
+def test_additive_command_builders_keep_analysis_and_current_roles_distinct():
+    tool = Path("/tools/crat-tool")
+    analysis = Path("/work/analysis")
+    current = Path("/work/current")
+    assert make_initial_command(tool, analysis, Path("/work/initial.rs")) == [
+        "/tools/crat-tool",
+        "make-initial",
+        "--output",
+        "/work/initial.rs",
+        "/work/analysis",
+    ]
+    assert add_functions_command(
+        tool,
+        analysis,
+        current,
+        Path("/work/request.json"),
+        Path("/work/candidate.rs"),
+        Path("/work/pairs.json"),
+        Path("/work/observation.rs"),
+        Path("/work/metadata.json"),
+    ) == [
+        "/tools/crat-tool",
+        "add-functions",
+        "--request",
+        "/work/request.json",
+        "--current-project",
+        "/work/current",
+        "--output",
+        "/work/candidate.rs",
+        "--statement-pairs-output",
+        "/work/pairs.json",
+        "--observation-source-output",
+        "/work/observation.rs",
+        "--observation-metadata-output",
+        "/work/metadata.json",
+        "/work/analysis",
+    ]
+    assert finalize_project_command(
+        tool,
+        analysis,
+        current,
+        current / "proctor.toml",
+        Path("/work/final.rs"),
+        Path("/work/final-proctor.toml"),
+    ) == [
+        "/tools/crat-tool",
+        "finalize-project",
+        "--manifest",
+        "/work/current/proctor.toml",
+        "--current-project",
+        "/work/current",
+        "--output",
+        "/work/final.rs",
+        "--manifest-output",
+        "/work/final-proctor.toml",
+        "/work/analysis",
+    ]
+
+
+def test_cargo_build_selects_library_for_incremental_checks(tmp_path):
+    commands = []
+
+    def runner(command, *, cwd=None, env=None):
+        commands.append((command, cwd))
+        return CommandResult(0)
+
+    tools = CratTools(tmp_path / "tool.log", run_command=runner)
+    project = tmp_path / "current"
+    project.mkdir()
+    tools.cargo_build(project, library_only=True)
+    tools.cargo_build(project)
+    assert commands == [
+        (["cargo", "build", "--lib"], project),
+        (["cargo", "build"], project),
+    ]
+
+
 VALID = {"schema_version": 1, "status": "valid"}
 INVALID = {
     "schema_version": 1,
@@ -3132,14 +3213,15 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
         "item_id": 7,
         "logical_path": "read",
         "implementation_path": "read",
-        "wrapper_path": "__proctor_wrapper_read",
+        "wrapper_path": None,
     }
     valid = {
-        "schema_version": 1,
+        "schema_version": 2,
         "candidate_sha256": "6c3ea56d9debffcf25243e9a41d58805af269772d266088c83d19053f7ccebf1",
         "statement_pairs_sha256": "2b8e6af47f728734179fa6d023e74d812a888e65d4f111e8ff4a6c01f75c823b",
         "observation_source_sha256": "5d00cc190ae11801bb4ae2af09f7eacb12c2fee35f8645b1aef611a12cf09fd0",
         "accepted_correspondence": [],
+        "source_stubs": [],
         "new_correspondence": [correspondence],
         "current_items": [
             {
@@ -3183,6 +3265,26 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
         (),
     )
     assert parsed.current_items[0].source_copy_path == "__proctor_source_read"
+
+    wrong_implementation = copy.deepcopy(valid)
+    wrong_implementation["new_correspondence"][0]["implementation_path"] = "other"
+    wrong_implementation["current_items"][0]["implementation_path"] = "other"
+    metadata_path.write_text(json.dumps(wrong_implementation))
+    with pytest.raises(StageFailure, match="paths do not match requested path read"):
+        _load_and_validate_replacement_metadata(
+            metadata_path,
+            candidate,
+            statement_pairs,
+            observation_source,
+            (7,),
+            {7: record},
+            (),
+        )
+
+    floating_version = copy.deepcopy(valid)
+    floating_version["schema_version"] = 2.0
+    with pytest.raises(ObservationError, match="schema_version 2.0"):
+        load_replacement_metadata(json.dumps(floating_version))
 
     for field, message in (
         ("candidate_sha256", "does not match candidate bytes"),
@@ -3253,19 +3355,20 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             (),
         )
 
-    absent = copy.deepcopy(valid)
-    absent["new_correspondence"][0]["wrapper_path"] = None
-    absent["current_items"][0]["wrapper_path"] = None
-    metadata_path.write_text(json.dumps(absent))
-    _load_and_validate_replacement_metadata(
-        metadata_path,
-        candidate,
-        statement_pairs,
-        observation_source,
-        (7,),
-        {7: record},
-        (),
-    )
+    with_wrapper = copy.deepcopy(valid)
+    with_wrapper["new_correspondence"][0]["wrapper_path"] = "__proctor_wrapper_read"
+    with_wrapper["current_items"][0]["wrapper_path"] = "__proctor_wrapper_read"
+    metadata_path.write_text(json.dumps(with_wrapper))
+    with pytest.raises(StageFailure, match="cannot contain a wrapper path"):
+        _load_and_validate_replacement_metadata(
+            metadata_path,
+            candidate,
+            statement_pairs,
+            observation_source,
+            (7,),
+            {7: record},
+            (),
+        )
 
     second_record = loaded(
         [
@@ -3285,7 +3388,7 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             "item_id": 8,
             "logical_path": "other",
             "implementation_path": "other",
-            "wrapper_path": "__proctor_wrapper_other",
+            "wrapper_path": None,
         }
     )
     two["current_items"].append(
@@ -3326,14 +3429,13 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
         ("item_id", "duplicate item_id 7"),
         ("logical_path", "duplicate logical_path read"),
         ("implementation_path", "duplicate implementation_path read"),
-        ("wrapper_path", "duplicate wrapper_path __proctor_wrapper_read"),
     ):
         duplicated = copy.deepcopy(valid)
         accepted_record = {
             "item_id": 6,
             "logical_path": "accepted",
             "implementation_path": "accepted",
-            "wrapper_path": "__proctor_wrapper_accepted",
+            "wrapper_path": None,
         }
         accepted_record[field] = duplicated["new_correspondence"][0][field]
         duplicated["accepted_correspondence"] = [accepted_record]
@@ -3384,6 +3486,70 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             records,
             (),
         )
+
+
+def test_source_stub_metadata_requires_accepted_unique_paths(tmp_path):
+    candidate = tmp_path / "candidate.rs"
+    pairs = tmp_path / "pairs.json"
+    observation = tmp_path / "observation.rs"
+    metadata_path = tmp_path / "metadata.json"
+    for path in (candidate, pairs, observation):
+        path.write_text(path.name)
+    accepted_records = [
+        {
+            "item_id": item_id,
+            "logical_path": f"inner::{name}",
+            "implementation_path": f"inner::{name}",
+            "wrapper_path": None,
+        }
+        for item_id, name in ((1, "leaf"), (2, "leaf_1"))
+    ]
+    valid = {
+        "schema_version": 2,
+        "candidate_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+        "statement_pairs_sha256": hashlib.sha256(pairs.read_bytes()).hexdigest(),
+        "observation_source_sha256": hashlib.sha256(
+            observation.read_bytes()
+        ).hexdigest(),
+        "accepted_correspondence": accepted_records,
+        "new_correspondence": [],
+        "current_items": [],
+        "source_stubs": [
+            {"item_id": 1, "path": "inner::__proctor_source_stub_leaf"},
+            {"item_id": 2, "path": "inner::__proctor_source_stub_leaf_1"},
+        ],
+    }
+    accepted = load_replacement_metadata(json.dumps(valid)).accepted_correspondence
+
+    def check(value):
+        metadata_path.write_text(json.dumps(value))
+        return _load_and_validate_replacement_metadata(
+            metadata_path, candidate, pairs, observation, (), {}, accepted
+        )
+
+    assert [stub.item_id for stub in check(valid).source_stubs] == [1, 2]
+    missing = copy.deepcopy(valid)
+    del missing["source_stubs"]
+    with pytest.raises(StageFailure, match="source_stubs"):
+        check(missing)
+    unknown = copy.deepcopy(valid)
+    unknown["source_stubs"][1]["item_id"] = 7
+    with pytest.raises(StageFailure, match="not an accepted item"):
+        check(unknown)
+    reversed_stubs = copy.deepcopy(valid)
+    reversed_stubs["source_stubs"].reverse()
+    with pytest.raises(StageFailure, match="sorted by unique item ID"):
+        check(reversed_stubs)
+    duplicate_path = copy.deepcopy(valid)
+    duplicate_path["source_stubs"][0]["path"] = duplicate_path["source_stubs"][1][
+        "path"
+    ]
+    with pytest.raises(StageFailure, match="duplicate source_stub_path"):
+        check(duplicate_path)
+    colliding = copy.deepcopy(valid)
+    colliding["source_stubs"][0]["path"] = "inner::leaf"
+    with pytest.raises(StageFailure, match="source stub 1 has wrong path"):
+        check(colliding)
 
 
 def _transform_labels(dispositions):
@@ -3437,6 +3603,43 @@ class FakeTools:
         self.observations = None if observations is None else list(observations)
         self.merged_observations = merged_observations
         self.events = []
+        self.build_modes = []
+        self.additions = []
+
+    def make_initial(self, analysis, output):
+        self.events.append(("make_initial", analysis, output))
+        output.write_bytes((analysis / "lib.rs").read_bytes())
+
+    def add_functions(
+        self,
+        analysis,
+        current,
+        request,
+        candidate,
+        statement_pairs_output,
+        observation_source_output,
+        observation_metadata_output,
+    ):
+        self.additions.append(
+            (analysis, current, json.loads(request.read_text(encoding="utf-8")))
+        )
+        self.replace(
+            current,
+            request,
+            candidate,
+            statement_pairs_output,
+            observation_source_output,
+            observation_metadata_output,
+        )
+        metadata = json.loads(observation_metadata_output.read_text())
+        metadata["schema_version"] = 2
+        metadata["source_stubs"] = []
+        observation_metadata_output.write_text(json.dumps(metadata))
+
+    def finalize_project(self, analysis, current, manifest, output, manifest_output):
+        self.events.append(("finalize_project", analysis, current, manifest))
+        output.write_bytes((current / "lib.rs").read_bytes())
+        manifest_output.write_bytes(manifest.read_bytes())
 
     def build_tools(self, crat_dir):
         self.events.append(("build_tools", crat_dir))
@@ -3479,9 +3682,10 @@ class FakeTools:
         self.events.append(("normalize", library, output))
         output.write_text(self.normalized, encoding="utf-8")
 
-    def cargo_build(self, current):
+    def cargo_build(self, current, *, library_only=False):
         self.events.append(("cargo_build", current, (current / "lib.rs").read_text()))
-        return self.builds.pop(0)
+        self.build_modes.append(library_only)
+        return self.builds.pop(0) if self.builds else CommandResult(0)
 
     def validate(self, request, response):
         self.events.append(("validate", json.loads(request.read_text())))
@@ -3623,7 +3827,10 @@ def stage_input(tmp_path, *, artifacts=True, config=None, llm=None, rule_set=Non
     source.mkdir()
     (source / "Cargo.toml").write_text('[lib]\npath = "lib.rs"\n', encoding="utf-8")
     (source / "lib.rs").write_text("old\n", encoding="utf-8")
-    (source / "proctor.toml").write_text("wrappers = []\n", encoding="utf-8")
+    (source / "proctor.toml").write_text(
+        'target_kind = "library"\ntarget_name = "fixture"\napi_functions = []\nwrappers = []\n',
+        encoding="utf-8",
+    )
     (source / "target").mkdir()
     (source / "target/cache").write_text("warm\n", encoding="utf-8")
     work = tmp_path / "work"
@@ -3667,6 +3874,154 @@ def run_fake(tmp_path, tools, client, **kwargs):
         llm_client_factory=lambda settings, tracker: client,
     )
     return value, output
+
+
+def test_additive_builds_keep_complete_analysis_and_grow_target_by_scc(tmp_path):
+    complete = (
+        "pub struct Cell;\n"
+        "mod inner { use super::Cell; "
+        "pub unsafe fn leaf(p: *const Cell) {} "
+        "pub unsafe fn caller(p: *const Cell) { leaf(p); } }\n"
+    )
+    initial = "pub struct Cell;\nmod inner { use super::Cell; }\n"
+    leaf = (
+        "pub struct Cell;\nmod inner { use super::Cell; "
+        "pub unsafe fn leaf(p: &Cell) {} }\n"
+    )
+    both = (
+        "pub struct Cell;\nmod inner { use super::Cell; "
+        "pub unsafe fn leaf(p: &Cell) {} "
+        "pub unsafe fn caller(p: &Cell) { leaf(p); } }\n"
+    )
+
+    class AdditiveTools(FakeTools):
+        def make_initial(self, analysis, output):
+            assert (analysis / "lib.rs").read_text() == complete
+            super().make_initial(analysis, output)
+            output.write_text(initial)
+
+        def add_functions(self, analysis, current, *args):
+            assert (analysis / "lib.rs").read_text() == complete
+            super().add_functions(analysis, current, *args)
+
+    tools = AdditiveTools(
+        skeletons=[
+            fn_record(0, "inner::leaf", "leaf", [], needs_transformation=False),
+            fn_record(1, "inner::caller", "caller", [0], needs_transformation=False),
+        ],
+        normalized=complete,
+        candidates=[leaf, both],
+    )
+    value = stage_input(tmp_path)
+    (value.inputs.rust_project / "lib.rs").write_text(complete)
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=lambda settings, tracker: FakeClient([]),
+    )
+    assert output.status == "success", output.error
+    assert [event[2] for event in tools.events if event[0] == "cargo_build"] == [
+        initial,
+        leaf,
+        both,
+        both,
+    ]
+    assert tools.build_modes == [True, True, True, False]
+    assert [event[3] for event in tools.events if event[0] == "replace"] == [
+        initial,
+        leaf,
+    ]
+    assert [(entry[0], entry[1]) for entry in tools.additions] == [
+        (value.framework.workdir / "analysis", value.framework.workdir / "current"),
+        (value.framework.workdir / "analysis", value.framework.workdir / "current"),
+    ]
+    assert [
+        [item["id"] for item in entry[2]["items"]] for entry in tools.additions
+    ] == [
+        [0],
+        [1],
+    ]
+    assert (value.framework.workdir / "analysis/lib.rs").read_text() == complete
+    assert (value.outputs.rust_project / "lib.rs").read_text() == both
+    assert "__proctor_wrapper_" not in both
+    assert output.metrics["cargo_builds"] == 4
+
+
+@pytest.mark.parametrize(
+    ("manifest", "error"),
+    [
+        (None, "proctor.toml"),
+        ('target_kind = "unknown"\n', "target_kind"),
+        (
+            'target_kind = "library"\ntarget_name = "fixture"\nwrappers = []\n',
+            "missing api_functions",
+        ),
+        (
+            'target_kind = "library"\ntarget_name = "fixture"\napi_functions = []\n',
+            "missing wrappers",
+        ),
+        (
+            'target_kind = "library"\ntarget_name = "fixture"\n'
+            'api_functions = []\nwrappers = [{ wrapped = "f", wrapper = "w" }]\n',
+            "unsupported existing wrappers",
+        ),
+        (
+            'target_kind = "library"\ntarget_name = "fixture"\n'
+            'api_functions = ["main"]\nwrappers = []\n',
+            "main cannot be a library API function",
+        ),
+    ],
+)
+def test_invalid_project_manifest_fails_before_tool_work(tmp_path, manifest, error):
+    value = stage_input(tmp_path)
+    path = value.inputs.rust_project / "proctor.toml"
+    if manifest is None:
+        path.unlink()
+    else:
+        path.write_text(manifest)
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert error in output.error
+    assert tools.events == []
+    assert not value.outputs.rust_project.exists()
+
+
+def test_final_build_failure_restores_source_and_manifest_together(tmp_path):
+    class FinalizingTools(FakeTools):
+        def finalize_project(
+            self, analysis, current, manifest, output, manifest_output
+        ):
+            assert (current / "lib.rs").read_text() == "accepted partial\n"
+            assert manifest.read_text() == original_manifest
+            self.events.append(("finalize_project", analysis, current, manifest))
+            output.write_text("final with wrapper\n")
+            manifest_output.write_text(
+                original_manifest.replace(
+                    "wrappers = []", 'wrappers = [{ wrapped = "f", wrapper = "w" }]'
+                )
+            )
+
+    value = stage_input(tmp_path)
+    original_manifest = (value.inputs.rust_project / "proctor.toml").read_text()
+    tools = FinalizingTools(
+        normalized="accepted partial\n",
+        builds=[CommandResult(0), CommandResult(9, "", "final error")],
+    )
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "final cargo build failed (9)" in output.error
+    assert tools.build_modes == [True, False]
+    assert (
+        value.framework.workdir / "current/lib.rs"
+    ).read_text() == "accepted partial\n"
+    assert (
+        value.framework.workdir / "current/proctor.toml"
+    ).read_text() == original_manifest
+    assert (value.inputs.rust_project / "proctor.toml").read_text() == original_manifest
+    assert not value.outputs.rust_project.exists()
+    assert not (value.outputs.artifacts_dir / "observations.json").exists()
 
 
 def anchorless_rule_set(tmp_path):
@@ -3722,8 +4077,9 @@ TOOL_OPERATIONS = (
     "ordinary Crat prepare",
     "crat-tool make-skeleton",
     "crat-tool normalize-safety",
+    "crat-tool make-initial",
     "crat-tool validate",
-    "crat-tool replace",
+    "crat-tool add-functions",
 )
 
 
@@ -3740,10 +4096,12 @@ def _classify_tool_command(command, cwd):
         return "crat-tool make-skeleton"
     if len(command) > 1 and command[1] == "normalize-safety":
         return "crat-tool normalize-safety"
+    if len(command) > 1 and command[1] == "make-initial":
+        return "crat-tool make-initial"
     if len(command) > 1 and command[1] == "validate":
         return "crat-tool validate"
-    if len(command) > 1 and command[1] == "replace":
-        return "crat-tool replace"
+    if len(command) > 1 and command[1] == "add-functions":
+        return "crat-tool add-functions"
     if "--inplace" in command:
         return "ordinary Crat prepare"
     return "project cargo build"
@@ -3779,29 +4137,11 @@ def test_nonzero_build_preparation_or_crat_tool_exit_is_fatal(
                     [fn_record(0, "target", "target", [])]
                 ),
                 "crat-tool normalize-safety": "unsafe fn target() {}\n",
+                "crat-tool make-initial": "",
                 "crat-tool validate": json.dumps(VALID),
-                "crat-tool replace": "unsafe fn target() {}\n",
+                "crat-tool add-functions": "unsafe fn target() {}\n",
             }[operation]
             output.write_text(contents)
-            if operation == "crat-tool replace":
-                statement_pairs_output = Path(
-                    command[command.index("--statement-pairs-output") + 1]
-                )
-                statement_pairs_output.write_text(
-                    json.dumps(
-                        {
-                            "schema_version": 1,
-                            "statements": [
-                                {
-                                    "item_id": 0,
-                                    "path": "target",
-                                    "label": 0,
-                                    "after_statement": "#[proctor(0)]\n()",
-                                }
-                            ],
-                        }
-                    )
-                )
         return CommandResult(0)
 
     tools = CratTools(
@@ -3912,7 +4252,7 @@ def test_preparation_and_initialization_event_order_is_exact(
     source.joinpath("lib.rs").write_text("pub struct S;\n")
     source.joinpath("driver.rs").write_text("fn main() {}\n")
     source.joinpath("proctor.toml").write_text(
-        'wrappers = [{ wrapped = "a", wrapper = "b" }]\n'
+        'target_kind = "library"\ntarget_name = "p"\napi_functions = []\nwrappers = []\n'
     )
     if config_present:
         source.joinpath("config.toml").write_text("")
@@ -3939,17 +4279,29 @@ def test_preparation_and_initialization_event_order_is_exact(
     assert output.status == "success"
     assert tools.events == [
         ("build_tools", Path((STAGE_DIR / "../crat").resolve())),
-        ("prepare", value.framework.workdir / "current", ("expand", "unexpand"), True),
+        ("prepare", value.framework.workdir / "analysis", ("expand", "unexpand"), True),
         (
             "make_skeleton",
-            value.framework.workdir / "current",
+            value.framework.workdir / "analysis",
             value.framework.workdir / "skeletons.json",
             None,
         ),
         (
             "normalize",
-            value.framework.workdir / "current/lib.rs",
+            value.framework.workdir / "analysis/lib.rs",
             value.framework.workdir / "normalized.rs",
+        ),
+        (
+            "make_initial",
+            value.framework.workdir / "analysis",
+            value.framework.workdir / "initial.rs",
+        ),
+        ("cargo_build", value.framework.workdir / "current", "pub struct S;\n"),
+        (
+            "finalize_project",
+            value.framework.workdir / "analysis",
+            value.framework.workdir / "current",
+            value.framework.workdir / "current/proctor.toml",
         ),
         ("cargo_build", value.framework.workdir / "current", "pub struct S;\n"),
         (
@@ -3965,7 +4317,7 @@ def test_preparation_and_initialization_event_order_is_exact(
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 1,
+        "cargo_builds": 2,
     }
     assert output.usage is None
     assert output.models == ()
@@ -3974,7 +4326,7 @@ def test_preparation_and_initialization_event_order_is_exact(
         "fn main() {}\n"
     )
     assert value.outputs.rust_project.joinpath("proctor.toml").read_text() == (
-        'wrappers = [{ wrapped = "a", wrapper = "b" }]\n'
+        'target_kind = "library"\ntarget_name = "p"\napi_functions = []\nwrappers = []\n'
     )
     assert not (value.outputs.rust_project / "target").exists()
 
@@ -4437,7 +4789,7 @@ def test_valid_initial_generation_validates_replaces_and_builds_once(tmp_path):
     value, output = run_fake(tmp_path, tools, FakeClient([response()]))
     assert output.status == "success"
     assert (value.outputs.rust_project / "lib.rs").read_text() == "candidate-one\n"
-    assert output.metrics["cargo_builds"] == 2
+    assert output.metrics["cargo_builds"] == 3
 
 
 def test_optional_rule_set_is_forwarded_only_to_skeleton_generation(tmp_path):
@@ -4453,7 +4805,7 @@ def test_optional_rule_set_is_forwarded_only_to_skeleton_generation(tmp_path):
     assert output.status == "success"
     assert next(event for event in tools.events if event[0] == "make_skeleton") == (
         "make_skeleton",
-        value.framework.workdir / "current",
+        value.framework.workdir / "analysis",
         value.framework.workdir / "skeletons.json",
         rule_set,
     )
@@ -4624,7 +4976,7 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 2,
+        "cargo_builds": 3,
     }
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
@@ -4879,7 +5231,7 @@ def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_p
         "repair_calls": 1,
         "structural_failures": 0,
         "compilation_failures": 1,
-        "cargo_builds": 3,
+        "cargo_builds": 4,
     }
 
 
@@ -5033,12 +5385,14 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
         "normalized\n",
         applied_candidate,
         "accepted baseline candidate\n",
+        "accepted baseline candidate\n",
     ]
     assert [event[0] for event in tools.events] == [
         "build_tools",
         "prepare",
         "make_skeleton",
         "normalize",
+        "make_initial",
         "cargo_build",
         "replace",
         "cargo_build",
@@ -5046,6 +5400,8 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
         "replace",
         "cargo_build",
         "extract_observations",
+        "finalize_project",
+        "cargo_build",
         "merge_observations",
     ]
     assert len(client.requests) == 1
@@ -5089,7 +5445,7 @@ def test_repairs_before_applied_build_failure_are_not_reset_on_fallback(tmp_path
         "repair_calls": 3,
         "structural_failures": 2,
         "compilation_failures": 1,
-        "cargo_builds": 3,
+        "cargo_builds": 4,
     }
 
 
@@ -5188,7 +5544,7 @@ def test_all_preserved_singleton_skips_llm_and_validator(tmp_path):
     assert replacement[2]["transformation"].endswith("#[proctor(0)]\n    ()\n}")
     assert (value.outputs.rust_project / "lib.rs").read_text() == "mechanical\n"
     assert output.metrics["llm_generation_calls"] == 0
-    assert output.metrics["cargo_builds"] == 2
+    assert output.metrics["cargo_builds"] == 3
 
 
 def test_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
@@ -5212,7 +5568,7 @@ def test_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 3,
+        "cargo_builds": 4,
     }
 
 
@@ -5372,10 +5728,10 @@ def test_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_path):
     assert len(client.requests) == 2
     assert "pointer_leaf" in client.requests[0].messages[0].content
     assert "root" in client.requests[1].messages[0].content
-    assert output.metrics["cargo_builds"] == 4
+    assert output.metrics["cargo_builds"] == 5
 
 
-def test_mechanical_signature_change_runs_replacer_and_build(tmp_path):
+def test_mechanical_signature_change_adds_implementation_without_wrapper(tmp_path):
     record = fn_record(
         0,
         "unused_pointer",
@@ -5395,7 +5751,7 @@ def test_mechanical_signature_change_runs_replacer_and_build(tmp_path):
     tools = FakeTools(
         skeletons=[record],
         builds=[CommandResult(0), CommandResult(0)],
-        candidates=["implementation\ncompatibility-wrapper\n"],
+        candidates=["implementation\n"],
     )
     client = FakeClient([])
     _, output = run_fake(tmp_path, tools, client)
@@ -5404,7 +5760,8 @@ def test_mechanical_signature_change_runs_replacer_and_build(tmp_path):
     assert replacement[2]["transformation"] == record["baseline"]["skeleton"]
     assert "&mut i32" in replacement[2]["items"][0]["view"]["skeleton"]
     assert client.requests == []
-    assert output.metrics["cargo_builds"] == 2
+    assert (tmp_path / "output/lib.rs").read_text() == "implementation\n"
+    assert output.metrics["cargo_builds"] == 3
 
 
 def test_mechanical_build_failure_is_fatal_without_repair(tmp_path):
@@ -5416,7 +5773,7 @@ def test_mechanical_build_failure_is_fatal_without_repair(tmp_path):
     client = FakeClient([])
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "failure"
-    assert "mechanical SCC candidate cargo build failed" in output.error
+    assert "mechanical SCC candidate cargo build --lib failed" in output.error
     assert client.requests == []
     assert output.metrics["repair_calls"] == 0
     assert output.metrics["compilation_failures"] == 1
@@ -6225,7 +6582,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 2,
+        "cargo_builds": 3,
     }
     assert output.error is None
     if artifacts:
@@ -7366,6 +7723,76 @@ def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
     assert not extracted.exists()
 
 
+@pytest.mark.parametrize(
+    ("operation", "collision"),
+    [
+        ("make_initial", "analysis"),
+        ("make_initial", "symlink"),
+        ("add_functions", "current"),
+        ("add_functions", "request"),
+        ("finalize_project", "analysis"),
+        ("finalize_project", "manifest"),
+    ],
+)
+def test_tooling_preserves_inputs_when_project_output_collides(
+    tmp_path, operation, collision
+):
+    analysis = tmp_path / "analysis"
+    current = tmp_path / "current"
+    analysis.mkdir()
+    current.mkdir()
+    analysis_manifest = analysis / "Cargo.toml"
+    current_manifest = current / "Cargo.toml"
+    request = tmp_path / "request.json"
+    manifest = tmp_path / "manifest.json"
+    inputs = (analysis_manifest, current_manifest, request, manifest)
+    for path in inputs:
+        path.write_text("keep")
+    first_output = tmp_path / "candidate.rs"
+    first_output.write_text("stale")
+    alias = tmp_path / "alias.rs"
+    alias.symlink_to(analysis_manifest)
+    calls = []
+
+    def must_not_run(command, *, cwd=None, env=None):
+        calls.append(command)
+        return CommandResult(0)
+
+    tools = CratTools(
+        tmp_path / "tools.log",
+        run_command=must_not_run,
+        environment_factory=lambda path: {},
+    )
+    tools.crat_tool = Path("/tools/crat-tool")
+    target = {
+        "analysis": analysis_manifest,
+        "current": current_manifest,
+        "request": request,
+        "manifest": manifest,
+        "symlink": alias,
+    }[collision]
+    with pytest.raises(StageFailure, match="overlaps an input"):
+        if operation == "make_initial":
+            tools.make_initial(analysis, target)
+        elif operation == "add_functions":
+            tools.add_functions(
+                analysis,
+                current,
+                request,
+                first_output,
+                target,
+                tmp_path / "observation.rs",
+                tmp_path / "metadata.json",
+            )
+        else:
+            tools.finalize_project(analysis, current, manifest, first_output, target)
+
+    assert all(path.read_text() == "keep" for path in inputs)
+    assert first_output.read_text() == "stale"
+    assert alias.is_symlink()
+    assert not calls
+
+
 def test_extraction_runs_only_after_successful_build(tmp_path):
     record = fn_record(
         0,
@@ -7412,13 +7839,16 @@ def test_extraction_runs_only_after_successful_build(tmp_path):
     assert report.count("### Statement 0") == 1
     assert output.metrics["compilation_failures"] == 1
     assert output.metrics["repair_calls"] == 1
-    assert output.metrics["cargo_builds"] == 3
+    assert output.metrics["cargo_builds"] == 4
     operations = [event[0] for event in tools.events]
     assert operations.count("extract_observations") == 1
-    assert operations.index("extract_observations") > max(
+    build_indices = [
         index
         for index, operation in enumerate(operations)
         if operation == "cargo_build"
+    ]
+    assert (
+        build_indices[-2] < operations.index("extract_observations") < build_indices[-1]
     )
     assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
 
@@ -7474,12 +7904,15 @@ def test_accepted_transform_print_extracts_after_build_only(tmp_path, monkeypatc
     operations = [event[0] for event in tools.events]
     assert operations.count("validate") == 3
     assert operations.count("replace") == 2
-    assert operations.count("cargo_build") == 3
+    assert operations.count("cargo_build") == 4
     assert operations.count("extract_observations") == 1
-    assert operations.index("extract_observations") > max(
+    build_indices = [
         index
         for index, operation in enumerate(operations)
         if operation == "cargo_build"
+    ]
+    assert (
+        build_indices[-2] < operations.index("extract_observations") < build_indices[-1]
     )
     assert operations.count("merge_observations") == 1
     assert len(publication_calls) == 1
@@ -7593,12 +8026,15 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
     operations = [event[0] for event in tools.events]
     assert operations.count("validate") == 3
     assert operations.count("replace") == 2
-    assert operations.count("cargo_build") == 3
+    assert operations.count("cargo_build") == 4
     assert operations.count("extract_observations") == 1
-    assert operations.index("extract_observations") > max(
+    build_indices = [
         index
         for index, operation in enumerate(operations)
         if operation == "cargo_build"
+    ]
+    assert (
+        build_indices[-2] < operations.index("extract_observations") < build_indices[-1]
     )
     assert operations.count("merge_observations") == 1
     published = json.loads(
@@ -7620,7 +8056,7 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
         "repair_calls": 2,
         "structural_failures": 1,
         "compilation_failures": 1,
-        "cargo_builds": 3,
+        "cargo_builds": 4,
     }
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
@@ -7797,7 +8233,7 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 3,
+        "cargo_builds": 4,
     }
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
@@ -8170,11 +8606,14 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
         "prepare",
         "make_skeleton",
         "normalize",
+        "make_initial",
         "cargo_build",
         "validate",
         "replace",
         "cargo_build",
         "extract_observations",
+        "finalize_project",
+        "cargo_build",
         "merge_observations",
     ]
     assert output.metrics == {
@@ -8184,7 +8623,7 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 2,
+        "cargo_builds": 3,
     }
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()

@@ -293,6 +293,70 @@ def replace_command(
     ]
 
 
+def make_initial_command(
+    crat_tool: Path, analysis_project: Path, output: Path
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "make-initial",
+        "--output",
+        str(output),
+        str(analysis_project),
+    ]
+
+
+def add_functions_command(
+    crat_tool: Path,
+    analysis_project: Path,
+    current_project: Path,
+    request: Path,
+    output: Path,
+    statement_pairs_output: Path,
+    observation_source_output: Path,
+    observation_metadata_output: Path,
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "add-functions",
+        "--request",
+        str(request),
+        "--current-project",
+        str(current_project),
+        "--output",
+        str(output),
+        "--statement-pairs-output",
+        str(statement_pairs_output),
+        "--observation-source-output",
+        str(observation_source_output),
+        "--observation-metadata-output",
+        str(observation_metadata_output),
+        str(analysis_project),
+    ]
+
+
+def finalize_project_command(
+    crat_tool: Path,
+    analysis_project: Path,
+    current_project: Path,
+    manifest: Path,
+    output: Path,
+    manifest_output: Path,
+) -> list[str]:
+    return [
+        str(crat_tool),
+        "finalize-project",
+        "--manifest",
+        str(manifest),
+        "--current-project",
+        str(current_project),
+        "--output",
+        str(output),
+        "--manifest-output",
+        str(manifest_output),
+        str(analysis_project),
+    ]
+
+
 def extract_observations_command(
     crat_tool: Path,
     observation_source: Path,

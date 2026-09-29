@@ -48,6 +48,7 @@ from tooling import (
     CratTools,
     StageFailure,
     install_candidate_transaction,
+    install_final_transaction,
     write_json,
 )
 
@@ -59,6 +60,7 @@ from proctor.contracts import (
     StageOutput,
     UsageSummary,
 )
+from proctor.contracts.manifest import ManifestError, ProjectManifest
 from proctor.llm.client import LlmClient
 from proctor.llm.types import Response
 from proctor.usage.pricing import PricingTable
@@ -915,6 +917,8 @@ def _load_and_validate_replacement_metadata(
         metadata = load_replacement_metadata(path.read_text(encoding="utf-8"))
     except ObservationError as exc:
         raise StageFailure(f"invalid replacement observation metadata: {exc}") from exc
+    if metadata.schema_version != 2:
+        raise StageFailure("additive observation metadata must use schema version 2")
     companions = (
         ("candidate_sha256", candidate, "candidate"),
         ("statement_pairs_sha256", statement_pairs, "statement-pairs sidecar"),
@@ -957,9 +961,12 @@ def _load_and_validate_replacement_metadata(
         zip(metadata.new_correspondence, metadata.current_items, strict=True)
     ):
         expected = records_by_id[new.item_id]
-        if current.logical_path != expected.path:
+        if (
+            new.logical_path != expected.path
+            or new.implementation_path != expected.path
+        ):
             raise StageFailure(
-                "replacement metadata records do not preserve request order"
+                f"replacement metadata item {new.item_id} paths do not match requested path {expected.path}"
             )
         expected_labels = views_by_id[new.item_id].transform_labels
         if current.transform_labels != expected_labels:
@@ -992,6 +999,35 @@ def _load_and_validate_replacement_metadata(
                 f"replacement metadata has duplicate item_id {record.item_id}"
             )
         item_ids.add(record.item_id)
+        if record.wrapper_path is not None:
+            raise StageFailure("additive correspondence cannot contain a wrapper path")
+    accepted_by_id = {
+        record.item_id: record for record in metadata.accepted_correspondence
+    }
+    for stub in metadata.source_stubs:
+        accepted_record = accepted_by_id.get(stub.item_id)
+        if accepted_record is None:
+            raise StageFailure(
+                f"replacement metadata source stub {stub.item_id} is not an accepted item"
+            )
+        module, _, name = accepted_record.logical_path.rpartition("::")
+        stub_module, _, stub_name = stub.path.rpartition("::")
+        expected_name = f"__proctor_source_stub_{name.removeprefix('r#')}"
+        suffix = stub_name.removeprefix(f"{expected_name}_")
+        if stub_module != module or not (
+            stub_name == expected_name
+            or (
+                stub_name.startswith(f"{expected_name}_")
+                and suffix.isascii()
+                and suffix.isdigit()
+            )
+        ):
+            raise StageFailure(
+                f"replacement metadata source stub {stub.item_id} has wrong path"
+            )
+    categories["source_stub_path"] = [
+        (stub.path, stub.item_id) for stub in metadata.source_stubs
+    ]
     for category, values in categories.items():
         seen: set[str] = set()
         for value, _item_id in values:
@@ -1393,6 +1429,7 @@ def _process_scc(
     *,
     stage_input: StageInput,
     current: Path,
+    analysis: Path,
     library_source: Path,
     workdir: Path,
     tools: Any,
@@ -1530,7 +1567,8 @@ def _process_scc(
                 extracted_observations_path,
             )
         ):
-            tools.replace(
+            tools.add_functions(
+                analysis,
                 current,
                 replacement_request_path,
                 candidate,
@@ -1556,7 +1594,7 @@ def _process_scc(
                 library_source,
                 candidate,
                 workdir / "rollback",
-                lambda: tools.cargo_build(current),
+                lambda: tools.cargo_build(current, library_only=True),
             )
             if build.returncode == 0:
                 accepted_documents = list(state.accepted_observation_documents)
@@ -1592,7 +1630,8 @@ def _process_scc(
 
         state.metrics.compilation_failures += 1
         diagnostics = (
-            f"cargo build stdout:\n{build.stdout}\ncargo build stderr:\n{build.stderr}"
+            f"cargo build --lib stdout:\n{build.stdout}\n"
+            f"cargo build --lib stderr:\n{build.stderr}"
         )
         rule_involved = any(
             view.contains_rule_application for view in active_views.values()
@@ -1606,7 +1645,7 @@ def _process_scc(
             continue
         if mechanical:
             raise StageFailure(
-                "mechanical SCC candidate cargo build failed "
+                "mechanical SCC candidate cargo build --lib failed "
                 f"({build.returncode})\nstdout:\n{build.stdout}"
                 f"\nstderr:\n{build.stderr}"
             )
@@ -1641,6 +1680,22 @@ def run_stage(
             rule_set,
             config,
         ) = _validate_boundaries(stage_input, stage_dir)
+        manifest_info = ProjectManifest.load(source)
+        manifest_fields = tomllib.loads(
+            (source / "proctor.toml").read_text(encoding="utf-8")
+        )
+        for field_name in ("api_functions", "wrappers"):
+            if field_name not in manifest_fields:
+                raise StageFailure(f"input project manifest is missing {field_name}")
+        if manifest_info.wrappers:
+            raise StageFailure("input project contains unsupported existing wrappers")
+        if any(not name for name in manifest_info.api_functions):
+            raise StageFailure("input project contains an empty API function name")
+        if (
+            manifest_info.target_kind == "library"
+            and "main" in manifest_info.api_functions
+        ):
+            raise StageFailure("main cannot be a library API function")
         _clear_stale_artifact(report_path, "statement-pairs report")
         _clear_stale_artifact(observations_path, "observations artifact")
         _clear_stale_artifact(statistics_path, "statistics artifact")
@@ -1663,33 +1718,44 @@ def run_stage(
         active_tools = tools or CratTools(log_path)
         crat_dir = Path(config["crat_dir"])
         active_tools.build_tools(crat_dir)
-        current = workdir / "current"
-        if current.exists():
-            shutil.rmtree(current)
-        shutil.copytree(source, current)
-        _ensure_required_dependencies(current)
+        analysis = workdir / "analysis"
+        if analysis.exists():
+            shutil.rmtree(analysis)
+        shutil.copytree(source, analysis)
+        _ensure_required_dependencies(analysis)
         if library_relative is None:
-            library_relative = _library_relative_path(current)
-        active_tools.prepare(current, ("expand", "unexpand"), True)
-        library_source = current / library_relative
+            library_relative = _library_relative_path(analysis)
+        active_tools.prepare(analysis, ("expand", "unexpand"), True)
+        library_source = analysis / library_relative
         if not library_source.is_file():
             raise StageFailure(
                 f"prepared Cargo library source is not a regular file: {library_source}"
             )
 
         skeleton_path = workdir / "skeletons.json"
-        active_tools.make_skeleton(current, skeleton_path, rule_set)
+        active_tools.make_skeleton(analysis, skeleton_path, rule_set)
         records = load_skeletons(skeleton_path.read_text(encoding="utf-8"))
         records_by_id = {record.id: record for record in records}
 
         normalized = workdir / "normalized.rs"
         active_tools.normalize(library_source, normalized)
         os.replace(normalized, library_source)
+        current = workdir / "current"
+        if current.exists():
+            shutil.rmtree(current)
+        shutil.copytree(analysis, current)
+        library_source = current / library_relative
+        initial_source = workdir / "initial.rs"
+        active_tools.make_initial(analysis, initial_source)
+        os.replace(initial_source, library_source)
         state.metrics.cargo_builds += 1
-        initial_build: CommandResult = active_tools.cargo_build(current)
+        initial_build: CommandResult = active_tools.cargo_build(
+            current, library_only=True
+        )
         if initial_build.returncode != 0:
+            state.metrics.compilation_failures += 1
             raise StageFailure(
-                "normalized initial cargo build failed "
+                "initial cargo build --lib failed "
                 f"({initial_build.returncode})\nstdout:\n{initial_build.stdout}"
                 f"\nstderr:\n{initial_build.stderr}"
             )
@@ -1726,6 +1792,7 @@ def run_stage(
                     records_by_id,
                     stage_input=stage_input,
                     current=current,
+                    analysis=analysis,
                     library_source=library_source,
                     workdir=workdir,
                     tools=active_tools,
@@ -1734,6 +1801,41 @@ def run_stage(
                     usage_path=usage_path,
                     exchange_root=exchange_root,
                     state=state,
+                )
+        finalized_source = workdir / "final.rs"
+        finalized_manifest = workdir / "final-proctor.toml"
+        with _replacement_attempt_outputs((finalized_source, finalized_manifest)):
+            active_tools.finalize_project(
+                analysis,
+                current,
+                current / "proctor.toml",
+                finalized_source,
+                finalized_manifest,
+            )
+            final_manifest_info = ProjectManifest.load(finalized_manifest)
+            if (
+                final_manifest_info.target_kind != manifest_info.target_kind
+                or final_manifest_info.target_name != manifest_info.target_name
+                or final_manifest_info.api_functions != manifest_info.api_functions
+            ):
+                raise StageFailure(
+                    "finalized project manifest changed target or API declarations"
+                )
+            state.metrics.cargo_builds += 1
+            final_build = install_final_transaction(
+                library_source,
+                finalized_source,
+                current / "proctor.toml",
+                finalized_manifest,
+                workdir / "final-rollback",
+                lambda: active_tools.cargo_build(current),
+            )
+            if final_build.returncode != 0:
+                state.metrics.compilation_failures += 1
+                raise StageFailure(
+                    "final cargo build failed "
+                    f"({final_build.returncode})\nstdout:\n{final_build.stdout}"
+                    f"\nstderr:\n{final_build.stderr}"
                 )
         report = _render_statement_pairs(state.statement_pairs)
         merged_observations = workdir / "merged-observations.json"
@@ -1755,6 +1857,7 @@ def run_stage(
         return _output("failure", state, error=str(exc))
     except (
         StageFailure,
+        ManifestError,
         SkeletonError,
         ObservationError,
         ContextOverflow,

@@ -44,13 +44,21 @@ class CurrentObservationItem:
 
 
 @dataclass(frozen=True)
+class SourceStub:
+    item_id: int
+    path: str
+
+
+@dataclass(frozen=True)
 class ReplacementMetadata:
+    schema_version: int
     candidate_sha256: str
     statement_pairs_sha256: str
     observation_source_sha256: str
     accepted_correspondence: tuple[CallableCorrespondence, ...]
     new_correspondence: tuple[CallableCorrespondence, ...]
     current_items: tuple[CurrentObservationItem, ...]
+    source_stubs: tuple[SourceStub, ...] = ()
 
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -135,23 +143,33 @@ def load_replacement_metadata(text: str) -> ReplacementMetadata:
         raise ObservationError(
             f"replacement metadata JSON decode failure: {exc}"
         ) from exc
+    if not isinstance(value, dict):
+        raise ObservationError("replacement metadata must be an object")
+    version = value.get("schema_version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in (1, 2)
+    ):
+        raise ObservationError(
+            f"unsupported replacement metadata schema_version {version!r}"
+        )
+    keys = {
+        "schema_version",
+        "candidate_sha256",
+        "statement_pairs_sha256",
+        "observation_source_sha256",
+        "accepted_correspondence",
+        "new_correspondence",
+        "current_items",
+    }
+    if version == 2:
+        keys.add("source_stubs")
     value = _exact_object(
         value,
-        {
-            "schema_version",
-            "candidate_sha256",
-            "statement_pairs_sha256",
-            "observation_source_sha256",
-            "accepted_correspondence",
-            "new_correspondence",
-            "current_items",
-        },
+        keys,
         "replacement metadata",
     )
-    if isinstance(value["schema_version"], bool) or value["schema_version"] != 1:
-        raise ObservationError(
-            f"unsupported replacement metadata schema_version {value['schema_version']!r}"
-        )
     digests: dict[str, str] = {}
     for key in (
         "candidate_sha256",
@@ -210,11 +228,30 @@ def load_replacement_metadata(text: str) -> ReplacementMetadata:
                 ),
             )
         )
+    raw_stubs = value.get("source_stubs", [])
+    if not isinstance(raw_stubs, list):
+        raise ObservationError("replacement metadata source_stubs must be an array")
+    stubs: list[SourceStub] = []
+    for index, item in enumerate(raw_stubs):
+        where = f"replacement metadata source_stubs[{index}]"
+        item = _exact_object(item, {"item_id", "path"}, where)
+        stubs.append(
+            SourceStub(
+                item_id=_wire_integer(item["item_id"], f"{where}.item_id"),
+                path=_path(item["path"], f"{where}.path"),
+            )
+        )
+    if any(left.item_id >= right.item_id for left, right in pairwise(stubs)):
+        raise ObservationError(
+            "replacement metadata source_stubs must be sorted by unique item ID"
+        )
     return ReplacementMetadata(
+        schema_version=version,
         **digests,
         accepted_correspondence=correspondence_lists["accepted_correspondence"],
         new_correspondence=correspondence_lists["new_correspondence"],
         current_items=tuple(current),
+        source_stubs=tuple(stubs),
     )
 
 
