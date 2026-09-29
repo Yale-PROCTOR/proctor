@@ -7,7 +7,17 @@ from pathlib import Path
 import subprocess
 
 
-FEATURES = ("transmute", "union", "deref", "offset", "alloc", "std", "lib", "static", "fnptr")
+FEATURES = (
+    "transmute",
+    "union",
+    "deref",
+    "offset",
+    "alloc",
+    "std",
+    "lib",
+    "static",
+    "fnptr",
+)
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -44,7 +54,9 @@ def find_unsafe(directory: Path) -> list[str]:
 
 def main() -> None:
     directories = sorted(
-        path for path in ROOT.glob("runs/*/stages/02-local_transformation/out/rust") if path.is_dir()
+        path
+        for path in ROOT.glob("runs/*/stages/02-local_transformation/out/rust")
+        if path.is_dir()
     )
     counts: Counter[str] = Counter()
     if directories:
