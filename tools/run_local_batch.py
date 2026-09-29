@@ -15,13 +15,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run the local C2Rust/Crat configuration for each .tar.gz file."
     )
-    parser.add_argument("directory", type=Path, help="directory containing tarballs")
+    parser.add_argument(
+        "path", type=Path, help="tarball or directory containing tarballs"
+    )
     parser.add_argument("--rule-set", type=Path, help="rule set JSON file")
     args = parser.parse_args()
 
-    directory = args.directory.resolve()
-    if not directory.is_dir():
-        parser.error(f"not a directory: {args.directory}")
+    target = args.path.resolve()
+    if target.is_file():
+        directory = target.parent
+    elif target.is_dir():
+        directory = target
+        target = None
+    else:
+        parser.error(f"not a file or directory: {args.path}")
 
     if args.rule_set is None:
         rule_set = "empty-rule-set.json"
@@ -41,14 +48,16 @@ def main() -> int:
         else set()
     )
     failures: list[tuple[list[str], str, str]] = []
-    tarballs = sorted(path for path in directory.glob("*.tar.gz") if path.is_file())
+    tarballs = sorted(
+        path
+        for path in directory.glob("*.tar.gz")
+        if path.is_file() and (target is None or path == target)
+    )
     pending: list[tuple[Path, str]] = []
     for tarball in tarballs:
         archive_name = tarball.name[: -len(".tar.gz")]
         name = f"{name_prefix}{directory.name}_{archive_name}"
-        if not any(
-            run == name or run.startswith(f"{name}-") for run in existing_runs
-        ):
+        if not any(run == name or run.startswith(f"{name}-") for run in existing_runs):
             pending.append((tarball, name))
 
     bar_width = 20
