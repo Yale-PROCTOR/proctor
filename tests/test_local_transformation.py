@@ -54,7 +54,6 @@ from protocol import (
     merge_observations_command,
     normalize_safety_command,
     render_prompt,
-    replace_command,
     replacement_request,
     skeleton_view_value,
     validate_command,
@@ -3054,29 +3053,6 @@ def test_command_builders_use_exact_four_output_and_extract_argv():
         "--output",
         "/work/validation-response.json",
     ]
-    assert replace_command(
-        tool,
-        Path("/work/current"),
-        Path("/work/replacement-request.json"),
-        Path("/work/candidate.rs"),
-        Path("/work/replacement-statement-pairs.json"),
-        Path("/work/replacement-observation.rs"),
-        Path("/work/replacement-observation-metadata.json"),
-    ) == [
-        "/tools/crat-tool",
-        "replace",
-        "--request",
-        "/work/replacement-request.json",
-        "--output",
-        "/work/candidate.rs",
-        "--statement-pairs-output",
-        "/work/replacement-statement-pairs.json",
-        "--observation-source-output",
-        "/work/replacement-observation.rs",
-        "--observation-metadata-output",
-        "/work/replacement-observation-metadata.json",
-        "/work/current",
-    ]
     assert extract_observations_command(
         tool,
         Path("/work/replacement-observation.rs"),
@@ -3623,18 +3599,84 @@ class FakeTools:
         self.additions.append(
             (analysis, current, json.loads(request.read_text(encoding="utf-8")))
         )
-        self.replace(
-            current,
-            request,
-            candidate,
-            statement_pairs_output,
-            observation_source_output,
-            observation_metadata_output,
+        request_value = json.loads(request.read_text())
+        self.events.append(
+            (
+                "add_functions",
+                current,
+                request_value,
+                (current / "lib.rs").read_text(),
+                candidate,
+                statement_pairs_output,
+                observation_source_output,
+                observation_metadata_output,
+            )
         )
-        metadata = json.loads(observation_metadata_output.read_text())
-        metadata["schema_version"] = 2
-        metadata["source_stubs"] = []
-        observation_metadata_output.write_text(json.dumps(metadata))
+        candidate.write_text(self.candidates.pop(0), encoding="utf-8")
+        if self.sidecars is None:
+            statements = [
+                {
+                    "item_id": item["id"],
+                    "path": item["path"],
+                    "label": label,
+                    "after_statement": f"#[proctor({label})]\n()",
+                }
+                for item in request_value["items"]
+                for label in _report_labels(item["view"]["statement_dispositions"])
+            ]
+            sidecar = {"schema_version": 1, "statements": statements}
+        else:
+            sidecar = self.sidecars.pop(0)
+        statement_pairs_output.write_text(
+            sidecar if isinstance(sidecar, str) else json.dumps(sidecar),
+            encoding="utf-8",
+        )
+        observation_source_output.write_text(
+            "// observation source\n", encoding="utf-8"
+        )
+        new_correspondence = []
+        current_items = []
+        for item in request_value["items"]:
+            prefix, _, name = item["path"].rpartition("::")
+            source_copy = f"__proctor_source_{name.removeprefix('r#')}"
+            source_copy_path = f"{prefix}::{source_copy}" if prefix else source_copy
+            record = {
+                "item_id": item["id"],
+                "logical_path": item["path"],
+                "implementation_path": item["path"],
+                "wrapper_path": None,
+            }
+            new_correspondence.append(record)
+            current_items.append(
+                {
+                    **record,
+                    "source_copy_path": source_copy_path,
+                    "transform_labels": _transform_labels(
+                        item["view"]["statement_dispositions"]
+                    ),
+                }
+            )
+        observation_metadata_output.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "source_stubs": [],
+                    "candidate_sha256": hashlib.sha256(
+                        candidate.read_bytes()
+                    ).hexdigest(),
+                    "statement_pairs_sha256": hashlib.sha256(
+                        statement_pairs_output.read_bytes()
+                    ).hexdigest(),
+                    "observation_source_sha256": hashlib.sha256(
+                        observation_source_output.read_bytes()
+                    ).hexdigest(),
+                    "accepted_correspondence": request_value["accepted_correspondence"],
+                    "new_correspondence": new_correspondence,
+                    "current_items": current_items,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def finalize_project(self, analysis, current, manifest, output, manifest_output):
         self.events.append(("finalize_project", analysis, current, manifest))
@@ -3694,93 +3736,6 @@ class FakeTools:
         parsed = json.loads(raw)
         response.write_text(raw, encoding="utf-8")
         return raw, parsed
-
-    def replace(
-        self,
-        current,
-        request,
-        candidate,
-        statement_pairs_output,
-        observation_source_output,
-        observation_metadata_output,
-    ):
-        request_value = json.loads(request.read_text())
-        self.events.append(
-            (
-                "replace",
-                current,
-                request_value,
-                (current / "lib.rs").read_text(),
-                candidate,
-                statement_pairs_output,
-                observation_source_output,
-                observation_metadata_output,
-            )
-        )
-        candidate.write_text(self.candidates.pop(0), encoding="utf-8")
-        if self.sidecars is None:
-            statements = [
-                {
-                    "item_id": item["id"],
-                    "path": item["path"],
-                    "label": label,
-                    "after_statement": f"#[proctor({label})]\n()",
-                }
-                for item in request_value["items"]
-                for label in _report_labels(item["view"]["statement_dispositions"])
-            ]
-            sidecar = {"schema_version": 1, "statements": statements}
-        else:
-            sidecar = self.sidecars.pop(0)
-        statement_pairs_output.write_text(
-            sidecar if isinstance(sidecar, str) else json.dumps(sidecar),
-            encoding="utf-8",
-        )
-        observation_source_output.write_text(
-            "// observation source\n", encoding="utf-8"
-        )
-        new_correspondence = []
-        current_items = []
-        for item in request_value["items"]:
-            prefix, _, name = item["path"].rpartition("::")
-            source_copy = f"__proctor_source_{name.removeprefix('r#')}"
-            source_copy_path = f"{prefix}::{source_copy}" if prefix else source_copy
-            record = {
-                "item_id": item["id"],
-                "logical_path": item["path"],
-                "implementation_path": item["path"],
-                "wrapper_path": None,
-            }
-            new_correspondence.append(record)
-            current_items.append(
-                {
-                    **record,
-                    "source_copy_path": source_copy_path,
-                    "transform_labels": _transform_labels(
-                        item["view"]["statement_dispositions"]
-                    ),
-                }
-            )
-        observation_metadata_output.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "candidate_sha256": hashlib.sha256(
-                        candidate.read_bytes()
-                    ).hexdigest(),
-                    "statement_pairs_sha256": hashlib.sha256(
-                        statement_pairs_output.read_bytes()
-                    ).hexdigest(),
-                    "observation_source_sha256": hashlib.sha256(
-                        observation_source_output.read_bytes()
-                    ).hexdigest(),
-                    "accepted_correspondence": request_value["accepted_correspondence"],
-                    "new_correspondence": new_correspondence,
-                    "current_items": current_items,
-                }
-            ),
-            encoding="utf-8",
-        )
 
     def extract_observations(self, observation_source, metadata, output):
         self.events.append(
@@ -3928,7 +3883,7 @@ def test_additive_builds_keep_complete_analysis_and_grow_target_by_scc(tmp_path)
         both,
     ]
     assert tools.build_modes == [True, True, True, False]
-    assert [event[3] for event in tools.events if event[0] == "replace"] == [
+    assert [event[3] for event in tools.events if event[0] == "add_functions"] == [
         initial,
         leaf,
     ]
@@ -3945,6 +3900,7 @@ def test_additive_builds_keep_complete_analysis_and_grow_target_by_scc(tmp_path)
     assert (value.framework.workdir / "analysis/lib.rs").read_text() == complete
     assert (value.outputs.rust_project / "lib.rs").read_text() == both
     assert "__proctor_wrapper_" not in both
+    assert "wrappers = []" in (value.outputs.rust_project / "proctor.toml").read_text()
     assert output.metrics["cargo_builds"] == 4
 
 
@@ -3996,12 +3952,8 @@ def test_final_build_failure_restores_source_and_manifest_together(tmp_path):
             assert (current / "lib.rs").read_text() == "accepted partial\n"
             assert manifest.read_text() == original_manifest
             self.events.append(("finalize_project", analysis, current, manifest))
-            output.write_text("final with wrapper\n")
-            manifest_output.write_text(
-                original_manifest.replace(
-                    "wrappers = []", 'wrappers = [{ wrapped = "f", wrapper = "w" }]'
-                )
-            )
+            output.write_text("pub unsafe fn f(p: &[i32]) -> i32 { p[0] }\n")
+            manifest_output.write_text(original_manifest)
 
     value = stage_input(tmp_path)
     original_manifest = (value.inputs.rust_project / "proctor.toml").read_text()
@@ -4013,6 +3965,9 @@ def test_final_build_failure_restores_source_and_manifest_together(tmp_path):
     assert output.status == "failure"
     assert "final cargo build failed (9)" in output.error
     assert tools.build_modes == [True, False]
+    assert [event[2] for event in tools.events if event[0] == "cargo_build"][-1] == (
+        "pub unsafe fn f(p: &[i32]) -> i32 { p[0] }\n"
+    )
     assert (
         value.framework.workdir / "current/lib.rs"
     ).read_text() == "accepted partial\n"
@@ -4185,12 +4140,6 @@ def test_nonzero_build_preparation_or_crat_tool_exit_is_fatal(
             ("validation-request.json",),
             "validation-response.json",
         ),
-        (
-            "crat-tool replace",
-            "replace",
-            ("current", "replacement-request.json"),
-            "candidate.rs",
-        ),
     ],
 )
 @pytest.mark.parametrize("created_kind", ["missing", "directory"])
@@ -4206,10 +4155,6 @@ def test_created_outputs_cannot_be_missing_nonregular_or_stale(
         assert not output.exists()
         if created_kind == "directory":
             output.mkdir()
-        if operation == "crat-tool replace":
-            (work / "replacement-statement-pairs.json").write_text(
-                '{"schema_version":1,"statements":[]}'
-            )
         return CommandResult(0)
 
     tools = CratTools(
@@ -4221,10 +4166,7 @@ def test_created_outputs_cannot_be_missing_nonregular_or_stale(
     method = getattr(tools, method_name)
     paths = [work / argument for argument in arguments]
     with pytest.raises(StageFailure, match=operation):
-        if operation == "crat-tool replace":
-            method(*paths, output, work / "replacement-statement-pairs.json")
-        else:
-            method(*paths, output)
+        method(*paths, output)
     assert not output.is_file()
 
 
@@ -4920,7 +4862,7 @@ def test_mechanical_only_scc_skips_llm_validation_and_observation(tmp_path):
     assert output.status == "success"
     assert not [event for event in tools.events if event[0] == "validate"]
     assert not [event for event in tools.events if event[0] == "extract_observations"]
-    replacement = next(event for event in tools.events if event[0] == "replace")
+    replacement = next(event for event in tools.events if event[0] == "add_functions")
     assert replacement[2]["items"][0]["view"]["statement_dispositions"] == [
         {"label": 0, "disposition": "mechanical", "children": []}
     ]
@@ -4961,7 +4903,7 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
     assert json.loads(rule_set.read_text())["rules"][0]["pointer_anchors"] == []
     skeleton = next(event for event in tools.events if event[0] == "make_skeleton")
     assert skeleton[3] == rule_set
-    replacement = next(event for event in tools.events if event[0] == "replace")
+    replacement = next(event for event in tools.events if event[0] == "add_functions")
     assert replacement[2]["items"][0]["view"] == record["applied"]
     assert replacement[2]["transformation"] == record["applied"]["skeleton"]
     assert not [event for event in tools.events if event[0] == "validate"]
@@ -5011,7 +4953,7 @@ def test_failed_applied_build_falls_back_once_to_baseline_with_shared_budget(tmp
     client = FakeClient([response()])
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert replacements[0][2]["items"][0]["view"] == record["applied"]
     assert replacements[1][2]["items"][0]["view"] == record["baseline"]
     assert len(client.requests) == 1
@@ -5206,7 +5148,7 @@ def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_p
     client = FakeClient([response(), response()])
     _, output = run_fake(tmp_path, tools, client, rule_set=rule_set)
     assert output.status == "success"
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert len(replacements) == 2
     assert [item["view"] for item in replacements[0][2]["items"]] == [
         first["applied"],
@@ -5301,7 +5243,7 @@ def test_printf_rule_build_failure_uses_whole_scc_baseline_once(tmp_path):
     client = FakeClient([response("printf_member")])
     _, output = run_fake(tmp_path, tools, client, rule_set=rule_set)
     assert output.status == "success"
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert len(replacements) == 2
     assert [item["view"] for item in replacements[0][2]["items"]] == [
         printf_member["applied"],
@@ -5374,7 +5316,7 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
     assert (value.outputs.rust_project / "lib.rs").read_text() == (
         "accepted baseline candidate\n"
     )
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert len(replacements) == 2
     assert replacements[0][2]["items"][0]["view"] == record["applied"]
     assert replacements[0][2]["transformation"] == record["applied"]["skeleton"]
@@ -5394,10 +5336,10 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
         "normalize",
         "make_initial",
         "cargo_build",
-        "replace",
+        "add_functions",
         "cargo_build",
         "validate",
-        "replace",
+        "add_functions",
         "cargo_build",
         "extract_observations",
         "finalize_project",
@@ -5495,7 +5437,7 @@ def test_applied_fallback_and_baseline_repairs_share_ten_repair_limit(
         "compilation_failures": 11,
         "cargo_builds": 12,
     }
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert replacements[0][2]["items"][0]["view"] == record["applied"]
     assert all(
         event[2]["items"][0]["view"] == record["baseline"] for event in replacements[1:]
@@ -5512,7 +5454,7 @@ def test_build_failure_without_rule_application_repairs_in_same_view(tmp_path):
     )
     _, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
     assert output.status == "success"
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert all(
         event[2]["items"][0]["view"] == record["applied"] for event in replacements
     )
@@ -5540,7 +5482,7 @@ def test_all_preserved_singleton_skips_llm_and_validator(tmp_path):
     assert output.status == "success"
     assert client.requests == []
     assert not [event for event in tools.events if event[0] == "validate"]
-    replacement = next(event for event in tools.events if event[0] == "replace")
+    replacement = next(event for event in tools.events if event[0] == "add_functions")
     assert replacement[2]["transformation"].endswith("#[proctor(0)]\n    ()\n}")
     assert (value.outputs.rust_project / "lib.rs").read_text() == "mechanical\n"
     assert output.metrics["llm_generation_calls"] == 0
@@ -5560,7 +5502,7 @@ def test_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
     assert client.requests == []
-    assert len([event for event in tools.events if event[0] == "replace"]) == 2
+    assert len([event for event in tools.events if event[0] == "add_functions"]) == 2
     assert output.metrics == {
         "function_count": 2,
         "scc_count": 2,
@@ -5601,7 +5543,7 @@ def test_mixed_scc_still_uses_one_llm_request(tmp_path):
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
     assert len(client.requests) == 1
-    replacement = next(event for event in tools.events if event[0] == "replace")
+    replacement = next(event for event in tools.events if event[0] == "add_functions")
     items = replacement[2]["items"]
     assert [item["view"]["needs_transformation"] for item in items] == [False, True]
     emitted = (value.outputs.rust_project / "lib.rs").read_text()
@@ -5674,7 +5616,7 @@ def test_mixed_mechanical_printf_and_transform_scc_keep_canonical_statement(
     assert output.status == "success"
     assert len(client.requests) == 1
     validation = next(event for event in tools.events if event[0] == "validate")
-    replacement = next(event for event in tools.events if event[0] == "replace")
+    replacement = next(event for event in tools.events if event[0] == "add_functions")
     for request in (validation[1], replacement[2]):
         items = request.get("expected_functions", request.get("items"))
         fixed = next(item for item in items if item["id"] == 0)
@@ -5722,7 +5664,9 @@ def test_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_path):
     _, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
     replacements = [
-        event[2]["items"][0]["name"] for event in tools.events if event[0] == "replace"
+        event[2]["items"][0]["name"]
+        for event in tools.events
+        if event[0] == "add_functions"
     ]
     assert replacements == ["scalar_leaf", "pointer_leaf", "root"]
     assert len(client.requests) == 2
@@ -5756,7 +5700,7 @@ def test_mechanical_signature_change_adds_implementation_without_wrapper(tmp_pat
     client = FakeClient([])
     _, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
-    replacement = next(event for event in tools.events if event[0] == "replace")
+    replacement = next(event for event in tools.events if event[0] == "add_functions")
     assert replacement[2]["transformation"] == record["baseline"]["skeleton"]
     assert "&mut i32" in replacement[2]["items"][0]["view"]["skeleton"]
     assert client.requests == []
@@ -5784,13 +5728,19 @@ def test_mechanical_build_failure_is_fatal_without_repair(tmp_path):
     assert not (value.outputs.artifacts_dir / "statistics.json").exists()
     assert not [event for event in tools.events if event[0] == "validate"]
     assert not [event for event in tools.events if event[0] == "extract_observations"]
-    assert len([event for event in tools.events if event[0] == "replace"]) == 1
+    assert len([event for event in tools.events if event[0] == "add_functions"]) == 1
 
 
 def test_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
     class BrokenMechanicalReplacer(FakeTools):
-        def replace(
-            self, current, request, candidate, statement_pairs_output, *outputs
+        def add_functions(
+            self,
+            analysis,
+            current,
+            request,
+            candidate,
+            statement_pairs_output,
+            *outputs,
         ):
             raise StageFailure("mechanical replacement rejected")
 
@@ -6159,7 +6109,7 @@ def test_prepared_ctype_and_four_format_record_compose_through_stage_acceptance(
     for wrapper in ("signed", "unsigned", "scientific", "byte_string"):
         assert prompt.count(f"proctor_libc::printf::{wrapper}") == 1
     assert "chain `.space_sign()` directly on the adapter call result" in prompt
-    replacement = next(event for event in tools.events if event[0] == "replace")
+    replacement = next(event for event in tools.events if event[0] == "add_functions")
     assert replacement[2]["items"][0]["view"]["statement_pair_metadata"][0][
         "printf_template"
     ] == {
@@ -6168,8 +6118,8 @@ def test_prepared_ctype_and_four_format_record_compose_through_stage_acceptance(
     }
     operations = [event[0] for event in tools.events]
     assert operations.index("prepare") < operations.index("make_skeleton")
-    assert operations.index("make_skeleton") < operations.index("replace")
-    assert operations.index("replace") < operations.index("extract_observations")
+    assert operations.index("make_skeleton") < operations.index("add_functions")
+    assert operations.index("add_functions") < operations.index("extract_observations")
     merged = json.loads(
         (value.outputs.artifacts_dir / "observations.json").read_text(encoding="utf-8")
     )
@@ -6201,7 +6151,7 @@ def test_failed_candidate_build_restores_then_repairs(tmp_path):
     )
     value, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
     assert output.status == "success"
-    replace_events = [event for event in tools.events if event[0] == "replace"]
+    replace_events = [event for event in tools.events if event[0] == "add_functions"]
     assert replace_events[1][3] == "normalized\n"
     assert (value.outputs.rust_project / "lib.rs").read_text() == "good\n"
 
@@ -6267,13 +6217,19 @@ def test_validator_setup_or_protocol_failure_aborts_without_repair(
     assert output.metrics["repair_calls"] == 0
     assert len(client.requests) == 1
     assert len([event for event in tools.events if event[0] == "cargo_build"]) == 1
-    assert not [event for event in tools.events if event[0] == "replace"]
+    assert not [event for event in tools.events if event[0] == "add_functions"]
 
 
 def test_replacement_failure_is_not_sent_to_llm(tmp_path):
     class Broken(FakeTools):
-        def replace(
-            self, current, request, candidate, statement_pairs_output, *outputs
+        def add_functions(
+            self,
+            analysis,
+            current,
+            request,
+            candidate,
+            statement_pairs_output,
+            *outputs,
         ):
             raise StageFailure("TargetResolution: missing target")
 
@@ -6328,7 +6284,9 @@ def test_context_overflow_is_forced_to_error_and_aborts(tmp_path):
     assert output.metrics["repair_calls"] == 0
     assert output.metrics["structural_failures"] == 0
     assert output.metrics["compilation_failures"] == 0
-    assert not [event for event in tools.events if event[0] in {"validate", "replace"}]
+    assert not [
+        event for event in tools.events if event[0] in {"validate", "add_functions"}
+    ]
     usage = read_usage(
         value.framework.usage_log or value.framework.workdir / "usage.jsonl"
     )
@@ -6351,7 +6309,7 @@ def test_later_scc_uses_promoted_source_but_immutable_skeleton_prompt(tmp_path):
         tmp_path, tools, FakeClient([response("callee"), response("caller")])
     )
     assert output.status == "success"
-    assert [event[3] for event in tools.events if event[0] == "replace"] == [
+    assert [event[3] for event in tools.events if event[0] == "add_functions"] == [
         "normalized\n",
         "after-callee\n",
     ]
@@ -7425,212 +7383,6 @@ def test_replacement_sidecar_loader_is_strict_and_cross_checks_the_scc(tmp_path)
     assert _load_replacement_statement_pairs(path, (8,), {8: preserved}) == ()
 
 
-def test_crat_tools_replace_clears_and_requires_both_scratch_outputs(tmp_path):
-    candidate = tmp_path / "candidate.rs"
-    sidecar = tmp_path / "pairs.json"
-    observation_source = tmp_path / "observation.rs"
-    observation_metadata = tmp_path / "metadata.json"
-    request = tmp_path / "request.json"
-    current = tmp_path / "current"
-    current.mkdir()
-    request.write_text("{}")
-    candidate.write_text("stale candidate")
-    sidecar.write_text("stale sidecar")
-    events = []
-
-    def runner(command, *, cwd=None, env=None):
-        assert not candidate.exists() and not sidecar.exists()
-        events.append(command)
-        candidate.write_text("candidate")
-        sidecar.write_text('{"schema_version":1,"statements":[]}')
-        observation_source.write_text("observation")
-        observation_metadata.write_text("{}")
-        return CommandResult(0)
-
-    tools = CratTools(
-        tmp_path / "log",
-        run_command=runner,
-        environment_factory=lambda path: {},
-    )
-    tools.crat_tool = Path("/tools/crat-tool")
-    tools.replace(
-        current,
-        request,
-        candidate,
-        sidecar,
-        observation_source,
-        observation_metadata,
-    )
-    assert events[0][-1] == str(current)
-    assert events[0][events[0].index("--statement-pairs-output") + 1] == str(sidecar)
-
-    for missing in (candidate, sidecar):
-        candidate.unlink(missing_ok=True)
-        sidecar.unlink(missing_ok=True)
-
-        def incomplete_runner(command, *, cwd=None, env=None):
-            other = sidecar if missing == candidate else candidate
-            other.write_text("output")
-            return CommandResult(0)
-
-        broken = CratTools(
-            tmp_path / f"log-{missing.name}",
-            run_command=incomplete_runner,
-            environment_factory=lambda path: {},
-        )
-        broken.crat_tool = Path("/tools/crat-tool")
-        with pytest.raises(StageFailure):
-            broken.replace(
-                current,
-                request,
-                candidate,
-                sidecar,
-                observation_source,
-                observation_metadata,
-            )
-        assert not candidate.exists() and not sidecar.exists()
-
-    for stale in (candidate, sidecar):
-        candidate.unlink(missing_ok=True)
-        sidecar.unlink(missing_ok=True)
-        stale.mkdir()
-        untouched = stale / "untouched"
-        untouched.write_text("keep")
-        with pytest.raises(StageFailure):
-            tools.replace(
-                current,
-                request,
-                candidate,
-                sidecar,
-                observation_source,
-                observation_metadata,
-            )
-        assert untouched.read_text() == "keep"
-        untouched.unlink()
-        stale.rmdir()
-
-    for stale in (candidate, sidecar):
-        candidate.unlink(missing_ok=True)
-        sidecar.unlink(missing_ok=True)
-        target = tmp_path / f"{stale.name}.stale-target"
-        target.write_text("keep target")
-        stale.symlink_to(target)
-        tools.replace(
-            current,
-            request,
-            candidate,
-            sidecar,
-            observation_source,
-            observation_metadata,
-        )
-        assert not stale.is_symlink()
-        assert target.read_text() == "keep target"
-
-    for generated_kind in ("symlink", "directory", "fifo"):
-        for generated in (candidate, sidecar):
-            candidate.unlink(missing_ok=True)
-            sidecar.unlink(missing_ok=True)
-
-            def irregular_runner(command, *, cwd=None, env=None):
-                other = sidecar if generated == candidate else candidate
-                other.write_text("regular")
-                if generated_kind == "symlink":
-                    generated.symlink_to(request)
-                elif generated_kind == "directory":
-                    generated.mkdir()
-                else:
-                    os.mkfifo(generated)
-                return CommandResult(0)
-
-            irregular = CratTools(
-                tmp_path / f"new-{generated_kind}-{generated.name}.log",
-                run_command=irregular_runner,
-                environment_factory=lambda path: {},
-            )
-            irregular.crat_tool = Path("/tools/crat-tool")
-            with pytest.raises(StageFailure):
-                irregular.replace(
-                    current,
-                    request,
-                    candidate,
-                    sidecar,
-                    observation_source,
-                    observation_metadata,
-                )
-            assert not (sidecar if generated == candidate else candidate).exists()
-            if generated_kind == "symlink":
-                assert not generated.is_symlink()
-            else:
-                assert generated.exists()
-                if generated_kind == "directory":
-                    generated.rmdir()
-                else:
-                    generated.unlink()
-
-    for stale_kind in ("directory", "fifo"):
-        for stale in (candidate, sidecar):
-            candidate.unlink(missing_ok=True)
-            sidecar.unlink(missing_ok=True)
-            if stale_kind == "directory":
-                stale.mkdir()
-                child = stale / "untouched"
-                child.write_text("keep")
-            else:
-                os.mkfifo(stale)
-            invoked = False
-
-            def must_not_run(command, *, cwd=None, env=None):
-                nonlocal invoked
-                invoked = True
-                return CommandResult(0)
-
-            rejecting = CratTools(
-                tmp_path / f"stale-{stale_kind}-{stale.name}.log",
-                run_command=must_not_run,
-                environment_factory=lambda path: {},
-            )
-            rejecting.crat_tool = Path("/tools/crat-tool")
-            with pytest.raises(StageFailure):
-                rejecting.replace(
-                    current,
-                    request,
-                    candidate,
-                    sidecar,
-                    observation_source,
-                    observation_metadata,
-                )
-            assert not invoked
-            if stale_kind == "directory":
-                assert child.read_text() == "keep"
-                child.unlink()
-                stale.rmdir()
-            else:
-                assert stale.exists()
-                stale.unlink()
-
-    def failing_runner(command, *, cwd=None, env=None):
-        candidate.write_text("partial candidate")
-        sidecar.write_text("partial sidecar")
-        return CommandResult(9, "partial stdout", "failed")
-
-    failing = CratTools(
-        tmp_path / "command-failure.log",
-        run_command=failing_runner,
-        environment_factory=lambda path: {},
-    )
-    failing.crat_tool = Path("/tools/crat-tool")
-    with pytest.raises(StageFailure, match="exit code 9"):
-        failing.replace(
-            current,
-            request,
-            candidate,
-            sidecar,
-            observation_source,
-            observation_metadata,
-        )
-    assert not candidate.exists() and not sidecar.exists()
-
-
 def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
     outputs = (
         tmp_path / "candidate.rs",
@@ -7661,7 +7413,7 @@ def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
             output.write_text("fresh")
         return CommandResult(0)
 
-    make_tools("complete", complete).replace(current, request, *outputs)
+    make_tools("complete", complete).add_functions(current, current, request, *outputs)
     assert all(output.read_text() == "fresh" for output in outputs)
 
     for missing in outputs:
@@ -7675,8 +7427,8 @@ def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
             return CommandResult(0)
 
         with pytest.raises(StageFailure):
-            make_tools(f"missing-{missing.name}", incomplete).replace(
-                current, request, *outputs
+            make_tools(f"missing-{missing.name}", incomplete).add_functions(
+                current, current, request, *outputs
             )
         assert all(not output.exists() for output in outputs)
 
@@ -7690,8 +7442,8 @@ def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
             return CommandResult(0)
 
         with pytest.raises(StageFailure):
-            make_tools(f"stale-{stale.name}", must_not_run).replace(
-                current, request, *outputs
+            make_tools(f"stale-{stale.name}", must_not_run).add_functions(
+                current, current, request, *outputs
             )
         assert not invoked
         stale.rmdir()
@@ -7903,7 +7655,7 @@ def test_accepted_transform_print_extracts_after_build_only(tmp_path, monkeypatc
     assert output.status == "success"
     operations = [event[0] for event in tools.events]
     assert operations.count("validate") == 3
-    assert operations.count("replace") == 2
+    assert operations.count("add_functions") == 2
     assert operations.count("cargo_build") == 4
     assert operations.count("extract_observations") == 1
     build_indices = [
@@ -8025,7 +7777,7 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
     assert output.status == "success"
     operations = [event[0] for event in tools.events]
     assert operations.count("validate") == 3
-    assert operations.count("replace") == 2
+    assert operations.count("add_functions") == 2
     assert operations.count("cargo_build") == 4
     assert operations.count("extract_observations") == 1
     build_indices = [
@@ -8100,7 +7852,7 @@ def test_post_acceptance_extraction_failure_is_fatal_not_repairable(tmp_path, fa
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "failure"
     assert len(client.requests) == 1
-    assert len([event for event in tools.events if event[0] == "replace"]) == 1
+    assert len([event for event in tools.events if event[0] == "add_functions"]) == 1
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
         == 1
@@ -8135,7 +7887,7 @@ def test_accepted_correspondence_promotes_after_extraction(tmp_path):
         FakeClient([response("leaf"), response("root")]),
     )
     assert output.status == "success"
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert replacements[0][2]["accepted_correspondence"] == []
     assert replacements[1][2]["accepted_correspondence"] == [
         {
@@ -8164,7 +7916,7 @@ def test_mechanical_scc_promotes_correspondence_without_extracting(tmp_path):
     )
     _, output = run_fake(tmp_path, tools, FakeClient([response("root")]))
     assert output.status == "success"
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert replacements[1][2]["accepted_correspondence"][0]["logical_path"] == "leaf"
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
@@ -8206,7 +7958,7 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
         rule_set=rule_set,
     )
     assert output.status == "success"
-    replacements = [event for event in tools.events if event[0] == "replace"]
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert [event[2]["items"][0]["id"] for event in replacements] == [0, 1]
     merge = next(event for event in tools.events if event[0] == "merge_observations")
     assert [path.name for path in merge[1]] == ["000000.json", "000001.json"]
@@ -8305,7 +8057,9 @@ def test_accepted_pairs_sort_by_item_and_label_not_scc_schedule(tmp_path):
     )
     assert output.status == "success"
     processed = [
-        event[2]["items"][0]["id"] for event in tools.events if event[0] == "replace"
+        event[2]["items"][0]["id"]
+        for event in tools.events
+        if event[0] == "add_functions"
     ]
     assert processed == [1, 2, 0]
     report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
@@ -8609,7 +8363,7 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
         "make_initial",
         "cargo_build",
         "validate",
-        "replace",
+        "add_functions",
         "cargo_build",
         "extract_observations",
         "finalize_project",

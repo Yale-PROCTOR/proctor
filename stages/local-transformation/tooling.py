@@ -18,7 +18,6 @@ from protocol import (
     make_skeleton_command,
     merge_observations_command,
     normalize_safety_command,
-    replace_command,
     validate_command,
 )
 
@@ -271,8 +270,7 @@ class CratTools:
             path.unlink()
         elif path.exists():
             raise StageFailure(
-                f"crat-tool replace output destination is not a regular file "
-                f"or symlink: {path}"
+                f"crat-tool output destination is not a regular file or symlink: {path}"
             )
 
     @staticmethod
@@ -297,64 +295,6 @@ class CratTools:
                 raise StageFailure(
                     f"crat-tool output {output} overlaps an input project or file"
                 )
-
-    def replace(
-        self,
-        current_project: Path,
-        request: Path,
-        output: Path,
-        statement_pairs_output: Path,
-        observation_source_output: Path | None = None,
-        observation_metadata_output: Path | None = None,
-    ) -> None:
-        assert self.crat_tool is not None
-        observation_source_output = observation_source_output or output.with_name(
-            "replacement-observation.rs"
-        )
-        observation_metadata_output = observation_metadata_output or output.with_name(
-            "replacement-observation-metadata.json"
-        )
-        paths = (
-            output,
-            statement_pairs_output,
-            observation_source_output,
-            observation_metadata_output,
-        )
-        if len(set(paths)) != len(paths):
-            raise StageFailure(
-                "crat-tool replace output paths must be pairwise distinct"
-            )
-        for path in paths:
-            self._clear_replace_output(path)
-        try:
-            self._run(
-                "crat-tool replace",
-                replace_command(
-                    self.crat_tool,
-                    current_project,
-                    request,
-                    output,
-                    statement_pairs_output,
-                    observation_source_output,
-                    observation_metadata_output,
-                ),
-                env=self.environment,
-            )
-            self._require_regular_output("crat-tool replace", output)
-            self._require_regular_output(
-                "crat-tool replace statement pairs", statement_pairs_output
-            )
-            self._require_regular_output(
-                "crat-tool replace observation source", observation_source_output
-            )
-            self._require_regular_output(
-                "crat-tool replace observation metadata", observation_metadata_output
-            )
-        except Exception:
-            for path in paths:
-                if path.is_symlink() or path.is_file():
-                    path.unlink()
-            raise
 
     def make_initial(self, analysis_project: Path, output: Path) -> None:
         assert self.crat_tool is not None

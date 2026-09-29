@@ -267,32 +267,6 @@ def validate_command(crat_tool: Path, request: Path, response: Path) -> list[str
     ]
 
 
-def replace_command(
-    crat_tool: Path,
-    current_project: Path,
-    request: Path,
-    output: Path,
-    statement_pairs_output: Path,
-    observation_source_output: Path,
-    observation_metadata_output: Path,
-) -> list[str]:
-    return [
-        str(crat_tool),
-        "replace",
-        "--request",
-        str(request),
-        "--output",
-        str(output),
-        "--statement-pairs-output",
-        str(statement_pairs_output),
-        "--observation-source-output",
-        str(observation_source_output),
-        "--observation-metadata-output",
-        str(observation_metadata_output),
-        str(current_project),
-    ]
-
-
 def make_initial_command(
     crat_tool: Path, analysis_project: Path, output: Path
 ) -> list[str]:
