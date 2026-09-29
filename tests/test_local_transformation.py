@@ -3833,20 +3833,23 @@ def run_fake(tmp_path, tools, client, **kwargs):
 
 def test_additive_builds_keep_complete_analysis_and_grow_target_by_scc(tmp_path):
     complete = (
-        "pub struct Cell;\n"
-        "mod inner { use super::Cell; "
-        "pub unsafe fn leaf(p: *const Cell) {} "
-        "pub unsafe fn caller(p: *const Cell) { leaf(p); } }\n"
+        "mod inner { pub unsafe fn leaf(p: *mut i32) -> i32 { *p } "
+        "pub unsafe fn caller(p: *mut i32) -> i32 { leaf(p) } }\n"
+        "mod consumer { use crate::inner::{leaf as aliased_leaf, caller}; }\n"
     )
-    initial = "pub struct Cell;\nmod inner { use super::Cell; }\n"
+    initial = (
+        "mod inner { pub fn leaf() {} pub fn caller() {} }\n"
+        "mod consumer { use crate::inner::{leaf as aliased_leaf, caller}; }\n"
+    )
     leaf = (
-        "pub struct Cell;\nmod inner { use super::Cell; "
-        "pub unsafe fn leaf(p: &Cell) {} }\n"
+        "mod inner { pub unsafe fn leaf(p: Box<[i32]>) -> i32 { p[0] } "
+        "pub fn caller() {} }\n"
+        "mod consumer { use crate::inner::{leaf as aliased_leaf, caller}; }\n"
     )
     both = (
-        "pub struct Cell;\nmod inner { use super::Cell; "
-        "pub unsafe fn leaf(p: &Cell) {} "
-        "pub unsafe fn caller(p: &Cell) { leaf(p); } }\n"
+        "mod inner { pub unsafe fn leaf(p: Box<[i32]>) -> i32 { p[0] } "
+        "pub unsafe fn caller(p: Box<[i32]>) -> i32 { leaf(p) } }\n"
+        "mod consumer { use crate::inner::{leaf as aliased_leaf, caller}; }\n"
     )
 
     class AdditiveTools(FakeTools):
@@ -4714,11 +4717,19 @@ def test_non_string_canonical_package_field_preserves_stage_failure_diagnostic(
 def test_normalized_initial_build_failure_aborts_without_llm(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
-        builds=[CommandResult(101, "out", "err")],
+        normalized="use crate::missing::foo;\nfn target() {}\n",
+        builds=[
+            CommandResult(
+                101, "", "error[E0432]: unresolved import crate::missing::foo"
+            )
+        ],
     )
     client = FakeClient([])
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "failure" and not client.requests
+    assert [event[0] for event in tools.events].count("cargo_build") == 1
+    assert not [event for event in tools.events if event[0] == "add_functions"]
+    assert not value.outputs.rust_project.exists()
 
 
 def test_valid_initial_generation_validates_replaces_and_builds_once(tmp_path):
@@ -4855,11 +4866,15 @@ def test_mechanical_only_scc_skips_llm_validation_and_observation(tmp_path):
         ]
     tools = FakeTools(
         skeletons=[record],
+        normalized="fn target() {}\n",
         builds=[CommandResult(0), CommandResult(0)],
-        candidates=["mechanically converted\n"],
+        candidates=['unsafe fn target() { ::std::print!("fixed"); }\n'],
     )
     value, output = run_fake(tmp_path, tools, FakeClient([]))
     assert output.status == "success"
+    assert (value.outputs.rust_project / "lib.rs").read_text() == (
+        'unsafe fn target() { ::std::print!("fixed"); }\n'
+    )
     assert not [event for event in tools.events if event[0] == "validate"]
     assert not [event for event in tools.events if event[0] == "extract_observations"]
     replacement = next(event for event in tools.events if event[0] == "add_functions")
@@ -5232,19 +5247,26 @@ def test_printf_rule_build_failure_uses_whole_scc_baseline_once(tmp_path):
 
     tools = FakeTools(
         skeletons=[printf_member, ordinary_member],
+        normalized="fn printf_member() {}\nfn ordinary_member() {}\n",
         builds=[
             CommandResult(0),
             CommandResult(101, "applied out", "applied err"),
             CommandResult(0),
         ],
         validators=[VALID],
-        candidates=["rejected applied SCC\n", "accepted baseline SCC\n"],
+        candidates=[
+            "unsafe fn printf_member() { rule_value(); }\n"
+            "unsafe fn ordinary_member() {}\n",
+            'unsafe fn printf_member() { ::std::print!("fixed"); }\n'
+            "unsafe fn ordinary_member() {}\n",
+        ],
     )
     client = FakeClient([response("printf_member")])
     _, output = run_fake(tmp_path, tools, client, rule_set=rule_set)
     assert output.status == "success"
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert len(replacements) == 2
+    assert replacements[1][3] == "fn printf_member() {}\nfn ordinary_member() {}\n"
     assert [item["view"] for item in replacements[0][2]["items"]] == [
         printf_member["applied"],
         ordinary_member["applied"],
@@ -6139,21 +6161,66 @@ def test_missing_fence_consumes_repair_without_validator_call(tmp_path):
 
 
 def test_failed_candidate_build_restores_then_repairs(tmp_path):
-    tools = FakeTools(
-        skeletons=[fn_record(0, "target", "target", [])],
+    complete = (
+        "mod inner { pub unsafe fn leaf(p: *mut i32) -> i32 { *p } "
+        "pub unsafe fn caller(p: *mut i32) -> i32 { leaf(p) } }\n"
+        "mod consumer { use crate::inner::{leaf as aliased_leaf, caller}; }\n"
+    )
+    initial = (
+        "mod inner { pub fn leaf() {} pub fn caller() {} }\n"
+        "mod consumer { use crate::inner::{leaf as aliased_leaf, caller}; }\n"
+    )
+    leaf = (
+        "mod inner { pub unsafe fn leaf(p: Box<[i32]>) -> i32 { p[0] } "
+        "pub fn caller() {} }\n"
+        "mod consumer { use crate::inner::{leaf as aliased_leaf, caller}; }\n"
+    )
+    invalid = leaf.replace(
+        "pub fn caller() {}", "pub unsafe fn caller() { missing(); }"
+    )
+    accepted = leaf.replace(
+        "pub fn caller() {}",
+        "pub unsafe fn caller(p: Box<[i32]>) -> i32 { leaf(p) }",
+    )
+
+    class PendingTools(FakeTools):
+        def make_initial(self, analysis, output):
+            assert (analysis / "lib.rs").read_text() == complete
+            super().make_initial(analysis, output)
+            output.write_text(initial)
+
+    tools = PendingTools(
+        skeletons=[
+            fn_record(0, "inner::leaf", "leaf", [], needs_transformation=False),
+            fn_record(1, "inner::caller", "caller", [0]),
+        ],
+        normalized=complete,
         builds=[
+            CommandResult(0),
             CommandResult(0),
             CommandResult(101, "checking\n", "bad\n"),
             CommandResult(0),
         ],
         validators=[VALID, VALID],
-        candidates=["bad\n", "good\n"],
+        candidates=[leaf, invalid, accepted],
     )
     value, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
     assert output.status == "success"
     replace_events = [event for event in tools.events if event[0] == "add_functions"]
-    assert replace_events[1][3] == "normalized\n"
-    assert (value.outputs.rust_project / "lib.rs").read_text() == "good\n"
+    assert replace_events[1][3] == leaf
+    assert replace_events[2][3] == leaf
+    assert [event[2] for event in tools.events if event[0] == "cargo_build"] == [
+        initial,
+        leaf,
+        invalid,
+        accepted,
+        accepted,
+    ]
+    assert (value.outputs.rust_project / "lib.rs").read_text() == accepted
+    assert (
+        len([event for event in tools.events if event[0] == "extract_observations"])
+        == 1
+    )
 
 
 def test_ten_failed_repairs_allow_exactly_eleven_generations(tmp_path):
@@ -6347,8 +6414,15 @@ def test_failed_build_restores_source_but_retains_target_updates(tmp_path):
 def test_exception_after_installation_restores_in_finally(tmp_path):
     library = tmp_path / "lib.rs"
     candidate = tmp_path / "candidate.rs"
-    library.write_text("old\n")
-    candidate.write_text("bad\n")
+    pending = (
+        "mod inner { pub unsafe fn leaf(p: Box<[i32]>) -> i32 { p[0] } "
+        "pub fn caller() {} }\n"
+        "mod consumer { use crate::inner::{leaf as aliased_leaf, caller}; }\n"
+    )
+    library.write_text(pending)
+    candidate.write_text(
+        pending.replace("pub fn caller() {}", "pub unsafe fn caller() { missing(); }")
+    )
     with pytest.raises(RuntimeError):
         install_candidate_transaction(
             library,
@@ -6356,7 +6430,7 @@ def test_exception_after_installation_restores_in_finally(tmp_path):
             tmp_path / "rollback",
             lambda: (_ for _ in ()).throw(RuntimeError("transport")),
         )
-    assert library.read_text() == "old\n"
+    assert library.read_text() == pending
 
 
 def test_rollback_failure_is_fatal_and_not_repairable(tmp_path):
@@ -8603,7 +8677,8 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
 ):
     current = tmp_path / "current"
     current.mkdir()
-    (current / "lib.rs").write_text("accepted")
+    accepted = "pub unsafe fn accepted(p: i32) -> i32 { p }\n"
+    (current / "lib.rs").write_text(accepted)
     (current / "target").mkdir()
     destination = tmp_path / "output"
     artifacts = tmp_path / "artifacts"
@@ -8636,7 +8711,7 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
         '  "printf_observations": []\n}\n'
     )
     assert (artifacts / "statistics.json").is_file()
-    assert (destination / "lib.rs").read_text() == "accepted"
+    assert (destination / "lib.rs").read_text() == accepted
     assert not (destination / "target").exists()
 
     late_failure_root = tmp_path / "statistics-publication-failure"
