@@ -166,7 +166,7 @@ class GatedRow:
     abstraction_recovery result even when it was rejected (for the note)."""
 
     accepted: CaseRollup
-    stage: str  # "abstraction_recovery" or "crat"
+    stage: str  # the accepted stage's id, e.g. "crat" or "abstraction_recovery"
     absrec: CaseRollup
 
 
@@ -276,7 +276,9 @@ def _emit(
             notes.append(f"{other} skip")
         if not r.build_ok:
             notes.append("build-fail")
-        if row.stage == "crat":
+        if gated and row.accepted is not row.absrec:
+            # gate fell back to crat because abstraction_recovery regressed
+            # (distinct accepted/absrec objects only happen on a real fallback).
             n_fallback += 1
             a = row.absrec
             a_total = a.passed + a.skipped + a.failed
@@ -372,7 +374,14 @@ def main(argv: list[str] | None = None) -> int:
     if absrec is None:
         return 2
 
-    rows = {r.case: GatedRow(r, "abstraction_recovery", r) for r in absrec}
+    def _final_stage(case: str) -> str:
+        # label accepted_stage with the actual final stage that was staged and
+        # verified (e.g. "crat" for a plain c2rust->crat run), rather than a
+        # hardcoded "abstraction_recovery".
+        outs = stage_rust_outputs(args.bench_dir / case.split("/")[-1])
+        return outs[-1][0] if outs else "abstraction_recovery"
+
+    rows = {r.case: GatedRow(r, _final_stage(r.case), r) for r in absrec}
 
     if args.gate:
         # For cases the final stage didn't nail, re-verify the crat baseline and
