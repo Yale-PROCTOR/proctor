@@ -159,4 +159,10 @@ Syntactic (syn AST — unsafe syntax):
 - Yale `measure_unsafety` — https://github.com/Yale-PROCTOR/proctor/tree/automation/automation/measurements/measure_unsafety
 - Galois `find_unsafe` — https://github.com/GaloisInc/Tractor-Crisp/tree/main/tools/find_unsafe
 
+NOTE: the syn scorer actually vendored at `tools/measure_unsafety` is **DARPA's**
+`pipeline-automation/evaluate_unsafe_usage/measure_unsafety` (syntactic), **not**
+the Yale one listed above — see `tools/measure_unsafety/PROVENANCE.md` (the
+authoritative record of what is vendored). The §2 table and this list survey
+*candidate* tools, not which one was vendored.
+
 Related: idiomaticity — `idiomaticity_evaluation_plan.md`.

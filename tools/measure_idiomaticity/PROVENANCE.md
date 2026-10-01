@@ -18,3 +18,8 @@ committed under `.cache/`, so loading it — the normal path — needs neither
 dependency and runs offline. To refresh the map:
 `CLIPPY_CONF_DIR=.cache python -c "from clippy_lint_map import ClippyLintMap;
 ClippyLintMap().create_clippy_maps()"` (needs `requests` + `beautifulsoup4`).
+
+Vendored change: on a clippy/compile failure, `main()` now records the failure
+string as a `build_error` key in the output JSON (it was only logged before).
+This lets `proctor.testing.idiomaticity_eval` skip a non-building crate instead
+of misreading its empty lint set as "0 lints / maximally idiomatic."

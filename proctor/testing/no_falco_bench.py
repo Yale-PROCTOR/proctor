@@ -4,7 +4,8 @@ Companion to ``bench_no_falco.sh``. After ``bench`` has translated a suite
 (c2rust -> crat, one run dir per case), this stages each case's final-stage
 Rust into the newer TRACTOR corpus and verifies the selected cases with the
 corpus's own orchestrator (``tools/test_runner --no-falco`` — newer cando2,
-rustc 1.94.1, B03), all in one host-level ``nix run``.
+rustc 1.94.1, B03) in a host-level ``nix run`` (``--gate`` adds a second run
+that re-verifies the ``crat`` baseline for cases the recovery didn't pass).
 
 This runs at HOST level (the orchestrator spawns a Docker container per
 vector); it needs ``nix`` and ``docker`` on PATH — see ``bench_no_falco.sh``,
@@ -190,7 +191,11 @@ def rollup_junit(junit_path: Path) -> list[CaseRollup]:
     """Per-case pass/fail + skipped vector names from the newer harness's
     JUnit. Phase pseudo-tests (config/build/build-runners) drive
     ``build_ok``, not the vector counts."""
-    root = ET.parse(junit_path).getroot()
+    try:
+        root = ET.parse(junit_path).getroot()
+    except ET.ParseError as e:
+        # a harness killed mid-write leaves a truncated JUnit; fail cleanly.
+        raise VectorHarnessError(f"malformed JUnit at {junit_path}: {e}") from e
     out: list[CaseRollup] = []
     for ts in root.iter("testsuite"):
         passed = failed = 0

@@ -11,7 +11,8 @@ Pure Python stdlib.
 
 We drive it via `proctor.testing.vector_harness` to verify translations
 against the corpus test vectors at each pipeline stage. The newer
-Falco-based `tools/test_runner` orchestrator is deferred — see
+`tools/test_runner` orchestrator is now also driven Falco-free (`--no-falco`,
+via `proctor.testing.no_falco_bench`) for the newer corpus incl. B03 — see
 `plan_docs/falco_integration_notes.md`.
 
 License: MIT (© Massachusetts Institute of Technology), as in the source.

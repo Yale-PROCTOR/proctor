@@ -75,3 +75,37 @@ def test_measure_idiomaticity_no_output_errors(
     monkeypatch.setattr(ie.subprocess, "run", fake_run)
     with pytest.raises(IdiomEvalError, match="no output"):
         ie.measure_idiomaticity(tmp_path / "c", workdir=tmp_path / "wd")
+
+
+def test_measure_idiomaticity_build_failure_is_not_zero_lints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a crate that doesn't compile yields an empty lint set + a build_error;
+    # it must raise (skip), NOT return total=0 ("maximally idiomatic").
+    def fake_run(cmd, **kw):
+        out = Path(cmd[cmd.index("--output") + 1])
+        out.write_text(
+            '{"clippy": {}, "build_error": "error[E0412]: not found"}', "utf-8"
+        )
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return P()
+
+    monkeypatch.setattr(ie.subprocess, "run", fake_run)
+    with pytest.raises(IdiomEvalError, match="did not build"):
+        ie.measure_idiomaticity(tmp_path / "c", workdir=tmp_path / "wd")
+
+
+def test_measure_idiomaticity_timeout_is_wrapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_run(cmd, **kw):
+        raise ie.subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(ie.subprocess, "run", fake_run)
+    with pytest.raises(IdiomEvalError, match="timed out"):
+        ie.measure_idiomaticity(tmp_path / "c", workdir=tmp_path / "wd")

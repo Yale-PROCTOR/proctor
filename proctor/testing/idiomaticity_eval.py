@@ -108,15 +108,27 @@ def measure_idiomaticity(
     if include_complexity:
         cmd.append("--include_ccc")
 
-    proc = subprocess.run(
-        cmd, env=env, capture_output=True, text=True, timeout=timeout_s
-    )
+    try:
+        proc = subprocess.run(
+            cmd, env=env, capture_output=True, text=True, timeout=timeout_s
+        )
+    except subprocess.TimeoutExpired as e:
+        raise IdiomEvalError(f"clippy timed out after {timeout_s}s") from e
     if not out_json.is_file():
         raise IdiomEvalError(
             f"measure_idiomaticity produced no output (exit {proc.returncode}):\n"
             f"{(proc.stderr or proc.stdout)[-1500:]}"
         )
-    d = json.loads(out_json.read_text(encoding="utf-8"))
+    try:
+        d = json.loads(out_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise IdiomEvalError(f"measure_idiomaticity wrote invalid JSON: {e}") from e
+    # a crate that doesn't compile yields no lints; that is NOT "0 lints / maximally
+    # idiomatic" — surface it so the caller marks the stage skipped, not a win.
+    if d.get("build_error"):
+        raise IdiomEvalError(
+            f"crate did not build under clippy: {str(d['build_error'])[:500]}"
+        )
     by_group = {g: dict(lints) for g, lints in (d.get("clippy") or {}).items()}
     ccc = {
         int(k): int(v) for k, v in (d.get("cyclomatic_complexity_counts") or {}).items()

@@ -14,6 +14,7 @@ structures with Rust std collections).
 ```bash
 git clone <repo> && cd proctor
 git submodule update --init stages/crat stages/c2rust
+git submodule update --init stages/abstraction-recovery   # only for local recovery runs
 ./fetch_corpus.sh            # TRACTOR corpus at the pinned commit (DARPA access; not vendored)
 uv sync
 uv run proctor warmup -c tests/e2e/translation_smoke.toml   # pre-build stages
@@ -105,7 +106,7 @@ CONFIG=configs/c2rust_crat_absrec.toml ./bench_no_falco.sh B03_organic --gate
 or the `extern "C"` ABI. With `--gate`, any case the recovery didn't pass cleanly is
 re-verified against the previous stage (`crat`) and the non-regressing result is kept —
 recovery keeps its safety/idiomaticity wins where correct, falls back to `crat` where not.
-`verify.json` records `accepted_stage` and `fell_back` per case.
+`verify.json` records `accepted_stage` per case, plus a suite-level `fell_back` count.
 
 ## Measure safety + idiomaticity
 

@@ -91,9 +91,11 @@ fi
 
 # --- 1. translate the suite in the framework container -----------------------
 # Pipeline config (override with CONFIG=... ). The default is a plain
-# c2rust -> crat translation (no LLM). Set CONFIG=configs/c2rust_crat_absrec.toml
-# to add the abstraction_recovery stage (LLM via claude — the image ships the
-# CLI and we forward ANTHROPIC_API_KEY below; billed per case).
+# c2rust -> crat translation (no LLM). To add the abstraction_recovery stage
+# (billed per case), set CONFIG to either
+# configs/c2rust_crat_absrec.toml      (claude agent backend, ANTHROPIC_API_KEY) or
+# configs/c2rust_crat_absrec_llm.toml  (single-model GPT backend, OPENAI_API_KEY).
+# Both keys are forwarded into the container below.
 CONFIG="${CONFIG:-configs/bench.toml}"
 RUNTAG="$$"   # our PID: a per-run tag so parallel runs get distinct bench dirs
 TARGET="$SUITE"
@@ -151,6 +153,11 @@ if ! flock -n 9; then
   echo "   (another run is verifying — the harness isn't concurrency-safe; waiting our turn)"
   flock 9
 fi
+# `uv run` finds the project by walking up from CWD, so run it from the repo
+# root (all args below are already absolute). Without this, invoking the script
+# by absolute path from another directory fails the verify after the costly
+# translate has already run.
+cd "$ROOT"
 uv run python -m proctor.testing.no_falco_bench \
   --bench-dir "$BENCH_DIR" \
   --corpus "$CORPUS" \

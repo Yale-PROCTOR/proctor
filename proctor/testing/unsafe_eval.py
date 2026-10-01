@@ -129,12 +129,17 @@ def measure_unsafe(rust_project: Path, *, timeout_s: int = 300) -> UnsafeReport:
     total: dict[str, int] = dict.fromkeys(_STAT_FIELDS, 0)
     scanned = skipped = 0
     for f in files:
-        proc = subprocess.run(
-            [str(binary), "--file", str(f)],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
+        try:
+            proc = subprocess.run(
+                [str(binary), "--file", str(f)],
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            # a pathological file hanging the scorer shouldn't sink the crate.
+            skipped += 1
+            continue
         if proc.returncode != 0:
             # measure_unsafety panics (non-zero) on a file syn can't parse.
             skipped += 1

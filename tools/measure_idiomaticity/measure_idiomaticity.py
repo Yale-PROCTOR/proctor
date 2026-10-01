@@ -360,6 +360,11 @@ def main():
         logger.error(f"Error occurred: {err}")
 
     count_dct = clippy.convert_to_count(base_dct)
+    if err:
+        # Vendored change: surface a clippy/compile failure in the output so
+        # callers can skip the crate instead of reading an empty result as
+        # "0 lints / maximally idiomatic". See PROVENANCE.md.
+        count_dct["build_error"] = err
     dct_str = json.dumps(count_dct, indent=2)
     logger.info(dct_str)
     output.write_text(dct_str)

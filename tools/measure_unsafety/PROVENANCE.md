@@ -14,6 +14,15 @@ statement under an `unsafe` block/fn, +1 per `unsafe impl`, +1 per other
 `unsafe` keyword use). Source-only: no toolchain, runs even if the crate
 doesn't build.
 
+**Caveat (doc vs. code).** The in-code comment in `src/stats.rs` describes a
+"+1 per `pub`/trait-impl `unsafe fn`" rule that is **not** implemented — the
+formula above (read from the actual code) is authoritative, and `pub_fns` is
+computed but never added to the score. Also, a redundant `unsafe { }` block
+nested inside an `unsafe fn` is counted both as the block statement and for its
+inner statements, so `unsafe_score` skews high on heavily-nested C2Rust/CRAT
+output. Both are properties of the upstream tool (do not modify); treat the
+score as a *relative* syntactic signal, not an exact count.
+
 Per `plan_docs/unsafe_evaluation_plan.md` §3, this is the **syn / "cheapest
 signal, no compile"** tier. It is deliberately NOT:
 
