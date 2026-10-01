@@ -155,7 +155,7 @@ class Clippy:
         """
         Runs clippy in the current directory, which needs to be a Rust project.
 
-        Returns a tuple of a ClippyResultBase and an error message.
+        Returns a tuple of a dict and an error message.
         The internal dictionary is of the format:
         {
             "rustc": {
@@ -301,6 +301,7 @@ def get_parser():
 
     parser.add_argument(
         "--timeout",
+        type=float,
         default=300,
         help="timeout (sec) of the clippy invocation",
     )

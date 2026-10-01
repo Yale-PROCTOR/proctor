@@ -31,11 +31,9 @@ _STAT_FIELDS = (
     "unsafe_score",
     "unsafe_statements",
     "unsafe_fns",
-    "unsafe_pub_fns",
     "unsafe_blocks",
     "unsafe_impls",
     "unsafe_other",
-    "unsafe_lines_low_fidelity",
 )
 
 
@@ -51,7 +49,6 @@ class UnsafeReport:
     score: int
     statements: int
     fns: int
-    pub_fns: int
     blocks: int
     impls: int
     other: int
@@ -84,7 +81,6 @@ class UnsafeReport:
             score=d.get("unsafe_score", 0),
             statements=d.get("unsafe_statements", 0),
             fns=d.get("unsafe_fns", 0),
-            pub_fns=d.get("unsafe_pub_fns", 0),
             blocks=d.get("unsafe_blocks", 0),
             impls=d.get("unsafe_impls", 0),
             other=d.get("unsafe_other", 0),

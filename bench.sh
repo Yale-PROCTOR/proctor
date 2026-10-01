@@ -13,7 +13,7 @@
 #   JOBS=8 ./bench.sh B01_synthetic
 #
 # Output: one dir per run under out/, chowned to you:
-# out/bench-<suite>-<timestamp>/, containing
+# out/bench-<suite>-<pid>-<timestamp>/, containing
 #   <case>/stages/NN-<stage>/out/rust   the per-case translations, per stage
 #   bench.json    per-case run status + vector results (vectors_ok / passed /
 #                 failed / total) — bench.sh translates and verifies in one step,
@@ -43,6 +43,9 @@ fi
 MATCH=()
 [ -n "$CASE" ] && MATCH=(--match "$CASE")
 
+RUNTAG="$$"   # our PID: a per-run tag so concurrent same-suite runs get distinct
+              # bench dirs (and each chowns only its own), like bench_no_falco.sh
+
 mkdir -p "$ROOT/out" && chmod 777 "$ROOT/out"
 
 set +e
@@ -53,7 +56,7 @@ docker run --rm \
   -v "$ROOT/proctor:/home/proctor/proctor/proctor:ro" \
   proctor-framework:dev \
   bench -c configs/bench_vectors.toml \
-  --corpus "/corpus/Public-Tests/$SUITE" --name "$SUITE" \
+  --corpus "/corpus/Public-Tests/$SUITE" --name "$SUITE-$RUNTAG" \
   "${MATCH[@]}" \
   --set run.output_dir=/out \
   --set "bench.verify_all_stages=$ALL" \
@@ -66,7 +69,7 @@ set -e
 # user (needs root, hence a throwaway root container) so its per-case
 # translations and bench.json are yours to read, edit, and delete. Preserve the
 # bench exit code (non-zero when a case/vector failed).
-BENCH_DIR="$(ls -dt "$ROOT"/out/bench-"$SUITE"-* 2>/dev/null | head -1 || true)"
+BENCH_DIR="$(ls -dt "$ROOT"/out/bench-"$SUITE-$RUNTAG"-* 2>/dev/null | head -1 || true)"
 if [ -n "$BENCH_DIR" ]; then
   docker run --rm --user root -v "$ROOT/out:/out" --entrypoint chown \
     proctor-framework:dev -R "$(id -u):$(id -g)" "/out/$(basename "$BENCH_DIR")" \

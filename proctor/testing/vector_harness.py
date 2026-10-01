@@ -7,10 +7,12 @@ harness) and parse its JUnit output. Binary vectors run the translated
 ``driver`` directly; library vectors run the case's real cando ``runner``.
 Neither needs Docker/Falco/root — only cargo/cmake/ninja on PATH.
 
-The newer corpus's own orchestrator (``tools/test_runner``) is also
-supported, Falco-free, via ``run_vectors_no_falco`` — it runs at host
-level (nix + docker) and covers the newer-corpus library cases and B03;
-only file-change vectors remain Falco-only. See
+The newer corpus's own orchestrator (``tools/test_runner``) is also driven
+Falco-free at host level (nix + docker), covering the newer-corpus library
+cases and B03; only file-change vectors remain Falco-only. The pipeline/bench
+path for that is ``no_falco_bench.run_suite_no_falco`` (suite-batched); the
+per-case ``run_vectors_no_falco`` below is a thin variant over the same
+``tools/test_runner --no-falco`` invocation. See
 ``plan_docs/falco_integration_notes.md``.
 """
 
