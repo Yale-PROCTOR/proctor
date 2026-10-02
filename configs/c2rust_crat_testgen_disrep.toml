@@ -1,0 +1,53 @@
+# Pipeline: C source -> c2rust -> CRAT -> test generation -> discipline repair
+
+[run]
+provides = ["c_project"]
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = ["c2rust", "crat", "test_generation", "discipline_repair"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 900
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+
+[stages.test_generation]
+uses = "stages/test-infrastructure"
+timeout_s = 1800
+
+[stages.test_generation.config]
+command = "generate"
+strategy = "cando2"
+agent = "opencode"
+model = "opencode/muse-spark-1.3-contributor-free"
+attempts = 3
+min_coverage = 80.0
+
+[stages.discipline_repair]
+uses = "stages/discipline-repair"
+timeout_s = 1800
+
+[stages.discipline_repair.config]
+agent = "opencode"
+model = "opencode/muse-spark-1.3-contributor-free"
+max_attempts_per_target = 2
