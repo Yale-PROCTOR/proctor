@@ -7,3 +7,9 @@
 [submodule "stages/abstraction-recovery"]
 	path = stages/abstraction-recovery
 	url = https://github.com/Yale-PROCTOR/abstraction_recovery
+[submodule "stages/test-infrastructure"]
+	path = stages/test-infrastructure
+	url = https://github.com/Yale-PROCTOR/test_infrastructure
+[submodule "stages/discipline-repair"]
+	path = stages/discipline-repair
+	url = https://github.com/Yale-PROCTOR/discipline_repair
