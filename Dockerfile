@@ -45,9 +45,11 @@ RUN apt-get update \
 # Claude Code CLI (Node 20), for the abstraction_recovery stage, which shells
 # out to `claude`. Auth is via ANTHROPIC_API_KEY passed at run time
 # (e.g. bench_no_falco.sh forwards it with `docker run -e ANTHROPIC_API_KEY`).
+# Install Opencode v1 as well
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs \
  && npm install -g @anthropic-ai/claude-code \
+ && npm install -g opencode-ai \
  && npm cache clean --force \
  && rm -rf /var/lib/apt/lists/*
 
@@ -64,16 +66,21 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # it in so per-case runner builds reuse one toolchain instead of each
 # racing to auto-install it in parallel (which corrupts it).
 RUN rustup toolchain install nightly-2025-11-11 --profile minimal
+RUN cargo install --locked ripgrep cargo-llvm-cov cargo-nextest
+RUN rustup component add llvm-tools-preview
+
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 COPY --chown=proctor:proctor . /home/proctor/proctor
 WORKDIR /home/proctor/proctor
+ENV PROCTOR_TESTINFRA_ROOT=/home/proctor/proctor/stages/test-infrastructure
 
 RUN uv sync
 # Warm everything: c2rust-transpile (built from the submodule against
 # the image's LLVM), crat (pulls its pinned nightly via
 # rust-toolchain.toml), stage venvs, and the index crate.
 RUN uv run proctor warmup -c tests/e2e/translation_smoke.toml
+RUN uv run proctor warmup -c configs/c2rust_crat_testgen_disrep.toml
 
 # Put the built tools on PATH (reference tractor-crat-dockerfile parity):
 # c2rust-transpile is a plain binary; `crat` is a wrapper script that
