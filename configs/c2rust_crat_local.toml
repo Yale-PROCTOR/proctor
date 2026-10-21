@@ -1,0 +1,54 @@
+# Minimal local-transformation prototype pipeline.
+#
+#   export OPENROUTER_API_KEY=...
+#   uv run proctor run -c configs/c2rust_crat_local.toml \
+#     --input-c <c-project>
+
+[run]
+provides = ["c_project", "rule_set"]
+
+[llm]
+provider = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-6-luna"
+
+[llm.pricing."openai/openai/gpt-6-luna"]
+input = 0.10
+output = 0.50
+cached_input = 0.01
+
+[llm.extra]
+reasoning_effort = "medium"
+
+[pipeline]
+order = ["c2rust", "crat", "local_transformation"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 600
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "prepare",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.local_transformation]
+uses = "stages/local-transformation"
+timeout_s = 3600
+
+[stages.local_transformation.config]
+dump_llm_exchanges = true

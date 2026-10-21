@@ -1,0 +1,117 @@
+# Executable pipeline: C -> c2rust -> CRAT -> test generation -> abstraction
+# recovery -> discipline repair -> local transformation -> oracle tests.
+#
+# Requires OPENROUTER_API_KEY for all LLM stages.
+# Run from the PROCTOR repository root:
+#
+#   uv run proctor run -c configs/c2rust_crat_testgen_absrec_disrep_local.toml \
+#     --input-c <c-project> --rule-set <rules.json>
+#
+# The local-transformation prototype requires an empty proctor.toml wrapper
+# list. The final test stage reuses the generated oracle without completing
+# vectors or invoking an agent. Abstraction recovery is only build-checked
+# before discipline repair; its oracle is not rerun at that boundary.
+
+[run]
+provides = ["c_project", "rule_set"]
+
+[testing]
+after_each_stage = false
+
+[llm]
+provider = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-6-luna"
+
+[llm.pricing."openai/openai/gpt-6-luna"]
+input = 0.10
+output = 0.50
+cached_input = 0.01
+
+[llm.extra]
+reasoning_effort = "medium"
+
+[pipeline]
+order = [
+  "c2rust",
+  "crat",
+  "test_generation",
+  "abstraction_recovery",
+  "discipline_repair",
+  "local_transformation",
+  "test_validation",
+]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 900
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "prepare",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.test_generation]
+uses = "stages/test-infrastructure"
+timeout_s = 1800
+
+[stages.test_generation.config]
+command = "generate"
+strategy = "cando2"
+target_kind = "bin"
+agent = "opencode"
+model = "openrouter/openai/gpt-5.6-terra"
+attempts = 3
+min_coverage = 80.0
+
+[stages.abstraction_recovery]
+uses = "stages/abstraction-recovery"
+timeout_s = 2400
+
+[stages.abstraction_recovery.config]
+backend = "opencode"
+model = "openrouter/openai/gpt-5.6-terra"
+max_candidates = 1
+max_repair_iterations = 3
+on_give_up = "skip"
+
+[stages.discipline_repair]
+uses = "stages/discipline-repair"
+timeout_s = 1800
+
+[stages.discipline_repair.config]
+agent = "opencode"
+model = "openrouter/openai/gpt-5.6-terra"
+max_attempts_per_target = 2
+
+[stages.local_transformation]
+uses = "stages/local-transformation"
+timeout_s = 3600
+
+[stages.local_transformation.config]
+dump_llm_exchanges = true
+
+[stages.test_validation]
+uses = "stages/test-infrastructure"
+timeout_s = 1800
+
+[stages.test_validation.config]
+command = "run"
+strategy = "cando2"
+target_kind = "bin"
+collect_coverage = false
+complete_vectors = false
