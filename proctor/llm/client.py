@@ -11,6 +11,7 @@ import random
 import time
 from collections import deque
 from dataclasses import replace
+from threading import Lock
 from typing import Any, Callable
 
 from proctor.llm.providers.base import Provider, create_provider
@@ -45,18 +46,21 @@ class RateLimiter:
     def __init__(self, requests_per_minute: int | None) -> None:
         self._rpm = requests_per_minute
         self._window: deque[float] = deque()
+        self._lock = Lock()
 
     def acquire(self, sleep: Callable[[float], None] = time.sleep) -> None:
         if not self._rpm:
             return
-        now = time.monotonic()
-        while self._window and now - self._window[0] > 60:
-            self._window.popleft()
-        if len(self._window) >= self._rpm:
-            wait = 60 - (now - self._window[0])
-            if wait > 0:
-                sleep(wait)
-        self._window.append(time.monotonic())
+        with self._lock:
+            now = time.monotonic()
+            while self._window and now - self._window[0] >= 60:
+                self._window.popleft()
+            if len(self._window) >= self._rpm:
+                wait = 60 - (now - self._window[0])
+                if wait > 0:
+                    sleep(wait)
+                self._window.popleft()
+            self._window.append(time.monotonic())
 
 
 def _truncate(request: Request, strategy: str) -> Request | None:
@@ -90,6 +94,7 @@ class LlmClient:
         tracker: UsageTracker | None = None,
         provider: Provider | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        limiter: RateLimiter | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider if provider is not None else create_provider(settings)
@@ -99,7 +104,9 @@ class LlmClient:
         self._overflow = str(settings.get("context_overflow", "error"))
         rate = settings.get("rate_limit", {})
         rpm = rate.get("requests_per_minute") if isinstance(rate, dict) else None
-        self._limiter = RateLimiter(int(rpm) if rpm else None)
+        self._limiter = (
+            limiter if limiter is not None else RateLimiter(int(rpm) if rpm else None)
+        )
 
     def complete(self, request: Request) -> Response:
         current = request

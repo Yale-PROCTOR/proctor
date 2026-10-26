@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from proctor.llm.types import RequestMetadata, Usage
@@ -16,6 +17,8 @@ from proctor.usage.pricing import PricingTable
 
 
 class UsageTracker:
+    _append_lock = Lock()
+
     def __init__(
         self,
         path: Path,
@@ -30,6 +33,7 @@ class UsageTracker:
         self._stage = stage
         self._item = item
         self._pricing = pricing
+        self.record_count = 0
         path.parent.mkdir(parents=True, exist_ok=True)
 
     def record(
@@ -67,8 +71,10 @@ class UsageTracker:
             "cost_usd": cost,
             "error": error,
         }
-        with self._path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        with self._append_lock:
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            self.record_count += 1
 
 
 def read_usage(path: Path) -> list[dict[str, Any]]:

@@ -6,6 +6,9 @@ import hashlib
 import re
 import shutil
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 import tomllib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -30,7 +33,7 @@ from model import (
     ObservationError,
     dependency_context,
     function_graph,
-    leaf_schedule,
+    strongly_connected_components,
     load_skeletons,
     load_replacement_metadata,
     render_transformation_targets,
@@ -61,7 +64,7 @@ from proctor.contracts import (
     UsageSummary,
 )
 from proctor.contracts.manifest import ManifestError, ProjectManifest
-from proctor.llm.client import LlmClient
+from proctor.llm.client import LlmClient, RateLimiter
 from proctor.llm.types import Response
 from proctor.usage.pricing import PricingTable
 from proctor.usage.tracker import UsageTracker, read_usage
@@ -122,7 +125,6 @@ class RunState:
     statement_pairs: dict[tuple[int, int], AcceptedStatementPair] = field(
         default_factory=dict
     )
-    accepted_correspondence: list[CallableCorrespondence] = field(default_factory=list)
     accepted_observation_documents: list[Path] = field(default_factory=list)
     accepted_views: dict[int, SkeletonView] = field(default_factory=dict)
 
@@ -233,7 +235,7 @@ def _foreign_static_guidance(
 def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise StageFailure("stage config must be an object")
-    unknown = sorted(set(config) - {"crat_dir", "dump_llm_exchanges"})
+    unknown = sorted(set(config) - {"crat_dir", "dump_llm_exchanges", "workers"})
     if unknown:
         raise StageFailure(f"unknown local-transformation config keys: {unknown}")
     crat_dir = config.get("crat_dir", "../crat")
@@ -242,7 +244,11 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
     dump_llm_exchanges = config.get("dump_llm_exchanges", False)
     if not isinstance(dump_llm_exchanges, bool):
         raise StageFailure("config.dump_llm_exchanges must be a boolean")
+    workers = config.get("workers", 4)
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+        raise StageFailure("config.workers must be a positive integer")
     return {
+        "workers": workers,
         "crat_dir": str((stage_dir / crat_dir).resolve()),
         "dump_llm_exchanges": dump_llm_exchanges,
     }
@@ -456,6 +462,16 @@ def _validate_boundaries(
         raise StageFailure(
             f"output Rust project destination already exists: {destination}"
         )
+    for directory in ("analysis", "current", "workers", "sccs", "final-rollback"):
+        root = workdir / directory
+        if root.is_symlink():
+            raise StageFailure(f"scratch directory must not be a symlink: {root}")
+        if directory in {"workers", "sccs"} and root.is_dir():
+            for child in root.iterdir():
+                if child.is_symlink():
+                    raise StageFailure(
+                        f"scratch directory must not be a symlink: {child}"
+                    )
     source_resolved = source.resolve()
     writable_paths = {
         "outputs.rust_project": destination.resolve(),
@@ -531,6 +547,9 @@ def _validate_boundaries(
         "statement-pairs report": report_resolved,
         "observations artifact": observations_resolved,
         "statistics artifact": statistics_resolved,
+        "framework usage log": (
+            stage_input.framework.usage_log or workdir / "usage.jsonl"
+        ).resolve(),
     }
     if stage_input.outputs.artifacts_dir is not None:
         current_sensitive_paths["artifacts directory"] = (
@@ -543,6 +562,46 @@ def _validate_boundaries(
             or current_resolved in path.parents
         ):
             raise StageFailure(f"{name} overlaps working Rust project: {path}")
+    for directory in ("analysis", "workers", "sccs", "final-rollback"):
+        root = (workdir / directory).resolve()
+        for name, path in current_sensitive_paths.items():
+            if _paths_overlap(path, root):
+                raise StageFailure(f"{name} overlaps working directory: {root}")
+    usage_resolved = current_sensitive_paths["framework usage log"]
+    reserved = [
+        (workdir / name).resolve()
+        for name in (
+            "skeletons.json",
+            "frozen-project.json",
+            "normalized.rs",
+            "initial.rs",
+            "assembled.rs",
+            "assembled.json",
+            "final.rs",
+            "final-proctor.toml",
+            "merged-observations.json",
+        )
+    ]
+    log_root = (stage_input.outputs.artifacts_dir or workdir).resolve()
+    reserved.extend(
+        (
+            report_resolved,
+            observations_resolved,
+            statistics_resolved,
+            destination_resolved,
+            (log_root / "local-transformation.log").resolve(),
+        )
+    )
+    reserved.extend(path.resolve() for path in log_root.glob("worker-*.log"))
+    worker_log = re.fullmatch(r"worker-(\d{2,})\.log", usage_resolved.name)
+    if any(_paths_overlap(usage_resolved, path) for path in reserved) or (
+        usage_resolved.parent == log_root
+        and worker_log is not None
+        and int(worker_log.group(1)) < config["workers"]
+    ):
+        raise StageFailure(
+            "framework usage log overlaps a stage output or scratch file"
+        )
     if rule_set is not None:
         if rule_set.is_symlink() or not rule_set.is_file():
             raise StageFailure("inputs.rule_set must be a regular nonsymlink file")
@@ -701,9 +760,6 @@ def _validate_validator_response(value: dict[str, Any]) -> str:
         if not isinstance(item.get(field), str):
             raise StageFailure(f"validator {object_name}.{field} must be a string")
 
-    version = value.get("schema_version")
-    if isinstance(version, bool) or version != 1:
-        raise StageFailure(f"unsupported validator response schema_version {version!r}")
     status = value.get("status")
     if not isinstance(status, str) or status not in {
         "valid",
@@ -712,22 +768,18 @@ def _validate_validator_response(value: dict[str, Any]) -> str:
     }:
         raise StageFailure(f"unknown validator response status {status!r}")
     if status == "valid":
-        require_exact_keys("valid response", value, {"schema_version", "status"})
+        require_exact_keys("valid response", value, {"status"})
         return status
     if status == "setup_error":
         error = value.get("error")
-        require_exact_keys(
-            "setup_error response", value, {"schema_version", "status", "error"}
-        )
+        require_exact_keys("setup_error response", value, {"status", "error"})
         if not isinstance(error, dict):
             raise StageFailure("validator setup_error.error must be an object")
         require_exact_keys("setup_error.error", error, {"code", "message"})
         require_text("setup_error.error", "code", error)
         require_text("setup_error.error", "message", error)
         raise StageFailure(f"validator setup_error: {error!r}")
-    require_exact_keys(
-        "invalid response", value, {"schema_version", "status", "failures"}
-    )
+    require_exact_keys("invalid response", value, {"status", "failures"})
     failures = value.get("failures")
     if not isinstance(failures, list) or not failures:
         raise StageFailure(
@@ -776,12 +828,11 @@ def _validate_validator_response(value: dict[str, Any]) -> str:
 
 def _record_untracked_response(
     tracker: UsageTracker,
-    usage_path: Path,
     before: int,
     request: Any,
     response: Response,
 ) -> None:
-    if len(read_usage(usage_path)) == before:
+    if tracker.record_count == before:
         tracker.record(
             metadata=request.metadata,
             provider=response.provider,
@@ -804,16 +855,9 @@ def _load_replacement_statement_pairs(
         raise StageFailure(
             f"replacement statement-pairs sidecar is malformed JSON: {exc}"
         ) from exc
-    if not isinstance(value, dict) or set(value) != {"schema_version", "statements"}:
+    if not isinstance(value, dict) or set(value) != {"statements"}:
         raise StageFailure(
-            "replacement statement-pairs sidecar must contain exactly "
-            "['schema_version', 'statements']"
-        )
-    version = value["schema_version"]
-    if isinstance(version, bool) or version != 1:
-        raise StageFailure(
-            "unsupported replacement statement-pairs sidecar schema_version "
-            f"{version!r}"
+            "replacement statement-pairs sidecar must contain exactly ['statements']"
         )
     statements = value["statements"]
     if not isinstance(statements, list):
@@ -911,14 +955,42 @@ def _load_and_validate_replacement_metadata(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
     views_by_id: dict[int, SkeletonView],
-    accepted: tuple[CallableCorrespondence, ...],
+    frozen: Path,
 ) -> ReplacementMetadata:
     try:
         metadata = load_replacement_metadata(path.read_text(encoding="utf-8"))
     except ObservationError as exc:
         raise StageFailure(f"invalid replacement observation metadata: {exc}") from exc
-    if metadata.schema_version != 2:
-        raise StageFailure("additive observation metadata must use schema version 2")
+    if not set(metadata.unfilled_stub_items).issubset(members):
+        raise StageFailure(
+            "replacement metadata unfilled_stub_items contains a non-current item"
+        )
+    if (
+        metadata.frozen_project_sha256
+        != hashlib.sha256(frozen.read_bytes()).hexdigest()
+    ):
+        raise StageFailure(
+            "replacement metadata frozen_project_sha256 differs from frozen project"
+        )
+    expected_dependencies = tuple(
+        CallableCorrespondence(record.id, record.path, record.path, None)
+        for record in sorted(records_by_id.values(), key=lambda record: record.id)
+        if record.is_function and record.id not in members
+    )
+    if metadata.accepted_correspondence:
+        raise StageFailure(
+            "independent SCC metadata cannot contain accepted dependencies"
+        )
+    if metadata.dependency_correspondence != expected_dependencies:
+        raise StageFailure(
+            "replacement metadata dependency_correspondence differs from frozen interface"
+        )
+    if tuple(stub.item_id for stub in metadata.source_stubs) != tuple(
+        sorted((*members, *(record.item_id for record in expected_dependencies)))
+    ):
+        raise StageFailure(
+            "replacement metadata source_stubs do not cover the original interface"
+        )
     companions = (
         ("candidate_sha256", candidate, "candidate"),
         ("statement_pairs_sha256", statement_pairs, "statement-pairs sidecar"),
@@ -930,10 +1002,6 @@ def _load_and_validate_replacement_metadata(
             raise StageFailure(
                 f"replacement metadata {field_name} does not match {display} bytes"
             )
-    if metadata.accepted_correspondence != accepted:
-        raise StageFailure(
-            "replacement metadata accepted_correspondence does not equal the request"
-        )
     if len(metadata.new_correspondence) != len(metadata.current_items):
         raise StageFailure("replacement metadata current/new record counts differ")
     for index, (new, current) in enumerate(
@@ -974,7 +1042,11 @@ def _load_and_validate_replacement_metadata(
                 f"replacement metadata current_items[{index}].transform_labels "
                 f"does not equal {list(expected_labels)}"
             )
-    all_records = (*metadata.accepted_correspondence, *metadata.new_correspondence)
+    all_records = (
+        *metadata.accepted_correspondence,
+        *metadata.dependency_correspondence,
+        *metadata.new_correspondence,
+    )
     categories: dict[str, list[tuple[str, int]]] = {
         "logical_path": [
             (record.logical_path, record.item_id) for record in all_records
@@ -1001,16 +1073,14 @@ def _load_and_validate_replacement_metadata(
         item_ids.add(record.item_id)
         if record.wrapper_path is not None:
             raise StageFailure("additive correspondence cannot contain a wrapper path")
-    accepted_by_id = {
-        record.item_id: record for record in metadata.accepted_correspondence
-    }
+    callables_by_id = {record.item_id: record for record in all_records}
     for stub in metadata.source_stubs:
-        accepted_record = accepted_by_id.get(stub.item_id)
-        if accepted_record is None:
+        callable_record = callables_by_id.get(stub.item_id)
+        if callable_record is None:
             raise StageFailure(
-                f"replacement metadata source stub {stub.item_id} is not an accepted item"
+                f"replacement metadata source stub {stub.item_id} is not a callable item"
             )
-        module, _, name = accepted_record.logical_path.rpartition("::")
+        module, _, name = callable_record.logical_path.rpartition("::")
         stub_module, _, stub_name = stub.path.rpartition("::")
         expected_name = f"__proctor_source_stub_{name.removeprefix('r#')}"
         suffix = stub_name.removeprefix(f"{expected_name}_")
@@ -1242,7 +1312,6 @@ def _statistics_json(state: RunState) -> str:
         count(view.statement_dispositions)
 
     statistics = {
-        "schema_version": 1,
         "function_scc_count": state.metrics.scc_count,
         "llm_transformation_calls": (
             state.metrics.llm_generation_calls - state.metrics.repair_calls
@@ -1268,7 +1337,7 @@ def _publish_final_outputs(
     ),
     statistics_path: Path | None = None,
     statistics: str = (
-        '{\n  "schema_version": 1,\n  "function_scc_count": 0,\n'
+        '{\n  "function_scc_count": 0,\n'
         '  "llm_transformation_calls": 0,\n  "llm_repair_calls": 0,\n'
         '  "statements": {\n    "total": 0,\n    "preserve": 0,\n'
         '    "preserve_shell": 0,\n    "rule_applied": 0,\n'
@@ -1430,12 +1499,12 @@ def _process_scc(
     stage_input: StageInput,
     current: Path,
     analysis: Path,
+    frozen: Path,
     library_source: Path,
     workdir: Path,
     tools: Any,
     client: Any,
     tracker: UsageTracker,
-    usage_path: Path,
     exchange_root: Path | None,
     state: RunState,
 ) -> None:
@@ -1508,9 +1577,25 @@ def _process_scc(
                 (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
             state.prompt_used = True
             state.metrics.llm_generation_calls += 1
-            before = len(read_usage(usage_path))
-            response = client.complete(request)
-            _record_untracked_response(tracker, usage_path, before, request, response)
+            before = tracker.record_count
+            started = time.monotonic()
+            try:
+                response = client.complete(request)
+            except Exception as exc:
+                if tracker.record_count == before:
+                    tracker.record(
+                        metadata=request.metadata,
+                        provider=str(
+                            stage_input.framework.llm.get("provider", "unknown")
+                        ),
+                        model=str(stage_input.framework.llm.get("model", "")),
+                        usage=None,
+                        latency_s=time.monotonic() - started,
+                        finish_reason="error",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
+            _record_untracked_response(tracker, before, request, response)
             if exchange_dir is not None:
                 (exchange_dir / "response.md").write_text(
                     response.text, encoding="utf-8"
@@ -1520,6 +1605,12 @@ def _process_scc(
                 state.metrics.structural_failures += 1
                 latest_failed = extraction.failed_text
                 latest_diagnostics = extraction.diagnostics
+                (workdir / "last-failed-transformation.txt").write_text(
+                    latest_failed or "", encoding="utf-8"
+                )
+                (workdir / "structural-diagnostics.txt").write_text(
+                    latest_diagnostics or "", encoding="utf-8"
+                )
                 generation += 1
                 continue
             transformation = extraction.candidate
@@ -1539,9 +1630,18 @@ def _process_scc(
                 state.metrics.structural_failures += 1
                 latest_failed = transformation
                 latest_diagnostics = raw_response
+                (workdir / "last-failed-transformation.txt").write_text(
+                    transformation, encoding="utf-8"
+                )
+                (workdir / "structural-diagnostics.txt").write_text(
+                    raw_response, encoding="utf-8"
+                )
                 generation += 1
                 continue
 
+        (workdir / "last-transformation.rs").write_text(
+            transformation, encoding="utf-8"
+        )
         replacement_request_path = workdir / "replacement-request.json"
         candidate = workdir / "candidate.rs"
         statement_pairs_path = workdir / "replacement-statement-pairs.json"
@@ -1555,7 +1655,7 @@ def _process_scc(
                 records_by_id,
                 active_views,
                 transformation,
-                tuple(state.accepted_correspondence),
+                (),
             ),
         )
         with _replacement_attempt_outputs(
@@ -1575,6 +1675,7 @@ def _process_scc(
                 statement_pairs_path,
                 observation_source_path,
                 observation_metadata_path,
+                frozen=frozen,
             )
             statement_pairs = _load_replacement_statement_pairs(
                 statement_pairs_path, members, records_by_id, active_views
@@ -1587,8 +1688,31 @@ def _process_scc(
                 members,
                 records_by_id,
                 active_views,
-                tuple(state.accepted_correspondence),
+                frozen,
             )
+            if metadata.unfilled_stub_items:
+                diagnostics = (
+                    "Complete the unfilled whole-function stubs: "
+                    + ", ".join(
+                        f"{item_id}:{records_by_id[item_id].path}"
+                        for item_id in metadata.unfilled_stub_items
+                    )
+                )
+                if mechanical:
+                    raise StageFailure(
+                        f"mechanical SCC candidate contains unfilled whole-function stubs: {diagnostics}"
+                    )
+                state.metrics.structural_failures += 1
+                latest_failed = transformation
+                latest_diagnostics = diagnostics
+                (workdir / "last-failed-transformation.txt").write_text(
+                    transformation, encoding="utf-8"
+                )
+                (workdir / "structural-diagnostics.txt").write_text(
+                    diagnostics, encoding="utf-8"
+                )
+                generation += 1
+                continue
             state.metrics.cargo_builds += 1
             build = install_candidate_transaction(
                 library_source,
@@ -1597,6 +1721,21 @@ def _process_scc(
                 lambda: tools.cargo_build(current, library_only=True),
             )
             if build.returncode == 0:
+                if (
+                    hashlib.sha256(library_source.read_bytes()).hexdigest()
+                    != metadata.candidate_sha256
+                ):
+                    raise StageFailure(
+                        "successful cargo build changed candidate source bytes"
+                    )
+                retained_source = workdir / "accepted.rs"
+                shutil.copyfile(library_source, retained_source)
+                for path in (
+                    statement_pairs_path,
+                    observation_source_path,
+                    observation_metadata_path,
+                ):
+                    shutil.copyfile(path, workdir / f"accepted-{path.name}")
                 accepted_documents = list(state.accepted_observation_documents)
                 if any(view.transform_labels for view in active_views.values()):
                     tools.extract_observations(
@@ -1622,7 +1761,6 @@ def _process_scc(
                 )
                 state.statement_pairs = accepted_pairs
                 state.accepted_observation_documents = accepted_documents
-                state.accepted_correspondence.extend(metadata.new_correspondence)
                 accepted_views = dict(state.accepted_views)
                 accepted_views.update(active_views)
                 state.accepted_views = accepted_views
@@ -1633,6 +1771,7 @@ def _process_scc(
             f"cargo build --lib stdout:\n{build.stdout}\n"
             f"cargo build --lib stderr:\n{build.stderr}"
         )
+        (workdir / "compiler-diagnostics.txt").write_text(diagnostics, encoding="utf-8")
         rule_involved = any(
             view.contains_rule_application for view in active_views.values()
         )
@@ -1656,6 +1795,141 @@ def _process_scc(
     raise StageFailure(
         f"SCC {','.join(map(str, members))} exhausted {MAX_REPAIRS} repair calls"
     )
+
+
+def _merge_job_state(state: RunState, job: RunState) -> None:
+    for name in job.metrics.to_dict():
+        setattr(
+            state.metrics,
+            name,
+            getattr(state.metrics, name) + getattr(job.metrics, name),
+        )
+    state.prompt_used |= job.prompt_used
+    state.statement_pairs.update(job.statement_pairs)
+    state.accepted_observation_documents.extend(job.accepted_observation_documents)
+    state.accepted_views.update(job.accepted_views)
+
+
+def _run_scc_workers(
+    schedule: tuple[tuple[int, ...], ...],
+    records_by_id: dict[int, ItemRecord],
+    *,
+    stage_input: StageInput,
+    template: Path,
+    analysis: Path,
+    frozen: Path,
+    library_relative: Path,
+    workdir: Path,
+    tools: Any,
+    usage_path: Path,
+    exchange_root: Path | None,
+    state: RunState,
+    llm_client_factory: Callable[[dict[str, Any], UsageTracker], Any] | None,
+) -> tuple[tuple[tuple[int, ...], Path], ...]:
+    count = min(state.config_used["workers"], len(schedule))
+    settings = dict(stage_input.framework.llm)
+    settings["context_overflow"] = "error"
+    rate = settings.get("rate_limit", {})
+    rpm = rate.get("requests_per_minute") if isinstance(rate, dict) else None
+    limiter = RateLimiter(int(rpm) if rpm else None)
+    factory = llm_client_factory or (
+        lambda config, tracker: LlmClient(config, tracker=tracker, limiter=limiter)
+    )
+    dispatch = Lock()
+    next_job = 0
+    failures: dict[int, str] = {}
+    jobs: dict[int, RunState] = {}
+    accepted: dict[int, tuple[tuple[int, ...], Path]] = {}
+    artifacts = stage_input.outputs.artifacts_dir
+    log_root = artifacts or workdir
+    logs = tuple(log_root / f"worker-{index:02d}.log" for index in range(count))
+    if artifacts is not None:
+        state.logs += tuple(str(path.relative_to(artifacts)) for path in logs)
+
+    def worker(index: int) -> None:
+        nonlocal next_job
+        root = workdir / "workers" / f"{index:02d}"
+        job_index = -index - 1
+        try:
+            if root.exists():
+                shutil.rmtree(root)
+            root.mkdir(parents=True)
+            current = root / "project"
+            shutil.copytree(
+                template,
+                current,
+                ignore=lambda directory, names: (
+                    {"target"} if Path(directory) == template else set()
+                ),
+            )
+            worker_tools = tools.fork(logs[index], current / "target")
+            tracker = UsageTracker(
+                usage_path,
+                run_id=stage_input.run_id,
+                stage=STAGE_ID,
+                item=stage_input.item,
+                pricing=PricingTable.from_config(settings),
+            )
+            client = factory(dict(settings), tracker)
+            while True:
+                with dispatch:
+                    if failures or next_job == len(schedule):
+                        return
+                    job_index = next_job
+                    next_job += 1
+                members = schedule[job_index]
+                jobdir = workdir / "sccs" / f"{job_index:06d}"
+                if jobdir.exists():
+                    shutil.rmtree(jobdir)
+                jobdir.mkdir(parents=True)
+                # Only the private project's source is reset; Cargo's private
+                # dependency and incremental cache survives successive jobs.
+                shutil.copyfile(template / library_relative, current / library_relative)
+                job = RunState()
+                jobs[job_index] = job
+                _process_scc(
+                    members,
+                    records_by_id,
+                    stage_input=stage_input,
+                    current=current,
+                    analysis=analysis,
+                    frozen=frozen,
+                    library_source=current / library_relative,
+                    workdir=jobdir,
+                    tools=worker_tools,
+                    client=client,
+                    tracker=tracker,
+                    exchange_root=exchange_root,
+                    state=job,
+                )
+                accepted[job_index] = (members, jobdir / "accepted.rs")
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            with dispatch:
+                failures[job_index] = detail
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "failure.txt").write_text(detail + "\n", encoding="utf-8")
+
+    # Submit the workers, not the SCCs, so failures stop further dispatch while
+    # already running SCCs finish and record all usage before stage reporting.
+    try:
+        with ThreadPoolExecutor(
+            max_workers=count, thread_name_prefix="local-scc"
+        ) as pool:
+            futures = [pool.submit(worker, index) for index in range(count)]
+            for future in futures:
+                future.result()
+    finally:
+        for index in sorted(jobs):
+            _merge_job_state(state, jobs[index])
+    if failures:
+        raise StageFailure(
+            "; ".join(
+                f"SCC job {index}: {detail}"
+                for index, detail in sorted(failures.items())
+            )
+        )
+    return tuple(accepted[index] for index in range(len(schedule)))
 
 
 def run_stage(
@@ -1733,7 +2007,10 @@ def run_stage(
             )
 
         skeleton_path = workdir / "skeletons.json"
-        active_tools.make_skeleton(analysis, skeleton_path, rule_set)
+        frozen = workdir / "frozen-project.json"
+        active_tools.make_skeleton(
+            analysis, skeleton_path, rule_set, frozen_output=frozen
+        )
         records = load_skeletons(skeleton_path.read_text(encoding="utf-8"))
         records_by_id = {record.id: record for record in records}
 
@@ -1746,7 +2023,7 @@ def run_stage(
         shutil.copytree(analysis, current)
         library_source = current / library_relative
         initial_source = workdir / "initial.rs"
-        active_tools.make_initial(analysis, initial_source)
+        active_tools.make_initial(analysis, initial_source, frozen=frozen)
         os.replace(initial_source, library_source)
         state.metrics.cargo_builds += 1
         initial_build: CommandResult = active_tools.cargo_build(
@@ -1761,47 +2038,47 @@ def run_stage(
             )
 
         graph = function_graph(records)
-        schedule = leaf_schedule(graph)
+        schedule = strongly_connected_components(graph)
         state.metrics.function_count = len(graph)
         state.metrics.scc_count = len(schedule)
 
+        accepted: tuple[tuple[tuple[int, ...], Path], ...] = ()
         if schedule:
-            llm_settings = dict(stage_input.framework.llm)
-            llm_settings["context_overflow"] = "error"
-            tracker = UsageTracker(
-                usage_path,
-                run_id=stage_input.run_id,
-                stage=STAGE_ID,
-                item=stage_input.item,
-                pricing=PricingTable.from_config(llm_settings),
-            )
-            factory = llm_client_factory or (
-                lambda settings, usage_tracker: LlmClient(
-                    settings, tracker=usage_tracker
-                )
-            )
-            client = factory(llm_settings, tracker)
             exchange_root = (
                 (artifacts or workdir) / "llm-exchanges"
                 if config["dump_llm_exchanges"]
                 else None
             )
-            for members in schedule:
-                _process_scc(
-                    members,
-                    records_by_id,
-                    stage_input=stage_input,
-                    current=current,
-                    analysis=analysis,
-                    library_source=library_source,
-                    workdir=workdir,
-                    tools=active_tools,
-                    client=client,
-                    tracker=tracker,
-                    usage_path=usage_path,
-                    exchange_root=exchange_root,
-                    state=state,
-                )
+            accepted = _run_scc_workers(
+                schedule,
+                records_by_id,
+                stage_input=stage_input,
+                template=current,
+                analysis=analysis,
+                frozen=frozen,
+                library_relative=library_relative,
+                workdir=workdir,
+                tools=active_tools,
+                usage_path=usage_path,
+                exchange_root=exchange_root,
+                state=state,
+                llm_client_factory=llm_client_factory,
+            )
+        for members, accepted_source in accepted:
+            accepted_dir = accepted_source.parent
+            _load_and_validate_replacement_metadata(
+                accepted_dir / "accepted-replacement-observation-metadata.json",
+                accepted_source,
+                accepted_dir / "accepted-replacement-statement-pairs.json",
+                accepted_dir / "accepted-replacement-observation.rs",
+                members,
+                records_by_id,
+                state.accepted_views,
+                frozen,
+            )
+        assembled = workdir / "assembled.rs"
+        active_tools.assemble_project(frozen, accepted, assembled)
+        os.replace(assembled, library_source)
         finalized_source = workdir / "final.rs"
         finalized_manifest = workdir / "final-proctor.toml"
         with _replacement_attempt_outputs((finalized_source, finalized_manifest)):
@@ -1811,6 +2088,7 @@ def run_stage(
                 current / "proctor.toml",
                 finalized_source,
                 finalized_manifest,
+                frozen=frozen,
             )
             final_manifest_info = ProjectManifest.load(finalized_manifest)
             if (

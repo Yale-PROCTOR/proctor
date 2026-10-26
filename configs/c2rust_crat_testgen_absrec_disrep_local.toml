@@ -103,6 +103,7 @@ uses = "stages/local-transformation"
 timeout_s = 3600
 
 [stages.local_transformation.config]
+workers = 8
 dump_llm_exchanges = true
 
 [stages.test_validation]

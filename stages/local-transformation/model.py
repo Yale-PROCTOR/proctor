@@ -51,14 +51,16 @@ class SourceStub:
 
 @dataclass(frozen=True)
 class ReplacementMetadata:
-    schema_version: int
     candidate_sha256: str
     statement_pairs_sha256: str
     observation_source_sha256: str
     accepted_correspondence: tuple[CallableCorrespondence, ...]
     new_correspondence: tuple[CallableCorrespondence, ...]
     current_items: tuple[CurrentObservationItem, ...]
-    source_stubs: tuple[SourceStub, ...] = ()
+    source_stubs: tuple[SourceStub, ...]
+    dependency_correspondence: tuple[CallableCorrespondence, ...]
+    frozen_project_sha256: str
+    unfilled_stub_items: tuple[int, ...]
 
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -145,26 +147,18 @@ def load_replacement_metadata(text: str) -> ReplacementMetadata:
         ) from exc
     if not isinstance(value, dict):
         raise ObservationError("replacement metadata must be an object")
-    version = value.get("schema_version")
-    if (
-        not isinstance(version, int)
-        or isinstance(version, bool)
-        or version not in (1, 2)
-    ):
-        raise ObservationError(
-            f"unsupported replacement metadata schema_version {version!r}"
-        )
     keys = {
-        "schema_version",
         "candidate_sha256",
         "statement_pairs_sha256",
         "observation_source_sha256",
         "accepted_correspondence",
         "new_correspondence",
         "current_items",
+        "source_stubs",
+        "dependency_correspondence",
+        "frozen_project_sha256",
+        "unfilled_stub_items",
     }
-    if version == 2:
-        keys.add("source_stubs")
     value = _exact_object(
         value,
         keys,
@@ -175,6 +169,7 @@ def load_replacement_metadata(text: str) -> ReplacementMetadata:
         "candidate_sha256",
         "statement_pairs_sha256",
         "observation_source_sha256",
+        "frozen_project_sha256",
     ):
         digest = value[key]
         if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
@@ -183,7 +178,11 @@ def load_replacement_metadata(text: str) -> ReplacementMetadata:
             )
         digests[key] = digest
     correspondence_lists: dict[str, tuple[CallableCorrespondence, ...]] = {}
-    for key in ("accepted_correspondence", "new_correspondence"):
+    for key in (
+        "accepted_correspondence",
+        "new_correspondence",
+        "dependency_correspondence",
+    ):
         raw = value[key]
         if not isinstance(raw, list):
             raise ObservationError(f"replacement metadata {key} must be an array")
@@ -228,7 +227,7 @@ def load_replacement_metadata(text: str) -> ReplacementMetadata:
                 ),
             )
         )
-    raw_stubs = value.get("source_stubs", [])
+    raw_stubs = value["source_stubs"]
     if not isinstance(raw_stubs, list):
         raise ObservationError("replacement metadata source_stubs must be an array")
     stubs: list[SourceStub] = []
@@ -245,13 +244,27 @@ def load_replacement_metadata(text: str) -> ReplacementMetadata:
         raise ObservationError(
             "replacement metadata source_stubs must be sorted by unique item ID"
         )
+    raw_unfilled = value["unfilled_stub_items"]
+    if not isinstance(raw_unfilled, list):
+        raise ObservationError(
+            "replacement metadata unfilled_stub_items must be an array"
+        )
+    unfilled = tuple(
+        _wire_integer(item, "replacement metadata unfilled_stub_items entry")
+        for item in raw_unfilled
+    )
+    if any(left >= right for left, right in pairwise(unfilled)):
+        raise ObservationError(
+            "replacement metadata unfilled_stub_items must be sorted by unique item ID"
+        )
     return ReplacementMetadata(
-        schema_version=version,
         **digests,
         accepted_correspondence=correspondence_lists["accepted_correspondence"],
         new_correspondence=correspondence_lists["new_correspondence"],
         current_items=tuple(current),
         source_stubs=tuple(stubs),
+        dependency_correspondence=correspondence_lists["dependency_correspondence"],
+        unfilled_stub_items=unfilled,
     )
 
 
@@ -1722,32 +1735,6 @@ def strongly_connected_components(
         if node not in indices:
             visit(node)
     return tuple(sorted(result, key=lambda members: members[0]))
-
-
-def leaf_schedule(graph: dict[int, set[int]]) -> tuple[tuple[int, ...], ...]:
-    components = strongly_connected_components(graph)
-    owner = {
-        member: component_index
-        for component_index, component in enumerate(components)
-        for member in component
-    }
-    outgoing = {
-        index: {
-            owner[successor]
-            for member in component
-            for successor in graph[member]
-            if owner[successor] != index
-        }
-        for index, component in enumerate(components)
-    }
-    unprocessed = set(range(len(components)))
-    schedule: list[tuple[int, ...]] = []
-    while unprocessed:
-        leaves = [index for index in unprocessed if not (outgoing[index] & unprocessed)]
-        chosen = min(leaves, key=lambda index: components[index][0])
-        schedule.append(components[chosen])
-        unprocessed.remove(chosen)
-    return tuple(schedule)
 
 
 def render_dependency_entry(record: ItemRecord) -> str:
