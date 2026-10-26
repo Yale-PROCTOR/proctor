@@ -3833,8 +3833,10 @@ class FakeClient:
         )
 
 
-def response(name="target"):
-    return f"```rust\nunsafe fn {name}() {{\n    #[proctor(0)]\n    ()\n}}\n```"
+def response(name="target", *, statement="()"):
+    return (
+        f"```rust\nunsafe fn {name}() {{\n    #[proctor(0)]\n    {statement}\n}}\n```"
+    )
 
 
 def stage_input(tmp_path, *, artifacts=True, config=None, llm=None, rule_set=None):
@@ -5464,7 +5466,9 @@ def test_repairs_before_applied_build_failure_are_not_reset_on_fallback(tmp_path
         validators=[INVALID, VALID, VALID],
         candidates=["bad applied repair two\n", "good baseline repair three\n"],
     )
-    client = FakeClient(["missing fence", response(), response(), response()])
+    client = FakeClient(
+        ["missing fence", response(), response(statement="1;"), response()]
+    )
     _, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
     validations = [event for event in tools.events if event[0] == "validate"]
@@ -5486,8 +5490,9 @@ def test_repairs_before_applied_build_failure_are_not_reset_on_fallback(tmp_path
 
 
 @pytest.mark.parametrize("mechanical_entry", [False, True])
-def test_applied_fallback_and_baseline_repairs_share_ten_repair_limit(
-    tmp_path, mechanical_entry
+@pytest.mark.parametrize("max_repairs", [0, 3, 8])
+def test_applied_fallback_and_baseline_repairs_share_configured_repair_limit(
+    tmp_path, mechanical_entry, max_repairs
 ):
     if mechanical_entry:
         record = apply_rules(
@@ -5495,7 +5500,7 @@ def test_applied_fallback_and_baseline_repairs_share_ten_repair_limit(
             rule_labels=[0],
             transform_labels=[],
         )
-        response_count = 10
+        response_count = max_repairs
     else:
         record = apply_rules(
             fn_record(
@@ -5508,28 +5513,32 @@ def test_applied_fallback_and_baseline_repairs_share_ten_repair_limit(
             rule_labels=[0],
             transform_labels=[1],
         )
-        response_count = 11
+        response_count = max_repairs + 1
     failed_builds = [
-        CommandResult(101, f"out{index}", f"err{index}") for index in range(11)
+        CommandResult(101, f"out{index}", f"err{index}")
+        for index in range(max_repairs + 1)
     ]
     tools = FakeTools(
         skeletons=[record],
         builds=[CommandResult(0), *failed_builds],
         validators=[VALID] * response_count,
-        candidates=[f"candidate {index}\n" for index in range(11)],
+        candidates=[f"candidate {index}\n" for index in range(max_repairs + 1)],
     )
-    client = FakeClient([response()] * response_count)
-    _, output = run_fake(tmp_path, tools, client)
+    client = FakeClient(
+        [response(statement=f"{index};") for index in range(response_count)]
+    )
+    _, output = run_fake(tmp_path, tools, client, config={"max_repairs": max_repairs})
     assert output.status == "failure"
+    assert f"exhausted {max_repairs} repair calls" in output.error
     assert len(client.requests) == response_count
     assert output.metrics == {
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": response_count,
-        "repair_calls": 10,
+        "repair_calls": max_repairs,
         "structural_failures": 0,
-        "compilation_failures": 11,
-        "cargo_builds": 12,
+        "compilation_failures": max_repairs + 1,
+        "cargo_builds": max_repairs + 2,
     }
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert replacements[0][2]["items"][0]["view"] == record["applied"]
@@ -5546,7 +5555,9 @@ def test_build_failure_without_rule_application_repairs_in_same_view(tmp_path):
         validators=[VALID, VALID],
         candidates=["bad ordinary\n", "good ordinary\n"],
     )
-    _, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
+    _, output = run_fake(
+        tmp_path, tools, FakeClient([response(), response(statement="1;")])
+    )
     assert output.status == "success"
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert all(
@@ -5863,7 +5874,7 @@ def test_validator_invalid_consumes_one_repair_then_succeeds(tmp_path):
         validators=[INVALID, VALID],
         candidates=["candidate\n"],
     )
-    client = FakeClient([response(), response()])
+    client = FakeClient([response(), response(statement="1;")])
     _, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
     assert output.metrics["repair_calls"] == 1
@@ -5892,7 +5903,7 @@ def test_xj_scanf_guidance_is_consistent_across_initial_and_repair_prompts(tmp_p
         validators=[INVALID, VALID],
         candidates=["candidate\n"],
     )
-    client = FakeClient([response(), response()])
+    client = FakeClient([response(), response(statement="1;")])
 
     _, output = run_fake(tmp_path, tools, client)
 
@@ -5927,7 +5938,7 @@ def test_foreign_static_guidance_is_consistent_across_initial_and_repair_prompts
         validators=[INVALID, VALID],
         candidates=["candidate\n"],
     )
-    client = FakeClient([response(), response()])
+    client = FakeClient([response(), response(statement="1;")])
 
     _, output = run_fake(tmp_path, tools, client)
 
@@ -5962,7 +5973,7 @@ def test_libc_guidance_is_consistent_across_repair_and_rule_fallback_prompts(
         validators=[INVALID, VALID, VALID],
         candidates=["bad applied\n", "good baseline\n"],
     )
-    client = FakeClient([response(), response(), response()])
+    client = FakeClient([response(), response(statement="1;"), response()])
 
     _, output = run_fake(tmp_path, tools, client)
 
@@ -6028,7 +6039,7 @@ def test_printf_guidance_is_identical_across_initial_validation_and_build_repair
         validators=[INVALID, VALID, VALID],
         candidates=["rejected applied candidate\n", "accepted baseline candidate\n"],
     )
-    client = FakeClient([response(), response(), response()])
+    client = FakeClient([response(), response(statement="1;"), response()])
 
     _, output = run_fake(tmp_path, tools, client)
 
@@ -6229,7 +6240,8 @@ def test_missing_fence_consumes_repair_without_validator_call(tmp_path):
         validators=[VALID],
         candidates=["candidate\n"],
     )
-    _, output = run_fake(tmp_path, tools, FakeClient(["no code here", response()]))
+    unfenced = extract_code_block(response()).candidate
+    _, output = run_fake(tmp_path, tools, FakeClient([unfenced, response()]))
     assert output.status == "success"
     assert len([event for event in tools.events if event[0] == "validate"]) == 1
 
@@ -6278,7 +6290,9 @@ def test_failed_candidate_build_restores_then_repairs(tmp_path):
         validators=[VALID, VALID],
         candidates=[leaf, invalid, accepted],
     )
-    value, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
+    value, output = run_fake(
+        tmp_path, tools, FakeClient([response(), response(statement="1;")])
+    )
     assert output.status == "success"
     replace_events = [event for event in tools.events if event[0] == "add_functions"]
     assert replace_events[1][3] == initial
@@ -6297,15 +6311,194 @@ def test_failed_candidate_build_restores_then_repairs(tmp_path):
     )
 
 
-def test_ten_failed_repairs_allow_exactly_eleven_generations(tmp_path):
+@pytest.mark.parametrize(
+    "max_repairs, expected_repairs", [(None, 5), (0, 0), (2, 2), (8, 8)]
+)
+def test_repair_limit_allows_initial_generation_and_configured_repairs(
+    tmp_path, max_repairs, expected_repairs
+):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
-        validators=[INVALID] * 11,
+        validators=[INVALID] * (expected_repairs + 1),
     )
-    _, output = run_fake(tmp_path, tools, FakeClient([response()] * 12))
+    client = FakeClient(
+        [response(statement=f"{index};") for index in range(expected_repairs + 2)]
+    )
+    _, output = run_fake(
+        tmp_path,
+        tools,
+        client,
+        config={} if max_repairs is None else {"max_repairs": max_repairs},
+    )
     assert output.status == "failure"
-    assert output.metrics["llm_generation_calls"] == 11
-    assert output.metrics["repair_calls"] == 10
+    assert f"exhausted {expected_repairs} repair calls" in output.error
+    assert output.config_used["max_repairs"] == expected_repairs
+    assert len(client.requests) == expected_repairs + 1
+    assert (
+        output.metrics["llm_generation_calls"]
+        == output.usage.calls
+        == len(client.requests)
+    )
+    assert output.metrics["repair_calls"] == expected_repairs
+
+
+@pytest.mark.parametrize("max_repairs", [0, 2])
+def test_last_allowed_generation_can_succeed(tmp_path, max_repairs):
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        validators=[INVALID] * max_repairs + [VALID],
+        candidates=["accepted\n"],
+    )
+    client = FakeClient(
+        [response(statement=f"{index};") for index in range(max_repairs + 1)]
+    )
+    _, output = run_fake(tmp_path, tools, client, config={"max_repairs": max_repairs})
+    assert output.status == "success", output.error
+    assert output.metrics["repair_calls"] == max_repairs
+    assert len(client.requests) == max_repairs + 1
+
+
+@pytest.mark.parametrize("failure_kind", ["structural", "compilation"])
+@pytest.mark.parametrize("nonconsecutive", [False, True])
+def test_repeated_transformations_fail_scc_before_revalidation(
+    tmp_path, failure_kind, nonconsecutive
+):
+    responses = [response()]
+    if nonconsecutive:
+        responses.append(response(statement="1;"))
+    failed_count = len(responses)
+    responses.append("Regenerated code:\n" + response().replace("```rust", "```"))
+    compilation = failure_kind == "compilation"
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        validators=[VALID if compilation else INVALID] * failed_count,
+        builds=[CommandResult(0)] + [CommandResult(101)] * failed_count,
+        candidates=[f"failed candidate {index}\n" for index in range(failed_count)],
+    )
+    client = FakeClient(responses)
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "failure"
+    assert output.error.endswith(
+        f"SCC 0 repeated transformation at generation {failed_count} "
+        "(first seen at generation 0)"
+    )
+    assert len(client.requests) == output.usage.calls == failed_count + 1
+    assert output.metrics["repair_calls"] == failed_count
+    assert output.metrics["structural_failures"] == (0 if compilation else failed_count)
+    assert output.metrics["compilation_failures"] == (
+        failed_count if compilation else 0
+    )
+    assert output.metrics["cargo_builds"] == 1 + (failed_count if compilation else 0)
+    assert (
+        len([event for event in tools.events if event[0] == "validate"]) == failed_count
+    )
+    jobdir = value.framework.workdir / "sccs/000000"
+    assert (
+        jobdir / "last-failed-transformation.txt"
+    ).read_text() == extract_code_block(responses[0]).candidate
+    assert not (jobdir / "candidate.rs").exists()
+    assert not (jobdir / "accepted.rs").exists()
+    assert (value.framework.workdir / "workers/00/project/lib.rs").read_text() == (
+        "normalized\n"
+    )
+    assert not value.outputs.rust_project.exists()
+    assert output.outputs.rust_project is None
+    assert not any(
+        event[0] in {"extract_observations", "assemble_project", "finalize_project"}
+        for event in tools.events
+    )
+
+
+def test_repeated_unfenced_response_fails_scc_without_validator(tmp_path):
+    tools = FakeTools(skeletons=[fn_record(0, "target", "target", [])])
+    value, output = run_fake(
+        tmp_path, tools, FakeClient(["no fence", "still no fence", "no fence"])
+    )
+    assert output.status == "failure"
+    assert "repeated transformation at generation 2 (first seen at generation 0)" in (
+        output.error
+    )
+    assert output.usage.calls == output.metrics["llm_generation_calls"] == 3
+    assert output.metrics["repair_calls"] == output.metrics["structural_failures"] == 2
+    assert not [event for event in tools.events if event[0] == "validate"]
+    jobdir = value.framework.workdir / "sccs/000000"
+    assert (jobdir / "last-failed-transformation.txt").read_text() == "no fence"
+
+
+@pytest.mark.parametrize("statements", [("()", "( )"), ('"a b";', '"ab";')])
+def test_code_differences_are_not_repeats(tmp_path, statements):
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        validators=[INVALID, VALID],
+        candidates=["accepted\n"],
+    )
+    client = FakeClient([response(statement=statement) for statement in statements])
+    _, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success", output.error
+    assert output.metrics["repair_calls"] == 1
+
+
+def test_repeat_detection_compares_the_complete_scc_output(tmp_path):
+    tools = FakeTools(
+        skeletons=[
+            fn_record(0, "first", "first", [1]),
+            fn_record(1, "second", "second", [0]),
+        ],
+        validators=[INVALID, VALID],
+        candidates=["accepted SCC\n"],
+    )
+    client = FakeClient(
+        [
+            "```rust\nunsafe fn first() { #[proctor(0)] () }\n"
+            f"unsafe fn second() {{ #[proctor(0)] {statement} }}\n```"
+            for statement in ("()", "1;")
+        ]
+    )
+    _, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success", output.error
+    assert output.metrics["scc_count"] == 1
+    assert output.metrics["repair_calls"] == 1
+
+
+def test_repeat_history_is_private_to_each_scc(tmp_path):
+    tools = FakeTools(
+        skeletons=[
+            fn_record(0, "first::target", "target", []),
+            fn_record(1, "second::target", "target", []),
+        ],
+        validators=[VALID, VALID],
+        candidates=["first SCC\n", "second SCC\n"],
+    )
+    _, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
+    assert output.status == "success", output.error
+    assert output.metrics["scc_count"] == output.metrics["llm_generation_calls"] == 2
+    assert output.metrics["repair_calls"] == 0
+
+
+def test_fallback_resets_history_and_subsequent_baseline_repeats_fail(tmp_path):
+    record = apply_rules(
+        fn_record(0, "target", "target", [], transformation_labels=[0, 1]),
+        rule_labels=[0],
+        transform_labels=[1],
+    )
+    tools = FakeTools(
+        skeletons=[record],
+        validators=[VALID, VALID],
+        builds=[CommandResult(0), CommandResult(101), CommandResult(101)],
+        candidates=["failed applied\n", "failed baseline\n"],
+    )
+    _, output = run_fake(tmp_path, tools, FakeClient([response()] * 3))
+    assert output.status == "failure"
+    assert "repeated transformation at generation 2 (first seen at generation 1)" in (
+        output.error
+    )
+    assert output.metrics["repair_calls"] == output.metrics["compilation_failures"] == 2
+    assert output.usage.calls == 3
+    validations = [event[1] for event in tools.events if event[0] == "validate"]
+    assert [value["expected_functions"][0]["view"] for value in validations] == [
+        record["applied"],
+        record["baseline"],
+    ]
 
 
 @pytest.mark.parametrize(
@@ -6564,9 +6757,13 @@ def test_final_output_excludes_only_root_target(tmp_path):
 def test_failure_creates_no_claimed_output(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
-        validators=[INVALID] * 11,
+        validators=[INVALID] * 6,
     )
-    value, output = run_fake(tmp_path, tools, FakeClient([response()] * 11))
+    value, output = run_fake(
+        tmp_path,
+        tools,
+        FakeClient([response(statement=f"{index};") for index in range(6)]),
+    )
     assert output.status == "failure"
     assert not value.outputs.rust_project.exists()
     assert output.outputs.rust_project is None
@@ -6608,8 +6805,14 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
         "rule_set": "optional",
     }
     assert manifest["produces"] == {"rust_project": True}
-    assert set(manifest["config"]) == {"workers", "crat_dir", "dump_llm_exchanges"}
+    assert set(manifest["config"]) == {
+        "workers",
+        "max_repairs",
+        "crat_dir",
+        "dump_llm_exchanges",
+    }
     assert manifest["config"]["workers"]["default"] == 4
+    assert manifest["config"]["max_repairs"]["default"] == 5
     assert manifest["config"]["crat_dir"]["default"] == "../crat"
     assert manifest["config"]["dump_llm_exchanges"]["default"] is False
     assert not (
@@ -6680,6 +6883,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
     ]
     assert output.config_used == {
         "workers": 1,
+        "max_repairs": 5,
         "crat_dir": str((STAGE_DIR / "../crat").resolve()),
         "dump_llm_exchanges": False,
     }
@@ -6713,7 +6917,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
 @pytest.mark.parametrize("artifacts", [True, False])
 def test_dump_llm_exchanges_preserves_each_generation(tmp_path, artifacts):
     first_response = "first response\n" + response()
-    second_response = "second response\n" + response()
+    second_response = "second response\n" + response(statement="1;")
     client = FakeClient([first_response, second_response])
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
@@ -7733,7 +7937,9 @@ def test_extraction_runs_only_after_successful_build(tmp_path):
         candidates=["rejected source\n", "accepted source\n"],
         sidecars=sidecars,
     )
-    value, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
+    value, output = run_fake(
+        tmp_path, tools, FakeClient([response(), response(statement="1;")])
+    )
     report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
     assert output.status == "success"
     assert "accepted();" in report and "rejected();" not in report
@@ -7799,7 +8005,7 @@ def test_accepted_transform_print_extracts_after_build_only(tmp_path, monkeypatc
     value, output = run_fake(
         tmp_path,
         tools,
-        FakeClient([response(), response(), response()]),
+        FakeClient([response(statement=f"{index};") for index in range(3)]),
     )
     assert output.status == "success"
     operations = [event[0] for event in tools.events]
@@ -7913,7 +8119,7 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
             }
         ],
     )
-    client = FakeClient([response(), response(), response()])
+    client = FakeClient([response(statement=f"{index};") for index in range(3)])
     value, output = run_fake(
         tmp_path,
         tools,
@@ -9102,15 +9308,15 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
         builds=[CommandResult(0)],
-        validators=[INVALID] * 11,
+        validators=[INVALID] * 6,
     )
     value, output = run_fake(
         exhausted_case,
         tools,
-        FakeClient([response()] * 11),
+        FakeClient([response(statement=f"{index};") for index in range(6)]),
     )
     assert output.status == "failure"
-    assert output.metrics["repair_calls"] == 10
+    assert output.metrics["repair_calls"] == 5
     assert not value.outputs.rust_project.exists()
     assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
     assert not (value.outputs.artifacts_dir / "statistics.json").exists()
@@ -9441,6 +9647,18 @@ def test_workers_configuration_rejects_nonpositive_or_noninteger_values(
     assert not tools.events
 
 
+@pytest.mark.parametrize("max_repairs", [-1, True, False, 2.5, "5", None])
+def test_max_repairs_configuration_rejects_negative_or_noninteger_values(
+    tmp_path, max_repairs
+):
+    tools = FakeTools()
+    value = stage_input(tmp_path, config={"max_repairs": max_repairs})
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "config.max_repairs must be a nonnegative integer" in output.error
+    assert not tools.events
+
+
 def test_private_cargo_directories_override_environment_and_project_config(
     tmp_path, monkeypatch
 ):
@@ -9475,13 +9693,14 @@ def test_exhausted_structural_repairs_retain_latest_failure_without_exchange_dum
     tmp_path,
 ):
     tools = FakeTools(skeletons=[fn_record(0, "target", "target", [])])
-    value, output = run_fake(tmp_path, tools, FakeClient(["no fence"] * 11))
+    responses = [f"no fence {index}" for index in range(6)]
+    value, output = run_fake(tmp_path, tools, FakeClient(responses))
     assert output.status == "failure"
     jobdir = value.framework.workdir / "sccs/000000"
-    assert (jobdir / "last-failed-transformation.txt").read_text() == "no fence"
+    assert (jobdir / "last-failed-transformation.txt").read_text() == responses[-1]
     assert (jobdir / "structural-diagnostics.txt").read_text() == NO_FENCE_DIAGNOSTIC
     assert not (value.outputs.artifacts_dir / "llm-exchanges").exists()
-    assert output.usage.calls == 11
+    assert output.usage.calls == 6
 
 
 def test_final_build_failure_retains_all_successful_scc_results(tmp_path):
@@ -9863,19 +10082,28 @@ def test_unfilled_whole_function_stub_exhausts_shared_repair_budget_without_obse
 ):
     item_id = 1 if mixed else 0
     tools = UnfilledStubTools(
-        [[item_id]] * 11,
+        [[item_id]] * 6,
         skeletons=stub_repair_records(mixed),
-        validators=[VALID] * 11,
-        candidates=["unfilled candidate\n"] * 11,
+        validators=[VALID] * 6,
+        candidates=["unfilled candidate\n"] * 6,
     )
     value, output = run_fake(
-        tmp_path, tools, FakeClient([stub_repair_response(mixed, item_id)] * 11)
+        tmp_path,
+        tools,
+        FakeClient(
+            [
+                stub_repair_response(mixed, item_id).replace(
+                    "todo!()", f"todo!() /* attempt {index} */"
+                )
+                for index in range(6)
+            ]
+        ),
     )
     assert output.status == "failure"
-    assert "exhausted 10 repair calls" in output.error
-    assert output.metrics["llm_generation_calls"] == output.usage.calls == 11
-    assert output.metrics["repair_calls"] == 10
-    assert output.metrics["structural_failures"] == 11
+    assert "exhausted 5 repair calls" in output.error
+    assert output.metrics["llm_generation_calls"] == output.usage.calls == 6
+    assert output.metrics["repair_calls"] == 5
+    assert output.metrics["structural_failures"] == 6
     assert output.metrics["cargo_builds"] == 1
     assert not any(
         event[0] in {"extract_observations", "assemble_project", "finalize_project"}
@@ -9884,6 +10112,30 @@ def test_unfilled_whole_function_stub_exhausts_shared_repair_budget_without_obse
     assert not list((value.framework.workdir / "sccs").glob("*/accepted.rs"))
     assert not value.outputs.rust_project.exists()
     assert not (value.outputs.artifacts_dir / "observations.json").exists()
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_repeated_unfilled_whole_function_stub_stops_before_replacement(
+    tmp_path, mixed
+):
+    item_id = 1 if mixed else 0
+    tools = UnfilledStubTools(
+        [[item_id]],
+        skeletons=stub_repair_records(mixed),
+        validators=[VALID],
+        candidates=["unfilled candidate\n"],
+    )
+    _, output = run_fake(
+        tmp_path, tools, FakeClient([stub_repair_response(mixed, item_id)] * 2)
+    )
+    assert output.status == "failure"
+    assert "repeated transformation at generation 1 (first seen at generation 0)" in (
+        output.error
+    )
+    assert output.metrics["repair_calls"] == output.metrics["structural_failures"] == 1
+    assert output.metrics["cargo_builds"] == 1
+    assert output.usage.calls == 2
+    assert len([event for event in tools.events if event[0] == "add_functions"]) == 1
 
 
 def test_mechanical_whole_function_stub_remains_fatal_without_llm_repair(tmp_path):
