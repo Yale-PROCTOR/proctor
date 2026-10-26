@@ -71,7 +71,6 @@ from proctor.usage.tracker import UsageTracker, read_usage
 
 STAGE_ID = "local_transformation"
 STAGE_VERSION = "0.1.0"
-MAX_REPAIRS = 10
 CONTEXT_LIMIT = 100_000
 CARGO_VERSION_COMPONENT_MAX = (1 << 64) - 1
 REQUIRED_CRATES_IO_DEPENDENCIES = (
@@ -235,7 +234,9 @@ def _foreign_static_guidance(
 def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise StageFailure("stage config must be an object")
-    unknown = sorted(set(config) - {"crat_dir", "dump_llm_exchanges", "workers"})
+    unknown = sorted(
+        set(config) - {"crat_dir", "dump_llm_exchanges", "workers", "max_repairs"}
+    )
     if unknown:
         raise StageFailure(f"unknown local-transformation config keys: {unknown}")
     crat_dir = config.get("crat_dir", "../crat")
@@ -247,8 +248,16 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
     workers = config.get("workers", 4)
     if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
         raise StageFailure("config.workers must be a positive integer")
+    max_repairs = config.get("max_repairs", 5)
+    if (
+        isinstance(max_repairs, bool)
+        or not isinstance(max_repairs, int)
+        or max_repairs < 0
+    ):
+        raise StageFailure("config.max_repairs must be a nonnegative integer")
     return {
         "workers": workers,
+        "max_repairs": max_repairs,
         "crat_dir": str((stage_dir / crat_dir).resolve()),
         "dump_llm_exchanges": dump_llm_exchanges,
     }
@@ -1506,6 +1515,7 @@ def _process_scc(
     client: Any,
     tracker: UsageTracker,
     exchange_root: Path | None,
+    max_repairs: int,
     state: RunState,
 ) -> None:
     duplicate_names: dict[str, list[ItemRecord]] = {}
@@ -1537,10 +1547,11 @@ def _process_scc(
     active_views = applied_views
     latest_failed: str | None = None
     latest_diagnostics: str | None = None
+    seen_results: dict[tuple[bool, str], int] = {}
     generation = 0
     mechanical = not any(view.needs_transformation for view in active_views.values())
 
-    while generation <= MAX_REPAIRS:
+    while generation <= max_repairs:
         targets = render_transformation_targets(members, records_by_id, active_views)
         if mechanical:
             transformation = "\n\n".join(
@@ -1601,6 +1612,23 @@ def _process_scc(
                     response.text, encoding="utf-8"
                 )
             extraction = extract_code_block(response.text)
+            result = (
+                extraction.candidate is not None,
+                extraction.candidate
+                if extraction.candidate is not None
+                else response.text,
+            )
+            previous_generation = seen_results.get(result)
+            if previous_generation is not None:
+                (workdir / "last-failed-transformation.txt").write_text(
+                    result[1], encoding="utf-8"
+                )
+                raise StageFailure(
+                    f"SCC {','.join(map(str, members))} repeated transformation "
+                    f"at generation {generation} (first seen at generation "
+                    f"{previous_generation})"
+                )
+            seen_results[result] = generation
             if extraction.candidate is None:
                 state.metrics.structural_failures += 1
                 latest_failed = extraction.failed_text
@@ -1777,6 +1805,7 @@ def _process_scc(
         )
         if rule_involved:
             active_views = baseline_views
+            seen_results.clear()
             latest_failed = transformation
             latest_diagnostics = diagnostics
             mechanical = False
@@ -1793,7 +1822,7 @@ def _process_scc(
         generation += 1
 
     raise StageFailure(
-        f"SCC {','.join(map(str, members))} exhausted {MAX_REPAIRS} repair calls"
+        f"SCC {','.join(map(str, members))} exhausted {max_repairs} repair calls"
     )
 
 
@@ -1900,6 +1929,7 @@ def _run_scc_workers(
                     client=client,
                     tracker=tracker,
                     exchange_root=exchange_root,
+                    max_repairs=state.config_used["max_repairs"],
                     state=job,
                 )
                 accepted[job_index] = (members, jobdir / "accepted.rs")
