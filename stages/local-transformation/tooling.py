@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import stat
@@ -83,6 +84,13 @@ def crat_env(crat_dir: Path) -> dict[str, str]:
     return env
 
 
+def _cargo_build_env(target_dir: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["CARGO_TARGET_DIR"] = str(target_dir.resolve())
+    environment["CARGO_BUILD_BUILD_DIR"] = environment["CARGO_TARGET_DIR"]
+    return environment
+
+
 class CratTools:
     def __init__(
         self,
@@ -97,7 +105,24 @@ class CratTools:
         self.crat: Path | None = None
         self.crat_tool: Path | None = None
         self.environment: dict[str, str] | None = None
+        self.target_dir: Path | None = None
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def fork(self, log_path: Path, target_dir: Path) -> CratTools:
+        worker = CratTools(
+            log_path,
+            run_command=self.run_command,
+            environment_factory=self.environment_factory,
+        )
+        worker.crat = self.crat
+        worker.crat_tool = self.crat_tool
+        worker.environment = dict(self.environment or {})
+        worker.environment["CARGO_TARGET_DIR"] = str(target_dir.resolve())
+        worker.environment["CARGO_BUILD_BUILD_DIR"] = str(target_dir.resolve())
+        worker.target_dir = target_dir.resolve()
+        worker._clear_replace_output(worker.log_path)
+        worker.log_path.touch(exist_ok=True)
+        return worker
 
     def _run(
         self,
@@ -148,31 +173,50 @@ class CratTools:
             ["git", "rev-parse", "HEAD"], cwd=crat_dir, env=None
         )
         head = head_result.stdout.strip() if head_result.returncode == 0 else "unknown"
+        fingerprint = hashlib.sha256(head.encode())
+        sources = set(crat_dir.glob("*.toml")) | set(crat_dir.glob("*.lock"))
+        for directory in ("src", "crates", "deps_crate", ".cargo"):
+            for root, directories, names in os.walk(crat_dir / directory):
+                directories[:] = [
+                    name for name in directories if name not in {"target", ".git"}
+                ]
+                sources.update(
+                    Path(root) / name
+                    for name in names
+                    if Path(name).suffix in {".rs", ".toml", ".lock"}
+                )
+        for path in sorted(sources):
+            fingerprint.update(str(path.relative_to(crat_dir)).encode() + b"\0")
+            fingerprint.update(path.read_bytes())
+        build_identity = fingerprint.hexdigest()
         if not (
             crat.is_file()
             and crat_tool.is_file()
             and marker.is_file()
-            and marker.read_text(encoding="utf-8").strip() == head
+            and marker.read_text(encoding="utf-8").strip() == build_identity
         ):
             self._run(
                 "deps_crate cargo build",
                 ["cargo", "build"],
                 cwd=crat_dir / "deps_crate",
+                env=_cargo_build_env(crat_dir / "deps_crate" / "target"),
             )
             self._run(
                 "release cargo build --bin crat",
                 ["cargo", "build", "--release", "--bin", "crat"],
                 cwd=crat_dir,
+                env=_cargo_build_env(crat_dir / "target"),
             )
             self._run(
                 "release cargo build --bin crat-tool",
                 ["cargo", "build", "--release", "--bin", "crat-tool"],
                 cwd=crat_dir,
+                env=_cargo_build_env(crat_dir / "target"),
             )
             if not crat.is_file() or not crat_tool.is_file():
                 raise StageFailure("Crat build did not produce both release binaries")
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(head + "\n", encoding="utf-8")
+            marker.write_text(build_identity + "\n", encoding="utf-8")
         self.crat = crat
         self.crat_tool = crat_tool
         self.environment = self.environment_factory(crat_dir)
@@ -222,14 +266,70 @@ class CratTools:
         self._require_regular_output(operation, output)
 
     def make_skeleton(
-        self, current_project: Path, output: Path, rule_set: Path | None = None
+        self,
+        current_project: Path,
+        output: Path,
+        rule_set: Path | None = None,
+        *,
+        frozen_output: Path | None = None,
     ) -> None:
         assert self.crat_tool is not None
+        paths = (output, *((frozen_output,) if frozen_output is not None else ()))
+        if len({path.resolve() for path in paths}) != len(paths):
+            raise StageFailure("crat-tool make-skeleton output paths must be distinct")
+        self._validate_project_outputs(
+            paths, (current_project,), (rule_set,) if rule_set is not None else ()
+        )
+        if frozen_output is not None:
+            self._clear_replace_output(frozen_output)
         self._output_operation(
             "crat-tool make-skeleton",
-            make_skeleton_command(self.crat_tool, current_project, output, rule_set),
+            make_skeleton_command(
+                self.crat_tool, current_project, output, rule_set, frozen_output
+            ),
             output,
             redactions=((str(rule_set), "<rule-set>"),) if rule_set is not None else (),
+        )
+
+        if frozen_output is not None:
+            self._require_regular_output("crat-tool make-skeleton", frozen_output)
+
+    def assemble_project(
+        self,
+        frozen: Path,
+        accepted: tuple[tuple[tuple[int, ...], Path], ...],
+        output: Path,
+    ) -> None:
+        assert self.crat_tool is not None
+        request = output.with_suffix(".json")
+        self._validate_project_outputs(
+            (output, request), (), (frozen, *(path for _, path in accepted))
+        )
+        request.write_text(
+            json.dumps(
+                [
+                    {
+                        "members": list(members),
+                        "source": path.read_text(encoding="utf-8"),
+                    }
+                    for members, path in accepted
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self._output_operation(
+            "crat-tool assemble-project",
+            [
+                str(self.crat_tool),
+                "assemble-project",
+                "--frozen",
+                str(frozen),
+                "--request",
+                str(request),
+                "--output",
+                str(output),
+            ],
+            output,
         )
 
     def merge_observations(self, inputs: tuple[Path, ...], output: Path) -> None:
@@ -296,14 +396,18 @@ class CratTools:
                     f"crat-tool output {output} overlaps an input project or file"
                 )
 
-    def make_initial(self, analysis_project: Path, output: Path) -> None:
+    def make_initial(
+        self, analysis_project: Path, output: Path, *, frozen: Path | None = None
+    ) -> None:
         assert self.crat_tool is not None
-        self._validate_project_outputs((output,), (analysis_project,))
+        self._validate_project_outputs(
+            (output,), (analysis_project,), (frozen,) if frozen is not None else ()
+        )
         self._clear_replace_output(output)
         try:
             self._run(
                 "crat-tool make-initial",
-                make_initial_command(self.crat_tool, analysis_project, output),
+                make_initial_command(self.crat_tool, analysis_project, output, frozen),
                 env=self.environment,
             )
             self._require_regular_output("crat-tool make-initial", output)
@@ -321,6 +425,8 @@ class CratTools:
         statement_pairs_output: Path,
         observation_source_output: Path,
         observation_metadata_output: Path,
+        *,
+        frozen: Path,
     ) -> None:
         assert self.crat_tool is not None
         paths = (
@@ -332,7 +438,9 @@ class CratTools:
         if len(set(paths)) != len(paths):
             raise StageFailure("crat-tool add-functions output paths must be distinct")
         self._validate_project_outputs(
-            paths, (analysis_project, current_project), (request,)
+            paths,
+            (analysis_project, current_project),
+            (request, frozen),
         )
         for path in paths:
             self._clear_replace_output(path)
@@ -348,6 +456,7 @@ class CratTools:
                     statement_pairs_output,
                     observation_source_output,
                     observation_metadata_output,
+                    frozen,
                 ),
                 env=self.environment,
             )
@@ -366,6 +475,8 @@ class CratTools:
         manifest: Path,
         output: Path,
         manifest_output: Path,
+        *,
+        frozen: Path | None = None,
     ) -> None:
         assert self.crat_tool is not None
         paths = (output, manifest_output)
@@ -374,7 +485,9 @@ class CratTools:
                 "crat-tool finalize-project output paths must be distinct"
             )
         self._validate_project_outputs(
-            paths, (analysis_project, current_project), (manifest,)
+            paths,
+            (analysis_project, current_project),
+            (manifest, *((frozen,) if frozen is not None else ())),
         )
         for path in paths:
             self._clear_replace_output(path)
@@ -388,6 +501,7 @@ class CratTools:
                     manifest,
                     output,
                     manifest_output,
+                    frozen,
                 ),
                 env=self.environment,
             )
@@ -429,8 +543,9 @@ class CratTools:
     def cargo_build(
         self, current_project: Path, *, library_only: bool = False
     ) -> CommandResult:
-        command = ["cargo", "build", *(["--lib"] if library_only else [])]
-        result = self.run_command(command, cwd=current_project, env=None)
+        command = ["cargo", "build", *(["--lib", "-j", "1"] if library_only else [])]
+        environment = _cargo_build_env(self.target_dir or current_project / "target")
+        result = self.run_command(command, cwd=current_project, env=environment)
         with self.log_path.open("a", encoding="utf-8") as log:
             log.write(f"$ {' '.join(command)}\n")
             log.write(result.stdout)

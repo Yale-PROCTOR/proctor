@@ -140,3 +140,35 @@ def test_report_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_render_table_empty() -> None:
     assert "no usage records" in render_table([])
+
+
+def test_concurrent_trackers_append_complete_records_with_private_counts(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from proctor.llm.types import RequestMetadata, Usage
+    from proctor.usage.tracker import UsageTracker, read_usage
+
+    path = tmp_path / "usage.jsonl"
+    trackers = [UsageTracker(path) for _ in range(8)]
+
+    def record(worker):
+        for attempt in range(25):
+            trackers[worker].record(
+                metadata=RequestMetadata(item=str(worker)),
+                provider="fixture",
+                model="model",
+                usage=Usage(input_tokens=1, output_tokens=2),
+                latency_s=0,
+                finish_reason="stop",
+                attempt=attempt + 1,
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(record, range(8)))
+    records = read_usage(path)
+    assert len(records) == 200
+    assert all(tracker.record_count == 25 for tracker in trackers)
+    assert sum(item["input_tokens"] for item in records) == 200
+    assert sorted((int(item["item"]), item["attempt"]) for item in records) == [
+        (worker, attempt) for worker in range(8) for attempt in range(1, 26)
+    ]
