@@ -34,7 +34,6 @@ from model import (
     StatementPairMetadata,
     dependency_context,
     function_graph,
-    leaf_schedule,
     load_replacement_metadata,
     load_skeletons,
     render_dependency_entry,
@@ -153,8 +152,9 @@ def _load_and_validate_replacement_metadata(
     observation_source,
     members,
     records_by_id,
-    accepted,
 ):
+    frozen = path.parent / "frozen-project.json"
+    frozen.write_text("frozen")
     return _load_and_validate_replacement_metadata_impl(
         path,
         candidate,
@@ -163,7 +163,7 @@ def _load_and_validate_replacement_metadata(
         members,
         records_by_id,
         {item_id: record.baseline for item_id, record in records_by_id.items()},
-        accepted,
+        frozen,
     )
 
 
@@ -1473,24 +1473,19 @@ def test_tarjan_partition_matches_nested_cycles_and_chains():
     )
 
 
-def test_leaf_schedule_is_exact_for_graph_fixture():
-    assert leaf_schedule(function_graph(loaded(GRAPH_RECORDS))) == (
+def test_independent_scc_order_uses_original_ids_without_dependency_order():
+    assert strongly_connected_components({0: {1}, 1: set(), 2: {0}}) == (
         (0,),
         (1,),
         (2,),
-        (3, 4),
-        (5,),
-        (6,),
-        (7,),
-        (8, 9),
     )
 
 
 def test_schedule_is_independent_of_record_and_dependency_order():
     records = tuple(reversed(loaded(GRAPH_RECORDS)))
-    assert leaf_schedule(function_graph(records)) == leaf_schedule(
-        function_graph(loaded(GRAPH_RECORDS))
-    )
+    assert strongly_connected_components(
+        function_graph(records)
+    ) == strongly_connected_components(function_graph(loaded(GRAPH_RECORDS)))
 
 
 def test_duplicate_names_abort_only_inside_one_scc():
@@ -1500,7 +1495,7 @@ def test_duplicate_names_abort_only_inside_one_scc():
             fn_record(9, "same_b::same", "same", [8]),
         ]
     )
-    scc = leaf_schedule(function_graph(records))[0]
+    scc = strongly_connected_components(function_graph(records))[0]
     assert len({next(r.name for r in records if r.id == item) for item in scc}) == 1
 
 
@@ -1508,7 +1503,7 @@ def test_duplicate_names_in_distinct_sccs_are_allowed():
     records = loaded(
         [fn_record(1, "a::same", "same", []), fn_record(2, "b::same", "same", [1])]
     )
-    assert leaf_schedule(function_graph(records)) == ((1,), (2,))
+    assert strongly_connected_components(function_graph(records)) == ((1,), (2,))
 
 
 def test_nonrecursive_singleton_omits_own_signature():
@@ -2856,7 +2851,7 @@ def test_empty_dependency_section_is_omitted_and_repair_text_is_unchanged():
 
     failed = "unsafe fn scalar() { broken }"
     diagnostics = (
-        '{"schema_version":1,"status":"invalid","failures":[{"id":0,'
+        '{"status":"invalid","failures":[{"id":0,'
         '"name":"scalar","failed_snippet":"unsafe fn scalar() { broken }",'
         '"errors":[{"code":"missing_label","message":"Function `scalar` '
         '(item 0): label 0 is missing."}]}]}'
@@ -2942,7 +2937,6 @@ def test_replacement_request_is_exact_and_member_ordered():
         "view",
     ]
     assert set(request) == {
-        "schema_version",
         "items",
         "transformation",
         "accepted_correspondence",
@@ -3089,9 +3083,12 @@ def test_additive_command_builders_keep_analysis_and_current_roles_distinct():
         Path("/work/pairs.json"),
         Path("/work/observation.rs"),
         Path("/work/metadata.json"),
+        frozen=Path("/frozen"),
     ) == [
         "/tools/crat-tool",
         "add-functions",
+        "--frozen",
+        "/frozen",
         "--request",
         "/work/request.json",
         "--current-project",
@@ -3141,14 +3138,13 @@ def test_cargo_build_selects_library_for_incremental_checks(tmp_path):
     tools.cargo_build(project, library_only=True)
     tools.cargo_build(project)
     assert commands == [
-        (["cargo", "build", "--lib"], project),
+        (["cargo", "build", "--lib", "-j", "1"], project),
         (["cargo", "build"], project),
     ]
 
 
-VALID = {"schema_version": 1, "status": "valid"}
+VALID = {"status": "valid"}
 INVALID = {
-    "schema_version": 1,
     "status": "invalid",
     "failures": [
         {
@@ -3173,7 +3169,7 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
     metadata_path = tmp_path / "metadata.json"
     candidate.write_text("pub unsafe fn read(mut pointer: &i32) -> i32 { *pointer }\n")
     statement_pairs.write_text(
-        '{"schema_version":1,"statements":[{"item_id":7,"path":"read",'
+        '{"statements":[{"item_id":7,"path":"read",'
         '"label":0,"after_statement":"*pointer"}]}\n'
     )
     observation_source.write_text(
@@ -3192,12 +3188,16 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
         "wrapper_path": None,
     }
     valid = {
-        "schema_version": 2,
+        "frozen_project_sha256": hashlib.sha256(b"frozen").hexdigest(),
+        "dependency_correspondence": [],
+        "unfilled_stub_items": [],
         "candidate_sha256": "6c3ea56d9debffcf25243e9a41d58805af269772d266088c83d19053f7ccebf1",
-        "statement_pairs_sha256": "2b8e6af47f728734179fa6d023e74d812a888e65d4f111e8ff4a6c01f75c823b",
+        "statement_pairs_sha256": hashlib.sha256(
+            statement_pairs.read_bytes()
+        ).hexdigest(),
         "observation_source_sha256": "5d00cc190ae11801bb4ae2af09f7eacb12c2fee35f8645b1aef611a12cf09fd0",
         "accepted_correspondence": [],
-        "source_stubs": [],
+        "source_stubs": [{"item_id": 7, "path": "__proctor_source_stub_read"}],
         "new_correspondence": [correspondence],
         "current_items": [
             {
@@ -3238,7 +3238,6 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
         observation_source,
         (7,),
         {7: record},
-        (),
     )
     assert parsed.current_items[0].source_copy_path == "__proctor_source_read"
 
@@ -3254,13 +3253,28 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             observation_source,
             (7,),
             {7: record},
-            (),
         )
 
-    floating_version = copy.deepcopy(valid)
-    floating_version["schema_version"] = 2.0
-    with pytest.raises(ObservationError, match="schema_version 2.0"):
-        load_replacement_metadata(json.dumps(floating_version))
+    for field in valid:
+        missing = copy.deepcopy(valid)
+        del missing[field]
+        with pytest.raises(ObservationError, match="must contain exactly"):
+            load_replacement_metadata(json.dumps(missing))
+    for field in (
+        "source_stubs",
+        "dependency_correspondence",
+        "unfilled_stub_items",
+        "frozen_project_sha256",
+    ):
+        wrong_type = copy.deepcopy(valid)
+        wrong_type[field] = None
+        with pytest.raises(ObservationError):
+            load_replacement_metadata(json.dumps(wrong_type))
+
+    unknown = copy.deepcopy(valid)
+    unknown["unexpected"] = 2.0
+    with pytest.raises(ObservationError, match="must contain exactly"):
+        load_replacement_metadata(json.dumps(unknown))
 
     for field, message in (
         ("candidate_sha256", "does not match candidate bytes"),
@@ -3278,13 +3292,12 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
                 observation_source,
                 (7,),
                 {7: record},
-                (),
             )
 
     mutated = copy.deepcopy(valid)
     mutated["accepted_correspondence"] = [correspondence]
     metadata_path.write_text(json.dumps(mutated))
-    with pytest.raises(StageFailure, match="does not equal the request"):
+    with pytest.raises(StageFailure, match="cannot contain accepted dependencies"):
         _load_and_validate_replacement_metadata(
             metadata_path,
             candidate,
@@ -3292,7 +3305,6 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             observation_source,
             (7,),
             {7: record},
-            (),
         )
 
     for field in ("item_id", "logical_path", "implementation_path", "wrapper_path"):
@@ -3311,7 +3323,6 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
                 observation_source,
                 (7,),
                 {7: record},
-                (),
             )
 
     mutated = copy.deepcopy(valid)
@@ -3328,7 +3339,6 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             observation_source,
             (7,),
             {7: record},
-            (),
         )
 
     with_wrapper = copy.deepcopy(valid)
@@ -3343,7 +3353,6 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             observation_source,
             (7,),
             {7: record},
-            (),
         )
 
     second_record = loaded(
@@ -3367,6 +3376,7 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             "wrapper_path": None,
         }
     )
+    two["source_stubs"].append({"item_id": 8, "path": "__proctor_source_stub_other"})
     two["current_items"].append(
         {
             **two["new_correspondence"][1],
@@ -3383,7 +3393,6 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
         observation_source,
         (7, 8),
         records,
-        (),
     )
 
     reordered = copy.deepcopy(two)
@@ -3398,36 +3407,24 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             observation_source,
             (7, 8),
             records,
-            (),
         )
 
     for field, expected in (
-        ("item_id", "duplicate item_id 7"),
-        ("logical_path", "duplicate logical_path read"),
-        ("implementation_path", "duplicate implementation_path read"),
+        ("logical_path", "paths do not match requested path other"),
+        ("implementation_path", "paths do not match requested path other"),
     ):
-        duplicated = copy.deepcopy(valid)
-        accepted_record = {
-            "item_id": 6,
-            "logical_path": "accepted",
-            "implementation_path": "accepted",
-            "wrapper_path": None,
-        }
-        accepted_record[field] = duplicated["new_correspondence"][0][field]
-        duplicated["accepted_correspondence"] = [accepted_record]
+        duplicated = copy.deepcopy(two)
+        duplicated["new_correspondence"][1][field] = "read"
+        duplicated["current_items"][1][field] = "read"
         metadata_path.write_text(json.dumps(duplicated))
-        accepted_value = load_replacement_metadata(
-            json.dumps(duplicated)
-        ).accepted_correspondence
         with pytest.raises(StageFailure, match=expected):
             _load_and_validate_replacement_metadata(
                 metadata_path,
                 candidate,
                 statement_pairs,
                 observation_source,
-                (7,),
-                {7: record},
-                accepted_value,
+                (7, 8),
+                records,
             )
 
     duplicated = copy.deepcopy(two)
@@ -3443,7 +3440,6 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             observation_source,
             (7, 8),
             records,
-            (),
         )
 
     collision = copy.deepcopy(two)
@@ -3460,18 +3456,17 @@ def test_metadata_digests_and_cross_file_contract_are_strict(tmp_path):
             observation_source,
             (7, 8),
             records,
-            (),
         )
 
 
-def test_source_stub_metadata_requires_accepted_unique_paths(tmp_path):
+def test_source_stub_metadata_requires_complete_unique_interface_paths(tmp_path):
     candidate = tmp_path / "candidate.rs"
     pairs = tmp_path / "pairs.json"
     observation = tmp_path / "observation.rs"
     metadata_path = tmp_path / "metadata.json"
     for path in (candidate, pairs, observation):
         path.write_text(path.name)
-    accepted_records = [
+    dependency_records = [
         {
             "item_id": item_id,
             "logical_path": f"inner::{name}",
@@ -3481,13 +3476,15 @@ def test_source_stub_metadata_requires_accepted_unique_paths(tmp_path):
         for item_id, name in ((1, "leaf"), (2, "leaf_1"))
     ]
     valid = {
-        "schema_version": 2,
+        "frozen_project_sha256": hashlib.sha256(b"frozen").hexdigest(),
+        "dependency_correspondence": dependency_records,
+        "unfilled_stub_items": [],
         "candidate_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
         "statement_pairs_sha256": hashlib.sha256(pairs.read_bytes()).hexdigest(),
         "observation_source_sha256": hashlib.sha256(
             observation.read_bytes()
         ).hexdigest(),
-        "accepted_correspondence": accepted_records,
+        "accepted_correspondence": [],
         "new_correspondence": [],
         "current_items": [],
         "source_stubs": [
@@ -3495,12 +3492,29 @@ def test_source_stub_metadata_requires_accepted_unique_paths(tmp_path):
             {"item_id": 2, "path": "inner::__proctor_source_stub_leaf_1"},
         ],
     }
-    accepted = load_replacement_metadata(json.dumps(valid)).accepted_correspondence
+    records = {
+        item["item_id"]: loaded(
+            [
+                fn_record(
+                    item["item_id"],
+                    item["logical_path"],
+                    item["logical_path"].split("::")[-1],
+                    [],
+                )
+            ]
+        )[0]
+        for item in dependency_records
+    }
 
     def check(value):
         metadata_path.write_text(json.dumps(value))
         return _load_and_validate_replacement_metadata(
-            metadata_path, candidate, pairs, observation, (), {}, accepted
+            metadata_path,
+            candidate,
+            pairs,
+            observation,
+            (),
+            records,
         )
 
     assert [stub.item_id for stub in check(valid).source_stubs] == [1, 2]
@@ -3510,7 +3524,7 @@ def test_source_stub_metadata_requires_accepted_unique_paths(tmp_path):
         check(missing)
     unknown = copy.deepcopy(valid)
     unknown["source_stubs"][1]["item_id"] = 7
-    with pytest.raises(StageFailure, match="not an accepted item"):
+    with pytest.raises(StageFailure, match="do not cover the original interface"):
         check(unknown)
     reversed_stubs = copy.deepcopy(valid)
     reversed_stubs["source_stubs"].reverse()
@@ -3582,7 +3596,18 @@ class FakeTools:
         self.build_modes = []
         self.additions = []
 
-    def make_initial(self, analysis, output):
+    def fork(self, log_path, target_dir):
+        worker = copy.copy(self)
+        worker.target_dir = target_dir
+        worker.log_path = log_path
+        log_path.touch()
+        return worker
+
+    def assemble_project(self, frozen, accepted, output):
+        self.events.append(("assemble_project", frozen, accepted, output))
+        output.write_text(accepted[-1][1].read_text() if accepted else self.normalized)
+
+    def make_initial(self, analysis, output, **kwargs):
         self.events.append(("make_initial", analysis, output))
         output.write_bytes((analysis / "lib.rs").read_bytes())
 
@@ -3595,6 +3620,7 @@ class FakeTools:
         statement_pairs_output,
         observation_source_output,
         observation_metadata_output,
+        **kwargs,
     ):
         self.additions.append(
             (analysis, current, json.loads(request.read_text(encoding="utf-8")))
@@ -3624,7 +3650,7 @@ class FakeTools:
                 for item in request_value["items"]
                 for label in _report_labels(item["view"]["statement_dispositions"])
             ]
-            sidecar = {"schema_version": 1, "statements": statements}
+            sidecar = {"statements": statements}
         else:
             sidecar = self.sidecars.pop(0)
         statement_pairs_output.write_text(
@@ -3659,8 +3685,36 @@ class FakeTools:
         observation_metadata_output.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
-                    "source_stubs": [],
+                    "unfilled_stub_items": [],
+                    "frozen_project_sha256": hashlib.sha256(
+                        kwargs["frozen"].read_bytes()
+                    ).hexdigest(),
+                    "dependency_correspondence": [
+                        {
+                            "item_id": item["id"],
+                            "logical_path": item["path"],
+                            "implementation_path": item["path"],
+                            "wrapper_path": None,
+                        }
+                        for item in self.skeletons
+                        if item["kind"] == "Fn"
+                        and item["id"]
+                        not in {entry["id"] for entry in request_value["items"]}
+                    ],
+                    "source_stubs": [
+                        {
+                            "item_id": item["id"],
+                            "path": "::".join(
+                                (
+                                    *item["path"].split("::")[:-1],
+                                    "__proctor_source_stub_"
+                                    + item["name"].removeprefix("r#"),
+                                )
+                            ),
+                        }
+                        for item in self.skeletons
+                        if item["kind"] == "Fn"
+                    ],
                     "candidate_sha256": hashlib.sha256(
                         candidate.read_bytes()
                     ).hexdigest(),
@@ -3678,7 +3732,9 @@ class FakeTools:
             encoding="utf-8",
         )
 
-    def finalize_project(self, analysis, current, manifest, output, manifest_output):
+    def finalize_project(
+        self, analysis, current, manifest, output, manifest_output, **kwargs
+    ):
         self.events.append(("finalize_project", analysis, current, manifest))
         output.write_bytes((current / "lib.rs").read_bytes())
         manifest_output.write_bytes(manifest.read_bytes())
@@ -3690,9 +3746,13 @@ class FakeTools:
     def prepare(self, current, passes, use_print):
         self.events.append(("prepare", current, passes, use_print))
 
-    def make_skeleton(self, current, output, rule_set=None):
+    def make_skeleton(self, current, output, rule_set=None, **kwargs):
         self.events.append(("make_skeleton", current, output, rule_set))
         output.write_text(json.dumps(self.skeletons), encoding="utf-8")
+        if kwargs.get("frozen_output") is not None:
+            kwargs["frozen_output"].write_text(
+                json.dumps({"target_source": self.normalized})
+            )
 
     def merge_observations(self, inputs, output):
         self.events.append(("merge_observations", inputs, output))
@@ -3801,7 +3861,7 @@ def stage_input(tmp_path, *, artifacts=True, config=None, llm=None, rule_set=Non
         outputs=OutputDestinations(
             rust_project=tmp_path / "output", artifacts_dir=artifact_dir
         ),
-        config=config or {},
+        config={"workers": 1, **(config or {})},
         framework=FrameworkSettings(
             llm=llm
             or {
@@ -3831,7 +3891,7 @@ def run_fake(tmp_path, tools, client, **kwargs):
     return value, output
 
 
-def test_additive_builds_keep_complete_analysis_and_grow_target_by_scc(tmp_path):
+def test_independent_builds_keep_complete_analysis_and_reset_target_by_scc(tmp_path):
     complete = (
         "mod inner { pub unsafe fn leaf(p: *mut i32) -> i32 { *p } "
         "pub unsafe fn caller(p: *mut i32) -> i32 { leaf(p) } }\n"
@@ -3853,14 +3913,14 @@ def test_additive_builds_keep_complete_analysis_and_grow_target_by_scc(tmp_path)
     )
 
     class AdditiveTools(FakeTools):
-        def make_initial(self, analysis, output):
+        def make_initial(self, analysis, output, **kwargs):
             assert (analysis / "lib.rs").read_text() == complete
-            super().make_initial(analysis, output)
+            super().make_initial(analysis, output, **kwargs)
             output.write_text(initial)
 
-        def add_functions(self, analysis, current, *args):
+        def add_functions(self, analysis, current, *args, **kwargs):
             assert (analysis / "lib.rs").read_text() == complete
-            super().add_functions(analysis, current, *args)
+            super().add_functions(analysis, current, *args, **kwargs)
 
     tools = AdditiveTools(
         skeletons=[
@@ -3888,11 +3948,17 @@ def test_additive_builds_keep_complete_analysis_and_grow_target_by_scc(tmp_path)
     assert tools.build_modes == [True, True, True, False]
     assert [event[3] for event in tools.events if event[0] == "add_functions"] == [
         initial,
-        leaf,
+        initial,
     ]
     assert [(entry[0], entry[1]) for entry in tools.additions] == [
-        (value.framework.workdir / "analysis", value.framework.workdir / "current"),
-        (value.framework.workdir / "analysis", value.framework.workdir / "current"),
+        (
+            value.framework.workdir / "analysis",
+            value.framework.workdir / "workers/00/project",
+        ),
+        (
+            value.framework.workdir / "analysis",
+            value.framework.workdir / "workers/00/project",
+        ),
     ]
     assert [
         [item["id"] for item in entry[2]["items"]] for entry in tools.additions
@@ -3950,7 +4016,7 @@ def test_invalid_project_manifest_fails_before_tool_work(tmp_path, manifest, err
 def test_final_build_failure_restores_source_and_manifest_together(tmp_path):
     class FinalizingTools(FakeTools):
         def finalize_project(
-            self, analysis, current, manifest, output, manifest_output
+            self, analysis, current, manifest, output, manifest_output, **kwargs
         ):
             assert (current / "lib.rs").read_text() == "accepted partial\n"
             assert manifest.read_text() == original_manifest
@@ -4100,6 +4166,8 @@ def test_nonzero_build_preparation_or_crat_tool_exit_is_fatal(
                 "crat-tool add-functions": "unsafe fn target() {}\n",
             }[operation]
             output.write_text(contents)
+            if operation == "crat-tool make-skeleton":
+                Path(command[command.index("--frozen-output") + 1]).write_text("{}")
         return CommandResult(0)
 
     tools = CratTools(
@@ -4242,6 +4310,12 @@ def test_preparation_and_initialization_event_order_is_exact(
             value.framework.workdir / "initial.rs",
         ),
         ("cargo_build", value.framework.workdir / "current", "pub struct S;\n"),
+        (
+            "assemble_project",
+            value.framework.workdir / "frozen-project.json",
+            (),
+            value.framework.workdir / "assembled.rs",
+        ),
         (
             "finalize_project",
             value.framework.workdir / "analysis",
@@ -4938,7 +5012,6 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
-        "schema_version": 1,
         "function_scc_count": 1,
         "llm_transformation_calls": 0,
         "llm_repair_calls": 0,
@@ -4980,7 +5053,6 @@ def test_failed_applied_build_falls_back_once_to_baseline_with_shared_budget(tmp
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
-        "schema_version": 1,
         "function_scc_count": 1,
         "llm_transformation_calls": 0,
         "llm_repair_calls": 1,
@@ -5033,7 +5105,6 @@ def test_statistics_count_recursive_final_views_across_all_functions(tmp_path):
     assert output.status == "success"
     path = value.outputs.artifacts_dir / "statistics.json"
     expected = {
-        "schema_version": 1,
         "function_scc_count": 2,
         "llm_transformation_calls": 1,
         "llm_repair_calls": 0,
@@ -5364,6 +5435,7 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
         "add_functions",
         "cargo_build",
         "extract_observations",
+        "assemble_project",
         "finalize_project",
         "cargo_build",
         "merge_observations",
@@ -5599,7 +5671,6 @@ def test_mixed_mechanical_printf_and_transform_scc_keep_canonical_statement(
         candidates=["accepted mixed SCC\n"],
         sidecars=[
             {
-                "schema_version": 1,
                 "statements": [
                     {
                         "item_id": 0,
@@ -5763,6 +5834,7 @@ def test_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
             candidate,
             statement_pairs_output,
             *outputs,
+            **kwargs,
         ):
             raise StageFailure("mechanical replacement rejected")
 
@@ -5773,7 +5845,10 @@ def test_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
     client = FakeClient([])
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "failure"
-    assert output.error == "StageFailure: mechanical replacement rejected"
+    assert (
+        output.error
+        == "StageFailure: SCC job 0: StageFailure: mechanical replacement rejected"
+    )
     assert client.requests == []
     assert output.metrics["repair_calls"] == 0
     assert output.metrics["cargo_builds"] == 1
@@ -6061,10 +6136,10 @@ def test_prepared_ctype_and_four_format_record_compose_through_stage_acceptance(
                 encoding="utf-8",
             )
 
-        def make_skeleton(self, current, output, rule_set=None):
+        def make_skeleton(self, current, output, rule_set=None, **kwargs):
             source = (current / "lib.rs").read_text(encoding="utf-8")
             assert "::proctor_libc::isalpha(d)" in source
-            super().make_skeleton(current, output, rule_set)
+            super().make_skeleton(current, output, rule_set, **kwargs)
 
     observations = [
         {"format_specifier": specifier, "accepted": True}
@@ -6084,7 +6159,6 @@ def test_prepared_ctype_and_four_format_record_compose_through_stage_acceptance(
         candidates=[f"unsafe fn render() {{ {accepted_statement} }}\n"],
         sidecars=[
             {
-                "schema_version": 1,
                 "statements": [
                     {
                         "item_id": 0,
@@ -6184,9 +6258,9 @@ def test_failed_candidate_build_restores_then_repairs(tmp_path):
     )
 
     class PendingTools(FakeTools):
-        def make_initial(self, analysis, output):
+        def make_initial(self, analysis, output, **kwargs):
             assert (analysis / "lib.rs").read_text() == complete
-            super().make_initial(analysis, output)
+            super().make_initial(analysis, output, **kwargs)
             output.write_text(initial)
 
     tools = PendingTools(
@@ -6207,8 +6281,8 @@ def test_failed_candidate_build_restores_then_repairs(tmp_path):
     value, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
     assert output.status == "success"
     replace_events = [event for event in tools.events if event[0] == "add_functions"]
-    assert replace_events[1][3] == leaf
-    assert replace_events[2][3] == leaf
+    assert replace_events[1][3] == initial
+    assert replace_events[2][3] == initial
     assert [event[2] for event in tools.events if event[0] == "cargo_build"] == [
         initial,
         leaf,
@@ -6239,18 +6313,17 @@ def test_ten_failed_repairs_allow_exactly_eleven_generations(tmp_path):
     [
         (
             {
-                "schema_version": 1,
                 "status": "setup_error",
                 "error": {"code": "duplicate_expected_name", "message": "duplicate"},
             },
             "validator setup_error",
         ),
         ("process_failure", "validator crashed"),
-        ({"schema_version": 1, "status": "mystery"}, "unknown validator"),
-        ({"schema_version": 2, "status": "valid"}, "unsupported validator"),
+        ({"status": "mystery"}, "unknown validator"),
+        ({"status": "valid", "extra": 2}, "must contain exactly"),
         ("malformed_json", "malformed JSON"),
         (
-            {"schema_version": 1, "status": "invalid"},
+            {"status": "invalid"},
             "invalid response must contain exactly",
         ),
     ],
@@ -6297,6 +6370,7 @@ def test_replacement_failure_is_not_sent_to_llm(tmp_path):
             candidate,
             statement_pairs_output,
             *outputs,
+            **kwargs,
         ):
             raise StageFailure("TargetResolution: missing target")
 
@@ -6362,7 +6436,7 @@ def test_context_overflow_is_forced_to_error_and_aborts(tmp_path):
     assert usage[0]["error"] == "ContextLimitExceeded: too long"
 
 
-def test_later_scc_uses_promoted_source_but_immutable_skeleton_prompt(tmp_path):
+def test_later_scc_resets_source_and_uses_immutable_skeleton_prompt(tmp_path):
     tools = FakeTools(
         skeletons=[
             fn_record(0, "callee", "callee", []),
@@ -6378,7 +6452,7 @@ def test_later_scc_uses_promoted_source_but_immutable_skeleton_prompt(tmp_path):
     assert output.status == "success"
     assert [event[3] for event in tools.events if event[0] == "add_functions"] == [
         "normalized\n",
-        "after-callee\n",
+        "normalized\n",
     ]
 
 
@@ -6534,7 +6608,8 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
         "rule_set": "optional",
     }
     assert manifest["produces"] == {"rust_project": True}
-    assert set(manifest["config"]) == {"crat_dir", "dump_llm_exchanges"}
+    assert set(manifest["config"]) == {"workers", "crat_dir", "dump_llm_exchanges"}
+    assert manifest["config"]["workers"]["default"] == 4
     assert manifest["config"]["crat_dir"]["default"] == "../crat"
     assert manifest["config"]["dump_llm_exchanges"]["default"] is False
     assert not (
@@ -6604,6 +6679,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
         ("local_transformation", 1)
     ]
     assert output.config_used == {
+        "workers": 1,
         "crat_dir": str((STAGE_DIR / "../crat").resolve()),
         "dump_llm_exchanges": False,
     }
@@ -6618,7 +6694,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
     }
     assert output.error is None
     if artifacts:
-        assert output.logs == ("local-transformation.log",)
+        assert output.logs == ("local-transformation.log", "worker-00.log")
         assert value.outputs.artifacts_dir.joinpath(output.logs[0]).is_file()
         assert all(not Path(log).is_absolute() for log in output.logs)
         assert not value.outputs.artifacts_dir.joinpath("llm-exchanges").exists()
@@ -6682,7 +6758,6 @@ def test_failure_after_llm_still_reports_accumulated_usage(tmp_path):
         skeletons=[fn_record(0, "target", "target", [])],
         validators=[
             {
-                "schema_version": 1,
                 "status": "setup_error",
                 "error": {"code": "duplicate_expected_name", "message": "duplicate"},
             }
@@ -7324,7 +7399,6 @@ def test_replacement_sidecar_loader_is_strict_and_cross_checks_the_scc(tmp_path)
     records = {7: loaded([record])[0]}
     path = tmp_path / "pairs.json"
     valid = {
-        "schema_version": 1,
         "statements": [
             {
                 "item_id": 7,
@@ -7347,8 +7421,8 @@ def test_replacement_sidecar_loader_is_strict_and_cross_checks_the_scc(tmp_path)
 
     malformed_values = []
     for field, value in (
-        ("schema_version", 2),
-        ("schema_version", True),
+        ("unexpected", 2),
+        ("statements", None),
         ("statements", {}),
     ):
         malformed = copy.deepcopy(valid)
@@ -7453,7 +7527,7 @@ def test_replacement_sidecar_loader_is_strict_and_cross_checks_the_scc(tmp_path)
     preserved = loaded(
         [fn_record(8, "preserved", "preserved", [], needs_transformation=False)]
     )[0]
-    path.write_text('{"schema_version":1,"statements":[]}')
+    path.write_text('{"statements":[]}')
     assert _load_replacement_statement_pairs(path, (8,), {8: preserved}) == ()
 
 
@@ -7487,7 +7561,9 @@ def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
             output.write_text("fresh")
         return CommandResult(0)
 
-    make_tools("complete", complete).add_functions(current, current, request, *outputs)
+    make_tools("complete", complete).add_functions(
+        current, current, request, *outputs, frozen=tmp_path / "frozen.json"
+    )
     assert all(output.read_text() == "fresh" for output in outputs)
 
     for missing in outputs:
@@ -7502,7 +7578,7 @@ def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
 
         with pytest.raises(StageFailure):
             make_tools(f"missing-{missing.name}", incomplete).add_functions(
-                current, current, request, *outputs
+                current, current, request, *outputs, frozen=tmp_path / "frozen.json"
             )
         assert all(not output.exists() for output in outputs)
 
@@ -7517,7 +7593,7 @@ def test_tooling_clears_requires_and_cleans_every_exact_output(tmp_path):
 
         with pytest.raises(StageFailure):
             make_tools(f"stale-{stale.name}", must_not_run).add_functions(
-                current, current, request, *outputs
+                current, current, request, *outputs, frozen=tmp_path / "frozen.json"
             )
         assert not invoked
         stale.rmdir()
@@ -7609,6 +7685,7 @@ def test_tooling_preserves_inputs_when_project_output_collides(
                 target,
                 tmp_path / "observation.rs",
                 tmp_path / "metadata.json",
+                frozen=tmp_path / "frozen.json",
             )
         else:
             tools.finalize_project(analysis, current, manifest, first_output, target)
@@ -7629,7 +7706,6 @@ def test_extraction_runs_only_after_successful_build(tmp_path):
     )
     sidecars = [
         {
-            "schema_version": 1,
             "statements": [
                 {
                     "item_id": 0,
@@ -7640,7 +7716,6 @@ def test_extraction_runs_only_after_successful_build(tmp_path):
             ],
         },
         {
-            "schema_version": 1,
             "statements": [
                 {
                     "item_id": 0,
@@ -7786,7 +7861,6 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
     )
     sidecars = [
         {
-            "schema_version": 1,
             "statements": [
                 {
                     "item_id": 0,
@@ -7797,7 +7871,6 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
             ],
         },
         {
-            "schema_version": 1,
             "statements": [
                 {
                     "item_id": 0,
@@ -7887,7 +7960,6 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
-        "schema_version": 1,
         "function_scc_count": 1,
         "llm_transformation_calls": 1,
         "llm_repair_calls": 2,
@@ -7944,7 +8016,7 @@ def test_post_acceptance_extraction_failure_is_fatal_not_repairable(tmp_path, fa
         assert not (value.framework.workdir / name).exists()
 
 
-def test_accepted_correspondence_promotes_after_extraction(tmp_path):
+def test_sccs_use_frozen_interfaces_without_promoting_earlier_bodies(tmp_path):
     records = [
         fn_record(0, "leaf", "leaf", []),
         fn_record(1, "root", "root", [0]),
@@ -7963,21 +8035,22 @@ def test_accepted_correspondence_promotes_after_extraction(tmp_path):
     assert output.status == "success"
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert replacements[0][2]["accepted_correspondence"] == []
-    assert replacements[1][2]["accepted_correspondence"] == [
-        {
-            "item_id": 0,
-            "logical_path": "leaf",
-            "implementation_path": "leaf",
-            "wrapper_path": None,
-        }
-    ]
+    assert replacements[1][2]["accepted_correspondence"] == []
+    first = json.loads(
+        (tmp_path / "work/sccs/000000/replacement-request.json").read_text()
+    )
+    second = json.loads(
+        (tmp_path / "work/sccs/000001/replacement-request.json").read_text()
+    )
+    assert [item["id"] for item in first["items"]] == [0]
+    assert [item["id"] for item in second["items"]] == [1]
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
         == 2
     )
 
 
-def test_mechanical_scc_promotes_correspondence_without_extracting(tmp_path):
+def test_mechanical_scc_keeps_other_scc_interfaces_without_extracting(tmp_path):
     records = [
         fn_record(0, "leaf", "leaf", [], needs_transformation=False),
         fn_record(1, "root", "root", [0]),
@@ -7991,7 +8064,7 @@ def test_mechanical_scc_promotes_correspondence_without_extracting(tmp_path):
     _, output = run_fake(tmp_path, tools, FakeClient([response("root")]))
     assert output.status == "success"
     replacements = [event for event in tools.events if event[0] == "add_functions"]
-    assert replacements[1][2]["accepted_correspondence"][0]["logical_path"] == "leaf"
+    assert replacements[1][2]["accepted_correspondence"] == []
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
         == 1
@@ -8035,7 +8108,10 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert [event[2]["items"][0]["id"] for event in replacements] == [0, 1]
     merge = next(event for event in tools.events if event[0] == "merge_observations")
-    assert [path.name for path in merge[1]] == ["000000.json", "000001.json"]
+    assert [str(path.relative_to(value.framework.workdir)) for path in merge[1]] == [
+        "sccs/000000/accepted-observations/000000.json",
+        "sccs/000001/accepted-observations/000000.json",
+    ]
     assert [json.loads(path.read_text()) for path in merge[1]] == [
         {
             "schema_version": 1,
@@ -8064,7 +8140,6 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
-        "schema_version": 1,
         "function_scc_count": 2,
         "llm_transformation_calls": 2,
         "llm_repair_calls": 0,
@@ -8085,7 +8160,7 @@ def test_malformed_sidecar_is_fatal_before_candidate_installation(tmp_path):
         builds=[CommandResult(0)],
         validators=[VALID],
         candidates=["must-not-install\n"],
-        sidecars=[{"schema_version": 1, "statements": []}],
+        sidecars=[{"statements": []}],
     )
     client = FakeClient([response()])
     value, output = run_fake(tmp_path, tools, client)
@@ -8135,7 +8210,7 @@ def test_accepted_pairs_sort_by_item_and_label_not_scc_schedule(tmp_path):
         for event in tools.events
         if event[0] == "add_functions"
     ]
-    assert processed == [1, 2, 0]
+    assert processed == [0, 1, 2]
     report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
     positions = [report.index(f"## Item {item_id}:") for item_id in (0, 1, 2)]
     assert positions == sorted(positions)
@@ -8440,6 +8515,7 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
         "add_functions",
         "cargo_build",
         "extract_observations",
+        "assemble_project",
         "finalize_project",
         "cargo_build",
         "merge_observations",
@@ -8456,7 +8532,6 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
-        "schema_version": 1,
         "function_scc_count": 1,
         "llm_transformation_calls": 1,
         "llm_repair_calls": 0,
@@ -8523,7 +8598,6 @@ def test_empty_document_is_always_published_beside_statement_pairs(tmp_path):
         )
         statistics = report.with_name("statistics.json")
         assert json.loads(statistics.read_text()) == {
-            "schema_version": 1,
             "function_scc_count": 0,
             "llm_transformation_calls": 0,
             "llm_repair_calls": 0,
@@ -8661,7 +8735,7 @@ def test_statistics_destination_handles_stale_and_nonregular_nodes(
     )
     if stale_kind in {"file", "symlink"}:
         assert output.status == "success"
-        assert json.loads(statistics.read_text())["schema_version"] == 1
+        assert "schema_version" not in json.loads(statistics.read_text())
         assert not statistics.is_symlink()
         if stale_kind == "symlink":
             assert target.read_text() == "target stays"
@@ -8997,7 +9071,6 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
         fn_record(1, "caller", "caller", [0]),
     ]
     valid_leaf_sidecar = {
-        "schema_version": 1,
         "statements": [
             {
                 "item_id": 0,
@@ -9012,7 +9085,7 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
         builds=[CommandResult(0), CommandResult(0)],
         validators=[VALID, VALID],
         candidates=["accepted leaf\n", "must not install\n"],
-        sidecars=[valid_leaf_sidecar, {"schema_version": 1, "statements": []}],
+        sidecars=[valid_leaf_sidecar, {"statements": []}],
     )
     value, output = run_fake(
         later_case,
@@ -9086,3 +9159,807 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
         and statistics_path.exists()
     )
     assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
+
+
+class ConcurrentTools(FakeTools):
+    def __init__(self, count, *, mechanical=False, build_barrier=None):
+        from threading import Lock
+
+        super().__init__(
+            skeletons=[
+                fn_record(
+                    index,
+                    f"function_{index}",
+                    f"function_{index}",
+                    [],
+                    needs_transformation=not mechanical,
+                )
+                for index in range(count)
+            ],
+            normalized="frozen template\n",
+        )
+        self.lock = Lock()
+        self.worker_projects = {}
+        self.build_activity = {"active": 0, "maximum": 0}
+        self.build_barrier = build_barrier
+        self.worker = False
+
+    def fork(self, log_path, target_dir):
+        worker = super().fork(log_path, target_dir)
+        worker.worker = True
+        with self.lock:
+            self.worker_projects[str(target_dir)] = []
+        return worker
+
+    def validate(self, request, response):
+        self.validators = [VALID]
+        return super().validate(request, response)
+
+    def add_functions(self, analysis, current, request, *outputs, **kwargs):
+        item_id = json.loads(request.read_text())["items"][0]["id"]
+        self.candidates = [f"accepted-{item_id}\n"]
+        self.current_item = item_id
+        assert (current / "lib.rs").read_text() == self.normalized
+        assert (analysis / "lib.rs").read_text() == self.normalized
+        assert self.target_dir == current / "target"
+        with self.lock:
+            self.worker_projects[str(self.target_dir)].append(item_id)
+        return super().add_functions(analysis, current, request, *outputs, **kwargs)
+
+    def cargo_build(self, current, *, library_only=False):
+        if not self.worker:
+            return super().cargo_build(current, library_only=library_only)
+        with self.lock:
+            self.build_activity["active"] += 1
+            self.build_activity["maximum"] = max(
+                self.build_activity["maximum"], self.build_activity["active"]
+            )
+        try:
+            assert library_only
+            if (
+                self.build_barrier is not None
+                and self.current_item < self.build_barrier.parties
+            ):
+                self.build_barrier.wait(timeout=5)
+            return super().cargo_build(current, library_only=True)
+        finally:
+            with self.lock:
+                self.build_activity["active"] -= 1
+
+    def extract_observations(self, observation_source, metadata, output):
+        metadata_value = json.loads(metadata.read_text())
+        assert metadata_value["accepted_correspondence"] == []
+        assert [
+            record["item_id"] for record in metadata_value["new_correspondence"]
+        ] == [self.current_item]
+        assert [
+            record["item_id"] for record in metadata_value["dependency_correspondence"]
+        ] == [
+            index for index in range(len(self.skeletons)) if index != self.current_item
+        ]
+        self.observations = [
+            {
+                "schema_version": 1,
+                "observations": [{"item": self.current_item}],
+                "printf_observations": [],
+            }
+        ]
+        return super().extract_observations(observation_source, metadata, output)
+
+    def assemble_project(self, frozen, accepted, output):
+        assert all(
+            (path.parent / "accepted-replacement-observation-metadata.json").is_file()
+            for _, path in accepted
+        )
+        assert all("accepted" in path.read_text() for _, path in accepted)
+        self.events.append(("assemble_project", frozen, accepted, output))
+        output.write_text("".join(path.read_text() for _, path in accepted))
+
+
+def test_concurrent_workers_reuse_private_projects_and_preserve_all_usage(tmp_path):
+    from threading import Barrier, Lock
+
+    count = 6
+    barrier = Barrier(2)
+    tools = ConcurrentTools(count, build_barrier=barrier)
+    clients = []
+    factory_lock = Lock()
+    completion_barrier = Barrier(2)
+
+    def factory(settings, tracker):
+        class Client(FakeClient):
+            def complete(self, request):
+                item_id = int(request.metadata.item)
+                self.responses = [response(f"function_{item_id}")]
+                value = super().complete(request)
+                # One client records through its tracker and the other relies on
+                # the stage fallback. Another worker's append cannot hide it.
+                if self.records_usage:
+                    tracker.record(
+                        metadata=request.metadata,
+                        provider=value.provider,
+                        model=value.model,
+                        usage=value.usage,
+                        latency_s=value.latency_s,
+                        finish_reason=value.finish_reason,
+                    )
+                if item_id < 2:
+                    completion_barrier.wait(timeout=5)
+                return value
+
+        client = Client([])
+        with factory_lock:
+            client.records_usage = bool(len(clients) % 2)
+            clients.append(client)
+        return client
+
+    value = stage_input(tmp_path, config={"workers": 2})
+    output = run_stage(
+        value, stage_dir=STAGE_DIR, tools=tools, llm_client_factory=factory
+    )
+    assert output.status == "success", output.error
+    assert len(clients) == 2
+    assert tools.build_activity["maximum"] == 2
+    assert len(tools.worker_projects) == 2
+    assert sum(map(len, tools.worker_projects.values())) == count
+    assert any(len(items) > 1 for items in tools.worker_projects.values())
+    assert sorted(
+        item for items in tools.worker_projects.values() for item in items
+    ) == list(range(count))
+    assert output.usage.calls == count
+    assert output.usage.input_tokens == count * 100
+    usage = read_usage(value.framework.workdir / "usage.jsonl")
+    assert sorted(int(record["item"]) for record in usage) == list(range(count))
+    assert (value.outputs.rust_project / "lib.rs").read_text() == "".join(
+        f"accepted-{index}\n" for index in range(count)
+    )
+    document = json.loads(
+        (value.outputs.artifacts_dir / "observations.json").read_text()
+    )
+    assert document["observations"] == [{"item": index} for index in range(count)]
+    operations = [event[0] for event in tools.events]
+    assembly = operations.index("assemble_project")
+    assert operations[:assembly].count("extract_observations") == count
+    assert operations[assembly:] == [
+        "assemble_project",
+        "finalize_project",
+        "cargo_build",
+        "merge_observations",
+    ]
+    assert output.metrics["cargo_builds"] == count + 2
+
+
+def test_single_worker_reuses_one_project_and_serializes_sccs(tmp_path):
+    tools = ConcurrentTools(3)
+    value = stage_input(tmp_path, config={"workers": 1})
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=lambda settings, tracker: FakeClient([response()] * 3),
+    )
+    assert output.status == "success", output.error
+    assert tools.build_activity["maximum"] == 1
+    assert list(tools.worker_projects.values()) == [[0, 1, 2]]
+    assert len({event[1] for event in tools.events if event[0] == "add_functions"}) == 1
+
+
+def test_failure_stops_dispatch_and_waits_for_inflight_usage(tmp_path, monkeypatch):
+    from threading import Barrier, Event
+
+    failure_written = Event()
+    first_builds = Barrier(2)
+    real_write = Path.write_text
+
+    def write(path, text, *args, **kwargs):
+        result = real_write(path, text, *args, **kwargs)
+        if path.name == "failure.txt":
+            failure_written.set()
+        return result
+
+    monkeypatch.setattr(Path, "write_text", write)
+
+    class FailingTools(ConcurrentTools):
+        def cargo_build(self, current, *, library_only=False):
+            if self.worker:
+                first_builds.wait(timeout=5)
+                if self.current_item == 0:
+                    raise StageFailure("private compiler invocation failed")
+                assert failure_written.wait(timeout=5)
+            return super().cargo_build(current, library_only=library_only)
+
+    tools = FailingTools(5)
+    value = stage_input(tmp_path, config={"workers": 2})
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=lambda settings, tracker: FakeClient([response()] * 5),
+    )
+    assert output.status == "failure"
+    assert "private compiler invocation failed" in output.error
+    assert sorted(
+        item for items in tools.worker_projects.values() for item in items
+    ) == [0, 1]
+    assert output.usage.calls == 2
+    assert output.metrics["llm_generation_calls"] == 2
+    assert not value.outputs.rust_project.exists()
+    assert not any(
+        (value.outputs.artifacts_dir / name).exists()
+        for name in ("observations.json", "statistics.json", "statement-pairs.md")
+    )
+    assert not any(
+        event[0] in {"assemble_project", "finalize_project", "merge_observations"}
+        for event in tools.events
+    )
+    assert (value.framework.workdir / "sccs/000001/accepted.rs").is_file()
+    assert len(list((value.framework.workdir / "workers").glob("*/failure.txt"))) == 1
+
+
+def test_worker_client_failure_records_the_failed_call_once(tmp_path):
+    tools = ConcurrentTools(1)
+    value, output = run_fake(tmp_path, tools, FakeClient([AuthError("denied")]))
+    assert output.status == "failure"
+    usage = read_usage(value.framework.workdir / "usage.jsonl")
+    assert len(usage) == output.usage.calls == 1
+    assert usage[0]["error"] == "AuthError: denied"
+    assert usage[0]["finish_reason"] == "error"
+
+
+def test_default_workers_share_one_rate_limiter_across_clients(tmp_path, monkeypatch):
+    from threading import Lock
+
+    limiters = []
+    factory_lock = Lock()
+
+    class Client(FakeClient):
+        def __init__(self, settings, *, tracker, limiter):
+            super().__init__([response()] * 3)
+            with factory_lock:
+                limiters.append(limiter)
+
+    monkeypatch.setattr(stage_module, "LlmClient", Client)
+    value = stage_input(tmp_path)
+    value = replace(value, config={})
+    tools = ConcurrentTools(6)
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "success", output.error
+    assert output.config_used["workers"] == 4
+    assert len(limiters) == 4
+    assert all(limiter is limiters[0] for limiter in limiters)
+
+
+@pytest.mark.parametrize("workers", [0, -1, True, False, 2.5, "4", None])
+def test_workers_configuration_rejects_nonpositive_or_noninteger_values(
+    tmp_path, workers
+):
+    tools = FakeTools()
+    value = stage_input(tmp_path, config={"workers": workers})
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "config.workers must be a positive integer" in output.error
+    assert not tools.events
+
+
+def test_private_cargo_directories_override_environment_and_project_config(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "shared-target"))
+    commands = []
+
+    def runner(command, *, cwd=None, env=None):
+        assert env["CARGO_BUILD_BUILD_DIR"] == env["CARGO_TARGET_DIR"]
+        commands.append((command, cwd, env["CARGO_TARGET_DIR"]))
+        return CommandResult(0)
+
+    tools = CratTools(tmp_path / "tools.log", run_command=runner)
+    projects = [tmp_path / "worker-a/project", tmp_path / "worker-b/project"]
+    for project in projects:
+        (project / ".cargo").mkdir(parents=True)
+        (project / ".cargo/config.toml").write_text(
+            '[build]\ntarget-dir = "/shared-from-config"\nbuild-dir = "/shared-build-config"\n'
+        )
+        worker = tools.fork(project.parent / "worker.log", project / "target")
+        worker.cargo_build(project, library_only=True)
+        assert worker.environment["CARGO_TARGET_DIR"] == str(project / "target")
+        assert worker.environment["CARGO_BUILD_BUILD_DIR"] == str(project / "target")
+    assert [command for command, _, _ in commands] == [
+        ["cargo", "build", "--lib", "-j", "1"]
+    ] * 2
+    assert [target for _, _, target in commands] == [
+        str(project / "target") for project in projects
+    ]
+
+
+def test_exhausted_structural_repairs_retain_latest_failure_without_exchange_dump(
+    tmp_path,
+):
+    tools = FakeTools(skeletons=[fn_record(0, "target", "target", [])])
+    value, output = run_fake(tmp_path, tools, FakeClient(["no fence"] * 11))
+    assert output.status == "failure"
+    jobdir = value.framework.workdir / "sccs/000000"
+    assert (jobdir / "last-failed-transformation.txt").read_text() == "no fence"
+    assert (jobdir / "structural-diagnostics.txt").read_text() == NO_FENCE_DIAGNOSTIC
+    assert not (value.outputs.artifacts_dir / "llm-exchanges").exists()
+    assert output.usage.calls == 11
+
+
+def test_final_build_failure_retains_all_successful_scc_results(tmp_path):
+    class IntegrationFailureTools(ConcurrentTools):
+        def cargo_build(self, current, *, library_only=False):
+            if not library_only:
+                return CommandResult(8, "", "integration failed")
+            return super().cargo_build(current, library_only=True)
+
+    tools = IntegrationFailureTools(3)
+    value = stage_input(tmp_path, config={"workers": 2})
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=lambda settings, tracker: FakeClient([response()] * 3),
+    )
+    assert output.status == "failure"
+    assert "final cargo build failed (8)" in output.error
+    assert output.metrics["llm_generation_calls"] == 3
+    assert output.metrics["repair_calls"] == 0
+    assert len(list((value.framework.workdir / "sccs").glob("*/accepted.rs"))) == 3
+    assert (
+        len(
+            list(
+                (value.framework.workdir / "sccs").glob(
+                    "*/accepted-replacement-observation-metadata.json"
+                )
+            )
+        )
+        == 3
+    )
+    assert not value.outputs.rust_project.exists()
+    assert not (value.outputs.artifacts_dir / "observations.json").exists()
+
+
+def test_tool_cache_rebuilds_after_uncommitted_or_untracked_rust_changes(tmp_path):
+    crat = tmp_path / "crat"
+    (crat / "src").mkdir(parents=True)
+    (crat / "deps_crate").mkdir()
+    source = crat / "src/lib.rs"
+    source.write_text("pub fn original() {}")
+    calls = []
+
+    def runner(command, *, cwd=None, env=None):
+        calls.append(command)
+        if command[:2] == ["git", "rev-parse"]:
+            return CommandResult(0, "same-commit")
+        if "--bin" in command:
+            binary = crat / "target/release" / command[-1]
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text("fixture binary")
+        return CommandResult(0)
+
+    tools = CratTools(
+        tmp_path / "tools.log", run_command=runner, environment_factory=lambda path: {}
+    )
+    tools.build_tools(crat)
+    assert len(calls) == 4
+    tools.build_tools(crat)
+    assert len(calls) == 5
+    source.write_text("pub fn changed() {}")
+    tools.build_tools(crat)
+    assert len(calls) == 9
+    (crat / "src/new_module.rs").write_text("pub fn added() {}")
+    tools.build_tools(crat)
+    assert len(calls) == 13
+    (crat / "deps_crate/target").mkdir()
+    (crat / "deps_crate/target/generated.rs").write_text("generated build output")
+    tools.build_tools(crat)
+    assert len(calls) == 14
+
+
+@pytest.mark.parametrize(
+    "mutation, diagnostic",
+    [
+        ("dependency", "dependency_correspondence differs"),
+        ("source_stub", "source_stubs do not cover"),
+        ("frozen_digest", "frozen_project_sha256 differs"),
+        ("accepted", "cannot contain accepted dependencies"),
+    ],
+)
+def test_independent_observation_metadata_rejects_wrong_frozen_identity(
+    tmp_path, mutation, diagnostic
+):
+    class BrokenMetadataTools(FakeTools):
+        def add_functions(self, analysis, current, request, *outputs, **kwargs):
+            super().add_functions(analysis, current, request, *outputs, **kwargs)
+            metadata_path = outputs[-1]
+            metadata = json.loads(metadata_path.read_text())
+            if mutation == "dependency":
+                metadata["dependency_correspondence"] = []
+            elif mutation == "source_stub":
+                metadata["source_stubs"] = metadata["source_stubs"][1:]
+            elif mutation == "frozen_digest":
+                metadata["frozen_project_sha256"] = "0" * 64
+            else:
+                metadata["accepted_correspondence"] = metadata[
+                    "dependency_correspondence"
+                ]
+            metadata_path.write_text(json.dumps(metadata))
+
+    tools = BrokenMetadataTools(
+        skeletons=[
+            fn_record(0, "first", "first", []),
+            fn_record(1, "second", "second", []),
+        ],
+        validators=[VALID],
+        candidates=["candidate\n"],
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([response("first")]))
+    assert output.status == "failure"
+    assert diagnostic in output.error
+    assert output.metrics["cargo_builds"] == 1
+    assert not value.outputs.rust_project.exists()
+    assert not any(event[0] == "extract_observations" for event in tools.events)
+
+
+@pytest.mark.parametrize("operation", ["initial", "add", "finalize", "assemble"])
+def test_frozen_bundle_cannot_be_overwritten_by_tool_outputs(tmp_path, operation):
+    analysis = tmp_path / "analysis"
+    current = tmp_path / "current"
+    analysis.mkdir()
+    current.mkdir()
+    frozen = tmp_path / "frozen.json"
+    frozen.write_text("preserve bundle")
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    tools = CratTools(
+        tmp_path / "tools.log",
+        run_command=lambda *args, **kwargs: pytest.fail(
+            "overlapping output reached a subprocess"
+        ),
+    )
+    tools.crat_tool = Path("/tools/crat-tool")
+    with pytest.raises(StageFailure, match="overlaps an input project or file"):
+        if operation == "initial":
+            tools.make_initial(analysis, frozen, frozen=frozen)
+        elif operation == "add":
+            tools.add_functions(
+                analysis,
+                current,
+                request,
+                frozen,
+                tmp_path / "pairs.json",
+                tmp_path / "observation.rs",
+                tmp_path / "metadata.json",
+                frozen=frozen,
+            )
+        elif operation == "finalize":
+            tools.finalize_project(
+                analysis,
+                current,
+                request,
+                frozen,
+                tmp_path / "manifest.toml",
+                frozen=frozen,
+            )
+        else:
+            tools.assemble_project(frozen, (), frozen)
+    assert frozen.read_text() == "preserve bundle"
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "work/current/usage.jsonl",
+        "work/analysis/usage.jsonl",
+        "work/workers/00/usage.jsonl",
+        "work/sccs/000000/usage.jsonl",
+        "work/frozen-project.json",
+        "work/assembled.rs",
+        "work/assembled.json",
+        "work/final-rollback/final-library.rollback",
+        "artifacts/worker-00.log",
+        "artifacts/local-transformation.log",
+        "artifacts/observations.json",
+    ],
+)
+def test_usage_log_cannot_alias_scratch_or_worker_outputs(tmp_path, relative):
+    value = stage_input(tmp_path)
+    usage = tmp_path / relative
+    usage.parent.mkdir(parents=True, exist_ok=True)
+    usage.write_text("{}\n")
+    value = replace(value, framework=replace(value.framework, usage_log=usage))
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "usage log overlaps" in output.error
+    assert usage.read_text() == "{}\n"
+    assert not tools.events
+
+
+def test_usage_log_cannot_alias_an_existing_worker_log_symlink(tmp_path):
+    value = stage_input(tmp_path)
+    usage = tmp_path / "outside-usage.jsonl"
+    usage.write_text("{}\n")
+    (value.outputs.artifacts_dir / "worker-00.log").symlink_to(usage)
+    value = replace(value, framework=replace(value.framework, usage_log=usage))
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "usage log overlaps" in output.error
+    assert usage.read_text() == "{}\n"
+    assert not tools.events
+
+
+@pytest.mark.parametrize(
+    "scratch",
+    [
+        "analysis",
+        "current",
+        "workers",
+        "sccs",
+        "final-rollback",
+        "workers/00",
+        "sccs/000000",
+    ],
+)
+@pytest.mark.parametrize("target_kind", ["input", "crat", "external", "dangling"])
+def test_symlinked_scratch_directories_fail_before_mutation(
+    tmp_path, scratch, target_kind
+):
+    value = stage_input(tmp_path)
+    crat = tmp_path / "crat"
+    external = tmp_path / "external"
+    for directory in (value.inputs.rust_project, crat, external):
+        directory.mkdir(exist_ok=True)
+        for child in ("00", "000000"):
+            sentinel = directory / child / "sentinel.txt"
+            sentinel.parent.mkdir(exist_ok=True)
+            sentinel.write_text(f"preserve {directory.name}/{child}\n")
+    target = {
+        "input": value.inputs.rust_project,
+        "crat": crat,
+        "external": external,
+        "dangling": external / "missing",
+    }[target_kind]
+    link = value.framework.workdir / scratch
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target, target_is_directory=True)
+    report = value.outputs.artifacts_dir / "statement-pairs.md"
+    report.write_text("preserve existing report\n")
+    value = replace(value, config={**value.config, "crat_dir": str(crat)})
+
+    def snapshot(directory):
+        return {
+            str(path.relative_to(directory)): path.read_bytes()
+            if path.is_file()
+            else None
+            for path in directory.rglob("*")
+        }
+
+    directories = (value.inputs.rust_project, crat, external)
+    before = [snapshot(directory) for directory in directories]
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
+        candidates=["accepted\n"],
+    )
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert f"scratch directory must not be a symlink: {link}" in output.error
+    assert not tools.events
+    assert link.is_symlink()
+    assert [snapshot(directory) for directory in directories] == before
+    assert report.read_text() == "preserve existing report\n"
+    assert not value.outputs.rust_project.exists()
+    if target_kind == "dangling":
+        assert not target.exists()
+
+
+def test_safe_work_directory_symlink_still_supports_private_scc_workers(tmp_path):
+    value = stage_input(tmp_path)
+    actual_work = value.framework.workdir
+    sentinel = actual_work / "sentinel.txt"
+    sentinel.write_text("preserve work directory contents\n")
+    alias = tmp_path / "work-alias"
+    alias.symlink_to(actual_work, target_is_directory=True)
+    value = replace(value, framework=replace(value.framework, workdir=alias))
+    tools = FakeTools(
+        skeletons=[fn_record(0, "target", "target", [], needs_transformation=False)],
+        candidates=["accepted\n"],
+    )
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=lambda settings, tracker: FakeClient([]),
+    )
+    assert output.status == "success", output.error
+    assert alias.is_symlink()
+    assert sentinel.read_text() == "preserve work directory contents\n"
+    assert (actual_work / "workers/00/project/lib.rs").read_text() == "accepted\n"
+    assert (value.outputs.rust_project / "lib.rs").read_text() == "accepted\n"
+
+
+class UnfilledStubTools(FakeTools):
+    def __init__(self, unfilled_attempts, **kwargs):
+        super().__init__(**kwargs)
+        self.unfilled_attempts = list(unfilled_attempts)
+
+    def add_functions(self, analysis, current, request, *outputs, **kwargs):
+        super().add_functions(analysis, current, request, *outputs, **kwargs)
+        metadata_path = outputs[-1]
+        metadata = json.loads(metadata_path.read_text())
+        metadata["unfilled_stub_items"] = self.unfilled_attempts.pop(0)
+        metadata_path.write_text(json.dumps(metadata))
+
+
+def stub_repair_records(mixed):
+    return [fn_record(0, "first", "first", [1] if mixed else [])] + (
+        [fn_record(1, "second", "second", [0])] if mixed else []
+    )
+
+
+def stub_repair_response(mixed, unfilled):
+    names = ["first", "second"] if mixed else ["first"]
+    return (
+        "```rust\n"
+        + "\n".join(
+            f"unsafe fn {name}() {{ #[proctor(0)] {'todo!()' if index == unfilled else '()'} }}"
+            for index, name in enumerate(names)
+        )
+        + "\n```"
+    )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_unfilled_whole_function_stub_uses_local_repair_before_build_or_observation(
+    tmp_path, mixed
+):
+    item_id = 1 if mixed else 0
+    tools = UnfilledStubTools(
+        [[item_id], []],
+        skeletons=stub_repair_records(mixed),
+        validators=[VALID, VALID],
+        candidates=["unfilled candidate\n", "repaired candidate\n"],
+        observations=[
+            {
+                "schema_version": 1,
+                "observations": [{"accepted": True}],
+                "printf_observations": [],
+            }
+        ],
+    )
+    client = FakeClient(
+        [stub_repair_response(mixed, item_id), stub_repair_response(mixed, None)]
+    )
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "success", output.error
+    assert output.metrics["llm_generation_calls"] == 2
+    assert output.metrics["repair_calls"] == output.metrics["structural_failures"] == 1
+    assert output.metrics["compilation_failures"] == 0
+    assert output.metrics["cargo_builds"] == 3
+    builds = [event[2] for event in tools.events if event[0] == "cargo_build"]
+    assert builds == ["normalized\n", "repaired candidate\n", "repaired candidate\n"]
+    operations = [event[0] for event in tools.events]
+    assert operations.count("extract_observations") == 1
+    assert operations.index("extract_observations") > max(
+        index
+        for index, operation in enumerate(operations)
+        if operation == "add_functions"
+    )
+    repair_prompt = client.requests[1].messages[0].content
+    assert "Complete the unfilled whole-function stubs" in repair_prompt
+    assert f"{item_id}:{'second' if mixed else 'first'}" in repair_prompt
+    assert "todo!()" in repair_prompt
+    assert json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
+        "observations"
+    ] == [{"accepted": True}]
+    assert (
+        value.framework.workdir / "sccs/000000/accepted.rs"
+    ).read_text() == "repaired candidate\n"
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_unfilled_whole_function_stub_exhausts_shared_repair_budget_without_observations(
+    tmp_path, mixed
+):
+    item_id = 1 if mixed else 0
+    tools = UnfilledStubTools(
+        [[item_id]] * 11,
+        skeletons=stub_repair_records(mixed),
+        validators=[VALID] * 11,
+        candidates=["unfilled candidate\n"] * 11,
+    )
+    value, output = run_fake(
+        tmp_path, tools, FakeClient([stub_repair_response(mixed, item_id)] * 11)
+    )
+    assert output.status == "failure"
+    assert "exhausted 10 repair calls" in output.error
+    assert output.metrics["llm_generation_calls"] == output.usage.calls == 11
+    assert output.metrics["repair_calls"] == 10
+    assert output.metrics["structural_failures"] == 11
+    assert output.metrics["cargo_builds"] == 1
+    assert not any(
+        event[0] in {"extract_observations", "assemble_project", "finalize_project"}
+        for event in tools.events
+    )
+    assert not list((value.framework.workdir / "sccs").glob("*/accepted.rs"))
+    assert not value.outputs.rust_project.exists()
+    assert not (value.outputs.artifacts_dir / "observations.json").exists()
+
+
+def test_mechanical_whole_function_stub_remains_fatal_without_llm_repair(tmp_path):
+    tools = UnfilledStubTools(
+        [[0]],
+        skeletons=[fn_record(0, "first", "first", [], needs_transformation=False)],
+        candidates=["unfilled candidate\n"],
+    )
+    client = FakeClient([])
+    value, output = run_fake(tmp_path, tools, client)
+    assert output.status == "failure"
+    assert (
+        "mechanical SCC candidate contains unfilled whole-function stubs"
+        in output.error
+    )
+    assert not client.requests
+    assert output.metrics["cargo_builds"] == 1
+    assert not value.outputs.rust_project.exists()
+
+
+def test_build_rewriting_candidate_source_fails_before_acceptance_or_observation(
+    tmp_path,
+):
+    class SourceRewritingTools(FakeTools):
+        def cargo_build(self, current, *, library_only=False):
+            result = super().cargo_build(current, library_only=library_only)
+            if current.name == "project":
+                (current / "lib.rs").write_text("changed by Cargo build\n")
+            return result
+
+    tools = SourceRewritingTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        validators=[VALID],
+        candidates=["original candidate\n"],
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([response()]))
+    assert output.status == "failure"
+    assert "successful cargo build changed candidate source bytes" in output.error
+    assert output.metrics["repair_calls"] == 0
+    assert output.metrics["cargo_builds"] == 2
+    assert not any(
+        event[0] in {"extract_observations", "assemble_project", "finalize_project"}
+        for event in tools.events
+    )
+    assert not list((value.framework.workdir / "sccs").glob("*/accepted.rs"))
+    assert not value.outputs.rust_project.exists()
+    assert not any(
+        (value.outputs.artifacts_dir / name).exists()
+        for name in ("observations.json", "statistics.json", "statement-pairs.md")
+    )
+
+
+def test_mutated_retained_candidate_fails_digest_check_before_assembly(tmp_path):
+    class RetainedSourceRewritingTools(FakeTools):
+        def extract_observations(self, observation_source, metadata, output):
+            super().extract_observations(observation_source, metadata, output)
+            (observation_source.parent / "accepted.rs").write_text(
+                "changed retained candidate\n"
+            )
+
+    tools = RetainedSourceRewritingTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        validators=[VALID],
+        candidates=["original candidate\n"],
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([response()]))
+    assert output.status == "failure"
+    assert "candidate_sha256 does not match candidate bytes" in output.error
+    assert output.metrics["repair_calls"] == 0
+    assert output.metrics["cargo_builds"] == 2
+    assert not any(
+        event[0] in {"assemble_project", "finalize_project", "merge_observations"}
+        for event in tools.events
+    )
+    assert not value.outputs.rust_project.exists()
+    assert not any(
+        (value.outputs.artifacts_dir / name).exists()
+        for name in ("observations.json", "statistics.json", "statement-pairs.md")
+    )

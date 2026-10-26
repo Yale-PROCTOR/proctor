@@ -69,7 +69,6 @@ def validation_request(
     transformation: str,
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
         "expected_functions": [
             {
                 "id": records_by_id[item_id].id,
@@ -90,7 +89,6 @@ def replacement_request(
     accepted_correspondence: tuple[CallableCorrespondence, ...] = (),
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
         "items": [
             {
                 "id": records_by_id[item_id].id,
@@ -219,6 +217,7 @@ def make_skeleton_command(
     current_project: Path,
     output: Path,
     rule_set: Path | None = None,
+    frozen_output: Path | None = None,
 ) -> list[str]:
     command = [
         str(crat_tool),
@@ -226,6 +225,8 @@ def make_skeleton_command(
         "--output",
         str(output),
     ]
+    if frozen_output is not None:
+        command.extend(("--frozen-output", str(frozen_output)))
     if rule_set is not None:
         command.extend(("--rules", str(rule_set)))
     command.append(str(current_project))
@@ -268,11 +269,12 @@ def validate_command(crat_tool: Path, request: Path, response: Path) -> list[str
 
 
 def make_initial_command(
-    crat_tool: Path, analysis_project: Path, output: Path
+    crat_tool: Path, analysis_project: Path, output: Path, frozen: Path | None = None
 ) -> list[str]:
     return [
         str(crat_tool),
         "make-initial",
+        *(["--frozen", str(frozen)] if frozen is not None else []),
         "--output",
         str(output),
         str(analysis_project),
@@ -288,10 +290,13 @@ def add_functions_command(
     statement_pairs_output: Path,
     observation_source_output: Path,
     observation_metadata_output: Path,
+    frozen: Path,
 ) -> list[str]:
     return [
         str(crat_tool),
         "add-functions",
+        "--frozen",
+        str(frozen),
         "--request",
         str(request),
         "--current-project",
@@ -315,10 +320,12 @@ def finalize_project_command(
     manifest: Path,
     output: Path,
     manifest_output: Path,
+    frozen: Path | None = None,
 ) -> list[str]:
     return [
         str(crat_tool),
         "finalize-project",
+        *(["--frozen", str(frozen)] if frozen is not None else []),
         "--manifest",
         str(manifest),
         "--current-project",

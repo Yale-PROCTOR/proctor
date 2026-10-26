@@ -242,3 +242,40 @@ def test_429_status_still_retried(tmp_path: Path) -> None:
     provider = FakeProvider([ProviderError("throttled", status=429), _response()])
     client, _ = _client(provider, tmp_path)
     assert client.complete(_request()).text == "hi"
+
+
+def test_concurrent_clients_share_rate_limit_for_every_retry(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    import proctor.llm.client as client_module
+
+    now = [0.0]
+    waits = []
+
+    def sleep(delay):
+        waits.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(
+        client_module, "time", SimpleNamespace(monotonic=lambda: now[0])
+    )
+    limiter = client_module.RateLimiter(2)
+    log = tmp_path / "shared.jsonl"
+    trackers = [UsageTracker(log) for _ in range(4)]
+    clients = [
+        LlmClient(
+            {"model": "fake-1", "max_retries": 1},
+            tracker=tracker,
+            provider=FakeProvider([RateLimited("retry", retry_after_s=0), _response()]),
+            sleep=sleep,
+            limiter=limiter,
+        )
+        for tracker in trackers
+    ]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(lambda client: client.complete(_request()), clients))
+    assert len(responses) == 4
+    assert len(read_usage(log)) == 8
+    assert all(tracker.record_count == 2 for tracker in trackers)
+    assert sum(waits) == 180
