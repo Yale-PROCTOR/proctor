@@ -1,0 +1,9 @@
+[project]
+name = "crat-repair-stage"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = ["proctor", "dr_agent"]
+
+[tool.uv.sources]
+proctor = { path = "../..", editable = true }
+dr_agent = { path = "../discipline-repair", editable = true }
