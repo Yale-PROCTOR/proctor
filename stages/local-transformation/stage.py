@@ -41,7 +41,9 @@ from model import (
     UnstructuredFailure,
     render_transformation_targets,
 )
+from patching import PatchError, apply_patch
 from protocol import (
+    Extraction,
     PROMPT_VERSION,
     PromptRenderInput,
     extract_code_block,
@@ -1558,6 +1560,34 @@ def _load_unstructured_candidate(
     return result
 
 
+def _extract_transformation(
+    response: str,
+    base: str | None,
+    workdir: Path,
+    exchange_dir: Path | None,
+) -> Extraction:
+    if base is None:
+        extraction = extract_code_block(response)
+    else:
+        (workdir / "repair-base.rs").write_text(base, encoding="utf-8")
+        if exchange_dir is not None:
+            (exchange_dir / "repair-base.rs").write_text(base, encoding="utf-8")
+        try:
+            extraction = Extraction(apply_patch(base, response), None, None)
+        except PatchError as error:
+            diagnostics = str(error)
+            (workdir / "last-failed-patch.txt").write_text(response, encoding="utf-8")
+            (workdir / "patch-diagnostics.txt").write_text(
+                diagnostics, encoding="utf-8"
+            )
+            extraction = Extraction(None, response, diagnostics)
+    if exchange_dir is not None and extraction.candidate is not None:
+        (exchange_dir / "transformation.rs").write_text(
+            extraction.candidate, encoding="utf-8"
+        )
+    return extraction
+
+
 def _process_unstructured_scc(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
@@ -1613,6 +1643,7 @@ def _process_unstructured_scc(
         raise StageFailure(
             "unstructured preparation candidate must be a string or null"
         )
+    transformation = transformation or None
     target_text = "\n\n".join(
         f"### Function `{target['name']}`\n\nSource:\n```rust\n{target['source']}\n```\n"
         f"Target signature:\n```rust\n{target['signature']}\n```"
@@ -1627,9 +1658,13 @@ def _process_unstructured_scc(
         ),
         unstructured=True,
     )
-    latest_failed: str | None = None
+    latest_failed = transformation
+    stub_base = "\n\n".join(
+        f"{target['signature']} {{ todo!() }}" for target in targets
+    )
     diagnostics: str | None = None
-    seen_results: dict[tuple[bool, str], int] = {}
+    patch_failure: tuple[str, str] | None = None
+    seen_results: dict[str, int] = {}
     calls = 0
     response_path = workdir / "unstructured-response.json"
     while True:
@@ -1639,11 +1674,13 @@ def _process_unstructured_scc(
                     f"SCC {','.join(map(str, members))} exhausted {max_repairs} unstructured repair calls"
                 )
             calls += 1
+            base = latest_failed or stub_base
             rendered = render_prompt(
                 PromptRenderInput(
                     dependency_context=context,
                     transformation_targets=target_text,
-                    failed_transformation=latest_failed,
+                    repair_base=base,
+                    patch_failure=patch_failure,
                     diagnostics=diagnostics,
                     use_xj_scanf_guidance=_uses_xj_scanf_guidance(
                         members, records_by_id
@@ -1695,30 +1732,26 @@ def _process_unstructured_scc(
                 (exchange_dir / "response.md").write_text(
                     response.text, encoding="utf-8"
                 )
-            extraction = extract_code_block(response.text)
-            transformation = extraction.candidate
-            result = (
-                transformation is not None,
-                transformation if transformation is not None else response.text,
+            extraction = _extract_transformation(
+                response.text, base, workdir, exchange_dir
             )
-            if result in seen_results:
+            transformation = extraction.candidate
+            if transformation is None:
+                state.metrics.structural_failures += 1
+                patch_failure = (response.text, extraction.diagnostics or "")
+                continue
+            patch_failure = None
+            if transformation in seen_results:
                 (workdir / "last-failed-transformation.txt").write_text(
-                    result[1], encoding="utf-8"
+                    transformation, encoding="utf-8"
                 )
                 raise StageFailure(
                     f"SCC {','.join(map(str, members))} repeated unstructured transformation "
-                    f"at attempt {calls} (first seen at attempt {seen_results[result]})"
+                    f"at attempt {calls} (first seen at attempt {seen_results[transformation]})"
                 )
-            seen_results[result] = calls
-            if transformation is None:
-                state.metrics.structural_failures += 1
-                diagnostics = extraction.diagnostics
-                (workdir / "last-failed-transformation.txt").write_text(
-                    response.text, encoding="utf-8"
-                )
-                continue
+            seen_results[transformation] = calls
         else:
-            seen_results[(True, transformation)] = 0
+            seen_results[transformation] = 0
         request_path = workdir / "unstructured-request.json"
         write_json(
             request_path, {"members": list(members), "transformation": transformation}
@@ -1731,7 +1764,11 @@ def _process_unstructured_scc(
         )
         if isinstance(result, UnstructuredFailure):
             state.metrics.structural_failures += 1
-            latest_failed = result.failed_transformation
+            latest_failed = (
+                result.failed_transformation
+                if result.failed_transformation is not None
+                else transformation
+            )
             diagnostics = result.diagnostics
         else:
             candidate = workdir / "unstructured-candidate.rs"
@@ -1819,7 +1856,8 @@ def _process_scc(
     active_views = applied_views
     latest_failed: str | None = None
     latest_diagnostics: str | None = None
-    seen_results: dict[tuple[bool, str], int] = {}
+    patch_failure: tuple[str, str] | None = None
+    seen_results: dict[str, int] = {}
     transformations: list[str] = []
     stopping_reason: str | None = None
     generation = 0
@@ -1839,11 +1877,17 @@ def _process_scc(
                 )
             if generation:
                 state.metrics.repair_calls += 1
+            base = None
+            if generation:
+                base = latest_failed or "\n\n".join(
+                    active_views[item_id].skeleton for item_id in sorted(members)
+                )
             rendered = render_prompt(
                 PromptRenderInput(
                     dependency_context=context,
                     transformation_targets=targets,
-                    failed_transformation=latest_failed,
+                    repair_base=base,
+                    patch_failure=patch_failure,
                     diagnostics=latest_diagnostics,
                     use_xj_scanf_guidance=use_xj_scanf_guidance,
                     libc_guidance=libc_guidance,
@@ -1886,18 +1930,30 @@ def _process_scc(
                 (exchange_dir / "response.md").write_text(
                     response.text, encoding="utf-8"
                 )
-            extraction = extract_code_block(response.text)
-            result = (
-                extraction.candidate is not None,
-                extraction.candidate
-                if extraction.candidate is not None
-                else response.text,
+            extraction = _extract_transformation(
+                response.text, base, workdir, exchange_dir
             )
-            transformations.append(result[1])
-            previous_generation = seen_results.get(result)
+            if extraction.candidate is None:
+                state.metrics.structural_failures += 1
+                if base is not None:
+                    patch_failure = (response.text, extraction.diagnostics or "")
+                else:
+                    latest_diagnostics = extraction.diagnostics
+                    (workdir / "last-failed-transformation.txt").write_text(
+                        extraction.failed_text or "", encoding="utf-8"
+                    )
+                    (workdir / "structural-diagnostics.txt").write_text(
+                        latest_diagnostics or "", encoding="utf-8"
+                    )
+                generation += 1
+                continue
+            patch_failure = None
+            transformation = extraction.candidate
+            transformations.append(transformation)
+            previous_generation = seen_results.get(transformation)
             if previous_generation is not None:
                 (workdir / "last-failed-transformation.txt").write_text(
-                    result[1], encoding="utf-8"
+                    transformation, encoding="utf-8"
                 )
                 stopping_reason = (
                     f"SCC {','.join(map(str, members))} repeated transformation "
@@ -1905,20 +1961,7 @@ def _process_scc(
                     f"{previous_generation})"
                 )
                 break
-            seen_results[result] = generation
-            if extraction.candidate is None:
-                state.metrics.structural_failures += 1
-                latest_failed = extraction.failed_text
-                latest_diagnostics = extraction.diagnostics
-                (workdir / "last-failed-transformation.txt").write_text(
-                    latest_failed or "", encoding="utf-8"
-                )
-                (workdir / "structural-diagnostics.txt").write_text(
-                    latest_diagnostics or "", encoding="utf-8"
-                )
-                generation += 1
-                continue
-            transformation = extraction.candidate
+            seen_results[transformation] = generation
             validation_request_path = workdir / "validation-request.json"
             validation_response_path = workdir / "validation-response.json"
             write_json(
