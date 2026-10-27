@@ -32,6 +32,7 @@ from model import (
     PrintfTemplateMetadata,
     SkeletonError,
     StatementPairMetadata,
+    _rust_tokens,
     dependency_context,
     function_graph,
     load_replacement_metadata,
@@ -875,6 +876,72 @@ def test_dual_view_loader_checks_lexical_structure_not_header_whitespace():
         malformed["applied"]["skeleton"] = mutation(malformed["applied"]["skeleton"])
         with pytest.raises(SkeletonError):
             loaded([malformed])
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ("'a, 'b", ("'a", ",", "'b")),
+        ("&'a str, &'b str", ("&", "'a", "str", ",", "&", "'b", "str")),
+        ("'{'; '}'; ';'", ("'{'", ";", "'}'", ";", "';'")),
+        ("'é'", ("'é'",)),
+        (r"'\n'", (r"'\n'",)),
+        (r"'\r'", (r"'\r'",)),
+        (r"'\t'", (r"'\t'",)),
+        (r"'\0'", (r"'\0'",)),
+        (r"'\\'", (r"'\\'",)),
+        (r"'\''", (r"'\''",)),
+        (r"'\"'", (r"'\"'",)),
+        (r"'\x7b'", (r"'\x7b'",)),
+        (r"'\u{7b}'", (r"'\u{7b}'",)),
+        (r"'\u{1F_980}'", (r"'\u{1F_980}'",)),
+        (r"b'\xff'", ("b", r"'\xff'")),
+        (
+            "'outer: loop { break 'outer; }",
+            ("'outer", ":", "loop", "{", "break", "'outer", ";", "}"),
+        ),
+    ],
+)
+def test_skeleton_lexer_distinguishes_characters_lifetimes_and_labels(source, expected):
+    assert _rust_tokens(source, "test skeleton") == expected
+
+
+@pytest.mark.parametrize(
+    "control",
+    ["loop", "while true", "while let Some(value) = Some(1)", "for value in 0..1", ""],
+)
+@pytest.mark.parametrize("terminator", ["", ";"])
+def test_dual_view_loader_keeps_labeled_control_children_and_following_sibling(
+    control, terminator
+):
+    record = fn_record(0, "labeled", "labeled", [], transformation_labels=[0, 1, 2])
+    record["baseline"]["skeleton"] = (
+        "unsafe fn labeled() {\n"
+        "    #[proctor(0)]\n"
+        f"    'retry: {control} {{\n"
+        "        #[proctor(1)]\n"
+        "        break 'retry;\n"
+        f"    }}{terminator}\n"
+        "    #[proctor(2)]\n"
+        "    let value: i32 = 1;\n"
+        "}"
+    )
+    record["baseline"]["statement_dispositions"] = [
+        {
+            "label": 0,
+            "disposition": "transform",
+            "children": [{"label": 1, "disposition": "transform", "children": []}],
+        },
+        {"label": 2, "disposition": "transform", "children": []},
+    ]
+    record["applied"] = copy.deepcopy(record["baseline"])
+    assert loaded([record])[0].baseline.transform_labels == (0, 1, 2)
+
+    record["applied"]["skeleton"] = record["applied"]["skeleton"].replace(
+        "'retry", "'other"
+    )
+    with pytest.raises(SkeletonError, match="control topology"):
+        loaded([record])
 
 
 def test_dual_view_loader_keeps_tail_children_in_their_control_branch():
