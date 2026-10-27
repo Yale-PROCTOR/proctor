@@ -2,7 +2,7 @@
 id = "local_transformation"
 version = 1
 description = "Transform one Rust function SCC against Crat skeletons."
-variables = ["dependency_context", "transformation_targets", "repair_context", "use_xj_scanf_guidance", "libc_guidance", "printf_guidance", "proctor_libc_call_guidance", "foreign_static_guidance"]
+variables = ["dependency_context", "transformation_targets", "repair_context", "repair_base", "use_xj_scanf_guidance", "libc_guidance", "printf_guidance", "proctor_libc_call_guidance", "foreign_static_guidance"]
 +++
 You are transforming unsafe Rust functions generated from C.
 
@@ -75,7 +75,8 @@ Requirements:
 11. {% set cast_guidance %}{% include "partials/bytemuck.jinja" %}{% endset %}{{ cast_guidance | trim | indent(4) }}
 12. Do not introduce an explicit `unsafe` block or a statement or expression
     attribute other than the required `#[proctor(N)]` labels.
-13. Return exactly one Rust code block delimited by triple-backtick fences.
+{% if repair_base is not none %}13. {% set patch_guidance %}{% include "partials/repair_patch.jinja" %}{% endset %}{{ patch_guidance | trim | indent(4) }}
+{% else %}13. Return exactly one Rust code block delimited by triple-backtick fences.
     Include all requested functions and no prose. Do not use tilde or
     longer-backtick fences.
 
@@ -132,7 +133,7 @@ unsafe fn read_value(mut p: &[i32], mut q: Option<&i32>) -> i32 {
 }
 ```
 
-{% if dependency_context %}## Dependency Context
+{% endif %}{% if dependency_context %}## Dependency Context
 
 {{ dependency_context }}
 
