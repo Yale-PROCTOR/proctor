@@ -1080,7 +1080,10 @@ def _rust_tokens(source: str, where: str) -> tuple[str, ...]:
             continue
 
         if character == "'":
-            character_literal = re.match(r"'(?:\\.|[^'\\])+'", source[index:])
+            character_literal = re.match(
+                r"'(?:[^'\\\r\n\t]|\\(?:[nrt0\\'\"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}))'",
+                source[index:],
+            )
             if character_literal is not None:
                 token = character_literal.group(0)
                 tokens.append(token)
@@ -1268,6 +1271,16 @@ def _statement_end(
     tokens: tuple[str, ...], start: int, limit: int, where: str
 ) -> tuple[int, str, tuple[str, ...], tuple[tuple[str, int, int], ...]]:
     root = tokens[start]
+    if (
+        start + 2 < limit
+        and re.fullmatch(r"'[A-Za-z_][A-Za-z0-9_]*", root) is not None
+        and tokens[start + 1] == ":"
+        and tokens[start + 2] in {"{", "while", "for", "loop"}
+    ):
+        end, kind, declaration, slots = _control_details(
+            tokens, start + 2, limit, where
+        )
+        return end, kind, (*tokens[start : start + 2], *declaration), slots
     if root == "{" or root in {"if", "while", "for", "loop", "match"}:
         return _control_details(tokens, start, limit, where)
     macro = _top_level_token(tokens, start, limit, {"!"})
