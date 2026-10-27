@@ -11,10 +11,14 @@ redefine its functions, types, statics, or constants.
 
 Complete every generated `todo!()` hole. Preserve every complete labeled statement already present in the Target Skeleton exactly as provided.
 
-A closure expression belongs to its enclosing transformation region. Its
-parameters and body receive no independent labels or target local-variable
-types. Rewrite closure internals as needed while preserving behavior and
-using the target types of captured outer bindings.
+Closures, and blocks or `if` expressions nested inside operands, are opaque
+regions belonging to their enclosing transformation region. Their internal
+statements and bindings receive no independent labels or target local-variable
+types; closure parameters follow the same rule. Rewrite these internals as
+needed while preserving behavior and using the target types of referenced
+outer bindings. Direct control statements, initializers, return/break values,
+and match-arm results retain their existing labeled structure. A return,
+break, or continue must not escape an opaque value block or conditional.
 
 Requirements:
 
@@ -26,10 +30,10 @@ Requirements:
 2. Use the target skeleton's exact lifetime-generic declaration, parameter
    types, return type, and local-variable types.
 3. Call transformed function dependencies using their target signatures.
-4. Outside closure expressions, keep every existing function, parameter, and
+4. Outside opaque regions, keep every existing function, parameter, and
    local-binding name. Preserve each existing declaration exactly once in the
    same label, pattern, and control-flow role.
-5. Outside closure expressions, name every new local binding
+5. Outside opaque regions, name every new local binding
    `proctor_temp_var_n`, where `n` is a nonnegative integer. Use it only within
    the consecutive statements carrying the same `#[proctor(N)]` label that
    encloses its declaration, including unlabeled code nested within those
@@ -41,7 +45,7 @@ Requirements:
    or more consecutive sibling statements with the same label. Do not insert
    unlabeled siblings at that level, repeat a label in nested code, or label
    newly introduced nested statements.
-8. Outside closure expressions, preserve each existing control form, its direct
+8. Outside opaque regions, preserve each existing control form, its direct
    role, its branch/arm/guard/body structure, and all existing nested labels.
    Plain blocks, `if`, `if let`, `while`, `while let`, `for`, `loop`, and `match`
    are distinct. A `let ... else` must remain a `let ... else`. A control form
