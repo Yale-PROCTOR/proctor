@@ -9,6 +9,8 @@ from model import CallableCorrespondence, ItemRecord, SkeletonView, StatementDis
 from proctor.llm.types import Message, Request, RequestMetadata
 from proctor.prompts.library import PromptLibrary, RenderedPrompt
 
+PROMPT_VERSION = 1
+
 NO_FENCE_DIAGNOSTIC = (
     "The LLM response contained no triple-backtick fenced code block; return "
     "exactly one triple-backtick fenced Rust code block."
@@ -36,6 +38,7 @@ class PromptRenderInput:
     printf_guidance: str = ""
     proctor_libc_call_guidance: str = ""
     foreign_static_guidance: str = ""
+    unstructured: bool = False
 
 
 def extract_code_block(response: str) -> Extraction:
@@ -177,9 +180,20 @@ def render_prompt(
     value: PromptRenderInput, prompt_dir: Path | None = None
 ) -> RenderedPrompt:
     directory = prompt_dir or Path(__file__).parent / "prompts"
-    template = PromptLibrary(directory).get("local_transformation", version=1)
+    template = PromptLibrary(directory).get(
+        "unstructured_repair" if value.unstructured else "local_transformation",
+        version=PROMPT_VERSION,
+    )
     repair = ""
-    if value.failed_transformation is not None and value.diagnostics is not None:
+    if value.unstructured and value.diagnostics is not None:
+        if value.failed_transformation is not None:
+            repair = (
+                "Previous failed target:\n\n```rust\n"
+                + value.failed_transformation
+                + "\n```\n\n"
+            )
+        repair += f"Diagnostics:\n\n```text\n{value.diagnostics}\n```\n\nRegenerate every requested function."
+    elif value.failed_transformation is not None and value.diagnostics is not None:
         repair = repair_context(value.failed_transformation, value.diagnostics)
     return template.render(
         dependency_context=value.dependency_context,

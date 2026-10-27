@@ -332,6 +332,49 @@ class CratTools:
             output,
         )
 
+    def prepare_unstructured(self, frozen: Path, request: Path, output: Path) -> None:
+        assert self.crat_tool is not None
+        self._validate_project_outputs((output,), (), (frozen, request))
+        self._output_operation(
+            "crat-tool prepare-unstructured-repair",
+            [
+                str(self.crat_tool),
+                "prepare-unstructured-repair",
+                "--frozen",
+                str(frozen),
+                "--request",
+                str(request),
+                "--output",
+                str(output),
+            ],
+            output,
+        )
+
+    def replace_unstructured(
+        self, analysis: Path, current: Path, frozen: Path, request: Path, output: Path
+    ) -> None:
+        assert self.crat_tool is not None
+        self._validate_project_outputs(
+            (output,), (analysis, current), (frozen, request)
+        )
+        self._output_operation(
+            "crat-tool replace-unstructured-scc",
+            [
+                str(self.crat_tool),
+                "replace-unstructured-scc",
+                "--frozen",
+                str(frozen),
+                "--request",
+                str(request),
+                "--current-project",
+                str(current),
+                "--output",
+                str(output),
+                str(analysis),
+            ],
+            output,
+        )
+
     def merge_observations(self, inputs: tuple[Path, ...], output: Path) -> None:
         assert self.crat_tool is not None
         self._output_operation(
