@@ -1,0 +1,11 @@
+Return only one Codex-style apply_patch patch, without Markdown fences or prose.
+Begin with `*** Begin Patch`, then `*** Update File: transformation.rs`,
+and end with `*** End Patch`. No other file, creation, deletion, or move is allowed.
+Use `@@` hunks, optionally followed by an exact preceding function or context line.
+Do not use line numbers. Prefix unchanged lines with a space, removed lines with
+`-`, and added lines with `+`. Copy whitespace exactly. Include about three
+unchanged lines around each edit, adding context or anchors until each location
+is unique. Keep hunks in source order without overlapping context. An optional
+`*** End of File` after the final hunk anchors it to the end of the base.
+Make only the changes needed to address the diagnostics. All hunks must apply
+to the displayed Repair Base; do not patch the source reference or target skeleton.

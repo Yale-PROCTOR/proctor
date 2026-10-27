@@ -12,8 +12,7 @@ from proctor.prompts.library import PromptLibrary, RenderedPrompt
 PROMPT_VERSION = 1
 
 NO_FENCE_DIAGNOSTIC = (
-    "The LLM response contained no triple-backtick fenced code block; return "
-    "exactly one triple-backtick fenced Rust code block."
+    "The initial LLM response contained no triple-backtick fenced Rust code block."
 )
 
 _OPENING = re.compile(r"(?m)^```(?!`)([A-Za-z0-9_+-]+)?(?:\r\n|\n)")
@@ -31,7 +30,7 @@ class Extraction:
 class PromptRenderInput:
     dependency_context: str
     transformation_targets: str
-    failed_transformation: str | None = None
+    repair_base: str | None = None
     diagnostics: str | None = None
     use_xj_scanf_guidance: bool = False
     libc_guidance: str = ""
@@ -39,6 +38,7 @@ class PromptRenderInput:
     proctor_libc_call_guidance: str = ""
     foreign_static_guidance: str = ""
     unstructured: bool = False
+    patch_failure: tuple[str, str] | None = None
 
 
 def extract_code_block(response: str) -> Extraction:
@@ -165,15 +165,26 @@ def skeleton_view_value(value: SkeletonView) -> dict[str, object]:
     }
 
 
-def repair_context(failed_transformation: str, diagnostics: str) -> str:
-    return (
-        "The previous transformation failed.\n\n"
-        "Previous transformation:\n\n"
-        f"```rust\n{failed_transformation}\n```\n\n"
-        "Diagnostics:\n\n"
-        f"```text\n{diagnostics}\n```\n\n"
-        "Regenerate every function in Transformation Targets."
+def repair_context(
+    base: str, diagnostics: str | None, patch_failure: tuple[str, str] | None
+) -> str:
+    text = (
+        "## Repair Base: `transformation.rs`\n\n"
+        "Apply your patch only to this exact virtual file. The requirements above "
+        "apply to the reconstructed code; unchanged functions are retained.\n\n"
+        f"```rust\n{base}\n```"
     )
+    if diagnostics is not None:
+        text += f"\n\nDiagnostics:\n\n```text\n{diagnostics}\n```"
+    if patch_failure is not None:
+        patch, error = patch_failure
+        text += (
+            f"\n\nPrevious rejected patch:\n\n```text\n{patch}\n```\n\n"
+            f"Patch application diagnostics:\n\n```text\n{error}\n```\n\n"
+            "The rejected patch was not applied. Return a corrected patch against "
+            "the unchanged Repair Base."
+        )
+    return text
 
 
 def render_prompt(
@@ -184,21 +195,16 @@ def render_prompt(
         "unstructured_repair" if value.unstructured else "local_transformation",
         version=PROMPT_VERSION,
     )
-    repair = ""
-    if value.unstructured and value.diagnostics is not None:
-        if value.failed_transformation is not None:
-            repair = (
-                "Previous failed target:\n\n```rust\n"
-                + value.failed_transformation
-                + "\n```\n\n"
-            )
-        repair += f"Diagnostics:\n\n```text\n{value.diagnostics}\n```\n\nRegenerate every requested function."
-    elif value.failed_transformation is not None and value.diagnostics is not None:
-        repair = repair_context(value.failed_transformation, value.diagnostics)
+    repair = (
+        repair_context(value.repair_base, value.diagnostics, value.patch_failure)
+        if value.repair_base is not None
+        else ""
+    )
     return template.render(
         dependency_context=value.dependency_context,
         transformation_targets=value.transformation_targets,
         repair_context=repair,
+        repair_base=value.repair_base,
         use_xj_scanf_guidance=value.use_xj_scanf_guidance,
         libc_guidance=value.libc_guidance,
         printf_guidance=value.printf_guidance,
