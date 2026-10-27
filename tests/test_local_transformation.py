@@ -3128,10 +3128,15 @@ def test_additive_command_builders_keep_analysis_and_current_roles_distinct():
     ]
 
 
-def test_cargo_build_selects_library_for_incremental_checks(tmp_path):
+def test_cargo_build_selects_library_for_incremental_checks(tmp_path, monkeypatch):
+    for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"):
+        monkeypatch.delenv(key, raising=False)
     commands = []
 
     def runner(command, *, cwd=None, env=None):
+        assert "RUSTFLAGS" not in env
+        assert "CARGO_ENCODED_RUSTFLAGS" not in env
+        assert env["CARGO_BUILD_RUSTFLAGS"] == "-Awarnings"
         commands.append((command, cwd))
         return CommandResult(0)
 
@@ -3141,8 +3146,8 @@ def test_cargo_build_selects_library_for_incremental_checks(tmp_path):
     tools.cargo_build(project, library_only=True)
     tools.cargo_build(project)
     assert commands == [
-        (["cargo", "build", "--lib", "-j", "1"], project),
-        (["cargo", "build"], project),
+        (["cargo", "build", "--quiet", "--lib", "-j", "1"], project),
+        (["cargo", "build", "--quiet"], project),
     ]
 
 
@@ -9822,7 +9827,7 @@ def test_private_cargo_directories_override_environment_and_project_config(
         assert worker.environment["CARGO_TARGET_DIR"] == str(project / "target")
         assert worker.environment["CARGO_BUILD_BUILD_DIR"] == str(project / "target")
     assert [command for command, _, _ in commands] == [
-        ["cargo", "build", "--lib", "-j", "1"]
+        ["cargo", "build", "--quiet", "--lib", "-j", "1"]
     ] * 2
     assert [target for _, _, target in commands] == [
         str(project / "target") for project in projects
