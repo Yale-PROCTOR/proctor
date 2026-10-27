@@ -1,0 +1,21 @@
+id = "crat_repair"
+version = "0.1.0"
+description = "Run fixed Crat passes with compilation checks and bounded agent repair."
+exec = ["python3", "main.py"]
+warmup = ["python3", "main.py", "--build-only"]
+
+[requires]
+rust_project = "required"
+
+[produces]
+rust_project = true
+
+[config]
+enable_interface = { type = "bool", default = false, doc = "run the interface pass between simpl and unsafe" }
+agent = { type = "string", default = "opencode", doc = "discipline-repair coding agent driver" }
+model = { type = "string", doc = "agent model identifier, including the provider prefix for OpenCode" }
+max_repair_attempts = { type = "integer", default = 3, doc = "maximum agent invocations for each failed pass build" }
+crat_timeout_s = { type = "number", default = 600, doc = "timeout for each Crat command" }
+build_timeout_s = { type = "number", default = 600, doc = "timeout for each Cargo command and tool build" }
+agent_timeout_s = { type = "number", default = 900, doc = "timeout for each complete agent invocation" }
+crat_dir = { type = "string", default = "../crat", doc = "Crat checkout, relative to this stage" }

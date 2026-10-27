@@ -1,0 +1,25 @@
+[run]
+provides = ["c_project"]
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = ["c2rust", "crat_repair"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat_repair]
+uses = "stages/crat-repair"
+timeout_s = 14400
+
+[stages.crat_repair.config]
+enable_interface = false
+agent = "opencode"
+model = "openrouter/openai/gpt-5.6-terra"
+max_repair_attempts = 3
+crat_timeout_s = 600
+build_timeout_s = 600
+agent_timeout_s = 900

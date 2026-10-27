@@ -19,6 +19,17 @@ def main() -> int:
         "path", type=Path, help="tarball or directory containing tarballs"
     )
     parser.add_argument("--rule-set", type=Path, help="rule set JSON file")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--with-non-local",
+        action="store_true",
+        help="include test generation, abstraction recovery, and discipline repair",
+    )
+    mode.add_argument(
+        "--crat-only",
+        action="store_true",
+        help="run C2Rust and the Crat repair stage without local transformation",
+    )
     args = parser.parse_args()
 
     target = args.path.resolve()
@@ -39,6 +50,14 @@ def main() -> int:
             parser.error(f"not a file: {args.rule_set}")
         rule_set = str(rule_set_path)
         name_prefix = f"rule_{rule_set_path.stem}_"
+
+    config = "configs/c2rust_crat_local.toml"
+    if args.crat_only:
+        config = "configs/c2rust_crat_repair.toml"
+        name_prefix = f"crat_only_{name_prefix}"
+    elif args.with_non_local:
+        config = "configs/c2rust_crat_testgen_absrec_disrep_local.toml"
+        name_prefix = f"non_local_{name_prefix}"
 
     proctor_root = Path(__file__).resolve().parent.parent
     runs_directory = proctor_root / "runs"
@@ -82,7 +101,7 @@ def main() -> int:
             "proctor",
             "run",
             "-c",
-            "configs/c2rust_crat_local.toml",
+            config,
             "--input-c",
             str(tarball),
             "--name",
