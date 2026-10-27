@@ -1,0 +1,54 @@
+When a listed foreign reference is `scanf`, `fscanf`, or `sscanf`, use
+`xj_scanf::legacy::scanf`, `xj_scanf::legacy::brscanf`, or
+`xj_scanf::legacy::bscanf`, respectively. Whenever the format, target
+types, and transformed input type are supported, replace the foreign call
+with that function instead of reimplementing scanning. Otherwise preserve
+the foreign call. The function signatures are:
+
+```rust
+pub fn scanf(
+    format: &str,
+    args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],
+) -> i32;
+pub fn brscanf<R: std::io::BufRead>(
+    reader: R,
+    format: &str,
+    args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],
+) -> i32;
+pub fn bscanf(
+    input: &[u8],
+    format: &str,
+    args: &mut [&mut dyn xj_scanf::legacy::ScanTarget],
+) -> i32;
+```
+
+Integer conversions are `%d`, `%i`, `%o`, `%u`, `%x`, and `%X`; `%i`
+detects decimal, octal, or hexadecimal prefixes. Floating-point
+conversions are `%f`, `%F`, `%e`, `%E`, `%g`, `%G`, `%a`, and `%A`. `%c`
+reads a fixed number of characters, defaulting to one; `%s` reads
+non-whitespace characters; and `%[...]` and `%[^...]` match a character
+set or its inverse. `%n` stores the number of characters consumed, and
+`%%` matches a literal percent sign. `*` suppresses assignment, a decimal
+field width limits the bytes scanned, and the length modifiers are `hh`
+for integer `char`, `h` for integer `short`, `l` for integer `long` or
+floating-point `double`, `ll` for integer `long long`, `L` for
+floating-point `long double`, `j` for integer `intmax_t`, `t` for integer
+`ptrdiff_t`, and `z` for integer `size_t`.
+
+Supply mutable targets in conversion order.
+`xj_scanf::legacy::ScanTarget` is implemented for `i8`, `i16`, `i32`,
+`i64`, `u8`, `u16`, `u32`, `u64`, `usize`, `f32`, `f64`, `char`, `String`,
+`Vec<u8>`, and `&mut [u8]`; storing fails when a scanned value's type does
+not match its target. The functions return the number of successful
+assignments, `0` when available input fails the first conversion, and
+`-1` for EOF before any conversion. `scanf` reads standard input,
+`brscanf` accepts a `std::io::BufRead`, and `bscanf` accepts a byte slice.
+
+These signatures are reference material only. Do not define or import any
+item for these calls, including `ScanTarget`. Call the selected function
+through its fully qualified path. For example, with `input: &[u8]`,
+`x: i32`, and `y: f32`:
+
+```rust
+xj_scanf::legacy::bscanf(input, "%d %f", &mut [&mut x, &mut y])
+```

@@ -135,7 +135,9 @@ def classify_printf_specifiers(
     return ordered, space_sign
 
 
-def render_printf_guidance(specifiers: Iterable[str]) -> str:
+def render_printf_guidance(
+    specifiers: Iterable[str], *, unstructured: bool = False
+) -> str:
     specifiers = tuple(specifiers)
     families, space_sign = classify_printf_specifiers(specifiers)
     if not families:
@@ -157,6 +159,13 @@ def render_printf_guidance(specifiers: Iterable[str]) -> str:
         "argument slots in order and do not swap slots. Pass each value after the C "
         "length conversion."
     )
+    if unstructured:
+        generic_guidance = (
+            "Preserve the original source's printf formatting behavior, including "
+            "width, precision, conversion, and order of consuming values. When using "
+            "Rust formatting, supply argument slots in source order and pass each "
+            "value after the C length conversion."
+        )
     if not selected:
         return generic_guidance
     accepted_types = []

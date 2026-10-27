@@ -47,6 +47,38 @@ def test_missing_variable_is_error() -> None:
         template.render(errors="E0308")
 
 
+def test_included_guidance_uses_strict_variables_and_changes_rendered_hash(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        "greet.md",
+        '+++\nid = "greet"\nversion = 1\nvariables = ["name"]\n+++\n'
+        '{% include "partials/guidance.jinja" %}',
+    )
+    _write(tmp_path / "partials", "guidance.jinja", "hello {{ name }}\n")
+    template = PromptLibrary(tmp_path).get("greet")
+    first = template.render(name="Ada")
+    assert first.text == "hello Ada\n"
+    with pytest.raises(PromptError, match="undefined"):
+        template.render()
+    _write(tmp_path / "partials", "guidance.jinja", "welcome {{ name }}\n")
+    updated = template.render(name="Ada")
+    assert updated.text == "welcome Ada\n"
+    assert updated.content_hash != first.content_hash
+
+
+def test_missing_included_guidance_identifies_the_prompt(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "greet.md",
+        '+++\nid = "greet"\nversion = 1\n+++\n{% include "partials/missing.jinja" %}',
+    )
+    template = PromptLibrary(tmp_path).get("greet")
+    with pytest.raises(PromptError, match="prompt 'greet' v1:.*partials/missing.jinja"):
+        template.render()
+
+
 def test_unknown_variable_is_error() -> None:
     library = PromptLibrary(TEMPLATES)
     template = library.get("compile_error_repair")

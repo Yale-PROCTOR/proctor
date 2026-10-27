@@ -36,9 +36,13 @@ from model import (
     strongly_connected_components,
     load_skeletons,
     load_replacement_metadata,
+    load_unstructured_replacement,
+    UnstructuredReplacement,
+    UnstructuredFailure,
     render_transformation_targets,
 )
 from protocol import (
+    PROMPT_VERSION,
     PromptRenderInput,
     extract_code_block,
     llm_request,
@@ -100,6 +104,8 @@ class Metrics:
     structural_failures: int = 0
     compilation_failures: int = 0
     cargo_builds: int = 0
+    unstructured_repair_calls: int = 0
+    unstructured_scc_count: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -110,6 +116,8 @@ class Metrics:
             "structural_failures": self.structural_failures,
             "compilation_failures": self.compilation_failures,
             "cargo_builds": self.cargo_builds,
+            "unstructured_repair_calls": self.unstructured_repair_calls,
+            "unstructured_scc_count": self.unstructured_scc_count,
         }
 
 
@@ -119,13 +127,14 @@ class RunState:
     config_used: dict[str, Any] = field(default_factory=dict)
     usage_path: Path | None = None
     usage_start: int = 0
-    prompt_used: bool = False
+    prompts_used: set[str] = field(default_factory=set)
     logs: tuple[str, ...] = ()
     statement_pairs: dict[tuple[int, int], AcceptedStatementPair] = field(
         default_factory=dict
     )
     accepted_observation_documents: list[Path] = field(default_factory=list)
     accepted_views: dict[int, SkeletonView] = field(default_factory=dict)
+    unstructured_sccs: set[tuple[int, ...]] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -235,7 +244,14 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
     if not isinstance(config, dict):
         raise StageFailure("stage config must be an object")
     unknown = sorted(
-        set(config) - {"crat_dir", "dump_llm_exchanges", "workers", "max_repairs"}
+        set(config)
+        - {
+            "crat_dir",
+            "dump_llm_exchanges",
+            "workers",
+            "max_repairs",
+            "max_unstructured_repairs",
+        }
     )
     if unknown:
         raise StageFailure(f"unknown local-transformation config keys: {unknown}")
@@ -255,9 +271,19 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
         or max_repairs < 0
     ):
         raise StageFailure("config.max_repairs must be a nonnegative integer")
+    max_unstructured_repairs = config.get("max_unstructured_repairs", 5)
+    if (
+        isinstance(max_unstructured_repairs, bool)
+        or not isinstance(max_unstructured_repairs, int)
+        or max_unstructured_repairs < 0
+    ):
+        raise StageFailure(
+            "config.max_unstructured_repairs must be a nonnegative integer"
+        )
     return {
         "workers": workers,
         "max_repairs": max_repairs,
+        "max_unstructured_repairs": max_unstructured_repairs,
         "crat_dir": str((stage_dir / crat_dir).resolve()),
         "dump_llm_exchanges": dump_llm_exchanges,
     }
@@ -745,10 +771,9 @@ def _output(
         config_used=state.config_used,
         models=_models(records),
         usage=_usage_summary(records),
-        prompts=(
-            (PromptUse(id="local_transformation", version=1),)
-            if state.prompt_used
-            else ()
+        prompts=tuple(
+            PromptUse(id=prompt_id, version=PROMPT_VERSION)
+            for prompt_id in sorted(state.prompts_used)
         ),
         metrics=state.metrics.to_dict(),
         logs=state.logs,
@@ -1326,6 +1351,8 @@ def _statistics_json(state: RunState) -> str:
             state.metrics.llm_generation_calls - state.metrics.repair_calls
         ),
         "llm_repair_calls": state.metrics.repair_calls,
+        "llm_unstructured_repair_calls": state.metrics.unstructured_repair_calls,
+        "unstructured_scc_count": state.metrics.unstructured_scc_count,
         "statements": {
             "total": sum(counts.values()),
             **counts,
@@ -1348,6 +1375,7 @@ def _publish_final_outputs(
     statistics: str = (
         '{\n  "function_scc_count": 0,\n'
         '  "llm_transformation_calls": 0,\n  "llm_repair_calls": 0,\n'
+        '  "llm_unstructured_repair_calls": 0,\n  "unstructured_scc_count": 0,\n'
         '  "statements": {\n    "total": 0,\n    "preserve": 0,\n'
         '    "preserve_shell": 0,\n    "rule_applied": 0,\n'
         '    "transform": 0,\n    "mechanical": 0\n  }\n}\n'
@@ -1501,6 +1529,249 @@ def _replacement_attempt_outputs(paths: tuple[Path, ...]) -> Iterator[None]:
             ) from primary
 
 
+def _load_unstructured_candidate(
+    path: Path,
+    members: tuple[int, ...],
+    records_by_id: dict[int, ItemRecord],
+    frozen: Path,
+) -> UnstructuredReplacement | UnstructuredFailure:
+    result = load_unstructured_replacement(path.read_text(encoding="utf-8"))
+    if isinstance(result, UnstructuredFailure):
+        return result
+    if result.frozen_project_sha256 != hashlib.sha256(frozen.read_bytes()).hexdigest():
+        raise StageFailure("unstructured frozen project digest mismatch")
+    if (
+        result.candidate_sha256
+        != hashlib.sha256(result.source.encode("utf-8")).hexdigest()
+    ):
+        raise StageFailure("unstructured candidate source digest mismatch")
+    expected = tuple(
+        CallableCorrespondence(
+            item_id, records_by_id[item_id].path, records_by_id[item_id].path, None
+        )
+        for item_id in sorted(members)
+    )
+    if result.new_correspondence != expected:
+        raise StageFailure(
+            "unstructured candidate identities differ from the requested SCC"
+        )
+    return result
+
+
+def _process_unstructured_scc(
+    members: tuple[int, ...],
+    records_by_id: dict[int, ItemRecord],
+    *,
+    transformations: list[str],
+    stage_input: StageInput,
+    current: Path,
+    analysis: Path,
+    frozen: Path,
+    library_source: Path,
+    workdir: Path,
+    tools: Any,
+    client: Any,
+    tracker: UsageTracker,
+    exchange_root: Path | None,
+    max_repairs: int,
+    state: RunState,
+) -> None:
+    preparation_request = workdir / "unstructured-preparation-request.json"
+    preparation_output = workdir / "unstructured-preparation.json"
+    write_json(
+        preparation_request,
+        {"members": list(members), "transformations": transformations},
+    )
+    tools.prepare_unstructured(frozen, preparation_request, preparation_output)
+    prepared = json.loads(preparation_output.read_text(encoding="utf-8"))
+    if not isinstance(prepared, dict) or set(prepared) != {"targets", "candidate"}:
+        raise StageFailure("invalid unstructured preparation response")
+    targets = prepared["targets"]
+    if not isinstance(targets, list) or len(targets) != len(members):
+        raise StageFailure(
+            "unstructured preparation must cover exactly the requested SCC"
+        )
+    for item_id, target in zip(sorted(members), targets, strict=True):
+        record = records_by_id[item_id]
+        if (
+            not isinstance(target, dict)
+            or set(target) != {"id", "path", "name", "source", "signature"}
+            or isinstance(target["id"], bool)
+            or not isinstance(target["id"], int)
+            or target["id"] != item_id
+            or target["path"] != record.path
+            or target["name"] != record.name
+            or target["signature"] != record.target_signature
+            or not isinstance(target["source"], str)
+            or not target["source"]
+        ):
+            raise StageFailure(
+                "unstructured preparation target differs from the frozen interface"
+            )
+    transformation = prepared["candidate"]
+    if transformation is not None and not isinstance(transformation, str):
+        raise StageFailure(
+            "unstructured preparation candidate must be a string or null"
+        )
+    target_text = "\n\n".join(
+        f"### Function `{target['name']}`\n\nSource:\n```rust\n{target['source']}\n```\n"
+        f"Target signature:\n```rust\n{target['signature']}\n```"
+        for target in targets
+    )
+    context, _ = dependency_context(members, records_by_id, limit=CONTEXT_LIMIT)
+    printf_guidance = render_printf_guidance(
+        (
+            specifier
+            for item_id in members
+            for specifier in records_by_id[item_id].printf_format_specifiers
+        ),
+        unstructured=True,
+    )
+    latest_failed: str | None = None
+    diagnostics: str | None = None
+    seen_results: dict[tuple[bool, str], int] = {}
+    calls = 0
+    response_path = workdir / "unstructured-response.json"
+    while True:
+        if transformation is None:
+            if calls == max_repairs:
+                raise StageFailure(
+                    f"SCC {','.join(map(str, members))} exhausted {max_repairs} unstructured repair calls"
+                )
+            calls += 1
+            rendered = render_prompt(
+                PromptRenderInput(
+                    dependency_context=context,
+                    transformation_targets=target_text,
+                    failed_transformation=latest_failed,
+                    diagnostics=diagnostics,
+                    use_xj_scanf_guidance=_uses_xj_scanf_guidance(
+                        members, records_by_id
+                    ),
+                    libc_guidance=_libc_guidance(members, records_by_id),
+                    printf_guidance=printf_guidance,
+                    proctor_libc_call_guidance=_proctor_libc_call_guidance(
+                        members, records_by_id
+                    ),
+                    foreign_static_guidance=_foreign_static_guidance(
+                        members, records_by_id
+                    ),
+                    unstructured=True,
+                )
+            )
+            request = llm_request(rendered, run_id=stage_input.run_id, members=members)
+            exchange_dir = None
+            if exchange_root is not None:
+                scc = "_".join(map(str, sorted(members)))
+                exchange_dir = (
+                    exchange_root / f"scc-{scc}" / f"unstructured-{calls:02d}"
+                )
+                exchange_dir.mkdir(parents=True, exist_ok=True)
+                (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
+            state.prompts_used.add(rendered.id)
+            state.metrics.llm_generation_calls += 1
+            state.metrics.repair_calls += 1
+            state.metrics.unstructured_repair_calls += 1
+            before = tracker.record_count
+            started = time.monotonic()
+            try:
+                response = client.complete(request)
+            except Exception as exc:
+                if tracker.record_count == before:
+                    tracker.record(
+                        metadata=request.metadata,
+                        provider=str(
+                            stage_input.framework.llm.get("provider", "unknown")
+                        ),
+                        model=str(stage_input.framework.llm.get("model", "")),
+                        usage=None,
+                        latency_s=time.monotonic() - started,
+                        finish_reason="error",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
+            _record_untracked_response(tracker, before, request, response)
+            if exchange_dir is not None:
+                (exchange_dir / "response.md").write_text(
+                    response.text, encoding="utf-8"
+                )
+            extraction = extract_code_block(response.text)
+            transformation = extraction.candidate
+            result = (
+                transformation is not None,
+                transformation if transformation is not None else response.text,
+            )
+            if result in seen_results:
+                (workdir / "last-failed-transformation.txt").write_text(
+                    result[1], encoding="utf-8"
+                )
+                raise StageFailure(
+                    f"SCC {','.join(map(str, members))} repeated unstructured transformation "
+                    f"at attempt {calls} (first seen at attempt {seen_results[result]})"
+                )
+            seen_results[result] = calls
+            if transformation is None:
+                state.metrics.structural_failures += 1
+                diagnostics = extraction.diagnostics
+                (workdir / "last-failed-transformation.txt").write_text(
+                    response.text, encoding="utf-8"
+                )
+                continue
+        else:
+            seen_results[(True, transformation)] = 0
+        request_path = workdir / "unstructured-request.json"
+        write_json(
+            request_path, {"members": list(members), "transformation": transformation}
+        )
+        tools.replace_unstructured(
+            analysis, current, frozen, request_path, response_path
+        )
+        result = _load_unstructured_candidate(
+            response_path, members, records_by_id, frozen
+        )
+        if isinstance(result, UnstructuredFailure):
+            state.metrics.structural_failures += 1
+            latest_failed = result.failed_transformation
+            diagnostics = result.diagnostics
+        else:
+            candidate = workdir / "unstructured-candidate.rs"
+            with _replacement_attempt_outputs((candidate,)):
+                candidate.write_text(result.source, encoding="utf-8")
+                state.metrics.cargo_builds += 1
+                build = install_candidate_transaction(
+                    library_source,
+                    candidate,
+                    workdir / "rollback",
+                    lambda: tools.cargo_build(current, library_only=True),
+                )
+            if build.returncode == 0:
+                if (
+                    hashlib.sha256(library_source.read_bytes()).hexdigest()
+                    != result.candidate_sha256
+                ):
+                    raise StageFailure(
+                        "successful cargo build changed unstructured candidate source bytes"
+                    )
+                shutil.copyfile(library_source, workdir / "accepted.rs")
+                shutil.copyfile(response_path, workdir / "accepted-unstructured.json")
+                state.unstructured_sccs.add(members)
+                state.metrics.unstructured_scc_count += 1
+                return
+            state.metrics.compilation_failures += 1
+            latest_failed = transformation
+            diagnostics = f"cargo build --lib stdout:\n{build.stdout}\ncargo build --lib stderr:\n{build.stderr}"
+            (workdir / "compiler-diagnostics.txt").write_text(
+                diagnostics, encoding="utf-8"
+            )
+        (workdir / "last-failed-transformation.txt").write_text(
+            transformation, encoding="utf-8"
+        )
+        (workdir / "unstructured-diagnostics.txt").write_text(
+            diagnostics, encoding="utf-8"
+        )
+        transformation = None
+
+
 def _process_scc(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
@@ -1516,6 +1787,7 @@ def _process_scc(
     tracker: UsageTracker,
     exchange_root: Path | None,
     max_repairs: int,
+    max_unstructured_repairs: int,
     state: RunState,
 ) -> None:
     duplicate_names: dict[str, list[ItemRecord]] = {}
@@ -1548,6 +1820,8 @@ def _process_scc(
     latest_failed: str | None = None
     latest_diagnostics: str | None = None
     seen_results: dict[tuple[bool, str], int] = {}
+    transformations: list[str] = []
+    stopping_reason: str | None = None
     generation = 0
     mechanical = not any(view.needs_transformation for view in active_views.values())
 
@@ -1557,6 +1831,7 @@ def _process_scc(
             transformation = "\n\n".join(
                 active_views[item_id].skeleton for item_id in sorted(members)
             )
+            transformations.append(transformation)
         else:
             if context is None:
                 context, _ = dependency_context(
@@ -1586,7 +1861,7 @@ def _process_scc(
                 )
                 exchange_dir.mkdir(parents=True, exist_ok=True)
                 (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
-            state.prompt_used = True
+            state.prompts_used.add(rendered.id)
             state.metrics.llm_generation_calls += 1
             before = tracker.record_count
             started = time.monotonic()
@@ -1618,16 +1893,18 @@ def _process_scc(
                 if extraction.candidate is not None
                 else response.text,
             )
+            transformations.append(result[1])
             previous_generation = seen_results.get(result)
             if previous_generation is not None:
                 (workdir / "last-failed-transformation.txt").write_text(
                     result[1], encoding="utf-8"
                 )
-                raise StageFailure(
+                stopping_reason = (
                     f"SCC {','.join(map(str, members))} repeated transformation "
                     f"at generation {generation} (first seen at generation "
                     f"{previous_generation})"
                 )
+                break
             seen_results[result] = generation
             if extraction.candidate is None:
                 state.metrics.structural_failures += 1
@@ -1821,9 +2098,31 @@ def _process_scc(
         latest_diagnostics = diagnostics
         generation += 1
 
-    raise StageFailure(
-        f"SCC {','.join(map(str, members))} exhausted {max_repairs} repair calls"
+    stopping_reason = (
+        stopping_reason
+        or f"SCC {','.join(map(str, members))} exhausted {max_repairs} repair calls"
     )
+    if max_unstructured_repairs:
+        (workdir / "structured-stop.txt").write_text(stopping_reason, encoding="utf-8")
+        _process_unstructured_scc(
+            members,
+            records_by_id,
+            transformations=transformations,
+            stage_input=stage_input,
+            current=current,
+            analysis=analysis,
+            frozen=frozen,
+            library_source=library_source,
+            workdir=workdir,
+            tools=tools,
+            client=client,
+            tracker=tracker,
+            exchange_root=exchange_root,
+            max_repairs=max_unstructured_repairs,
+            state=state,
+        )
+        return
+    raise StageFailure(stopping_reason)
 
 
 def _merge_job_state(state: RunState, job: RunState) -> None:
@@ -1833,7 +2132,8 @@ def _merge_job_state(state: RunState, job: RunState) -> None:
             name,
             getattr(state.metrics, name) + getattr(job.metrics, name),
         )
-    state.prompt_used |= job.prompt_used
+    state.prompts_used.update(job.prompts_used)
+    state.unstructured_sccs.update(job.unstructured_sccs)
     state.statement_pairs.update(job.statement_pairs)
     state.accepted_observation_documents.extend(job.accepted_observation_documents)
     state.accepted_views.update(job.accepted_views)
@@ -1930,6 +2230,9 @@ def _run_scc_workers(
                     tracker=tracker,
                     exchange_root=exchange_root,
                     max_repairs=state.config_used["max_repairs"],
+                    max_unstructured_repairs=state.config_used[
+                        "max_unstructured_repairs"
+                    ],
                     state=job,
                 )
                 accepted[job_index] = (members, jobdir / "accepted.rs")
@@ -2096,6 +2399,20 @@ def run_stage(
             )
         for members, accepted_source in accepted:
             accepted_dir = accepted_source.parent
+            if members in state.unstructured_sccs:
+                result = _load_unstructured_candidate(
+                    accepted_dir / "accepted-unstructured.json",
+                    members,
+                    records_by_id,
+                    frozen,
+                )
+                if (
+                    isinstance(result, UnstructuredFailure)
+                    or hashlib.sha256(accepted_source.read_bytes()).hexdigest()
+                    != result.candidate_sha256
+                ):
+                    raise StageFailure("accepted unstructured source digest mismatch")
+                continue
             _load_and_validate_replacement_metadata(
                 accepted_dir / "accepted-replacement-observation-metadata.json",
                 accepted_source,
