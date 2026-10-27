@@ -586,8 +586,24 @@ class CratTools:
     def cargo_build(
         self, current_project: Path, *, library_only: bool = False
     ) -> CommandResult:
-        command = ["cargo", "build", *(["--lib", "-j", "1"] if library_only else [])]
+        command = [
+            "cargo",
+            "build",
+            "--quiet",
+            *(["--lib", "-j", "1"] if library_only else []),
+        ]
         environment = _cargo_build_env(self.target_dir or current_project / "target")
+        encoded_rustflags = environment.get("CARGO_ENCODED_RUSTFLAGS")
+        if encoded_rustflags is not None:
+            environment["CARGO_ENCODED_RUSTFLAGS"] = (
+                f"{encoded_rustflags}\x1f-Awarnings"
+                if encoded_rustflags
+                else "-Awarnings"
+            )
+        else:
+            # The Cargo config key preserves configured build.rustflags.
+            key = "RUSTFLAGS" if "RUSTFLAGS" in environment else "CARGO_BUILD_RUSTFLAGS"
+            environment[key] = f"{environment.get(key, '')} -Awarnings".strip()
         result = self.run_command(command, cwd=current_project, env=environment)
         with self.log_path.open("a", encoding="utf-8") as log:
             log.write(f"$ {' '.join(command)}\n")
