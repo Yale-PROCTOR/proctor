@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import tomllib
-from jinja2 import Environment, StrictUndefined
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from jinja2 import exceptions as jinja_exceptions
 
 
@@ -50,13 +50,15 @@ class PromptTemplate:
             raise PromptError(
                 f"prompt '{self.id}' got unknown variables: {sorted(unknown)}"
             )
-        env = Environment(undefined=StrictUndefined, keep_trailing_newline=True)
+        env = Environment(
+            loader=FileSystemLoader(self.source.parent),
+            undefined=StrictUndefined,
+            keep_trailing_newline=True,
+        )
         try:
             text = env.from_string(self.body).render(**params)
-        except jinja_exceptions.UndefinedError as exc:
-            raise PromptError(
-                f"prompt '{self.id}' v{self.version}: {exc.message}"
-            ) from exc
+        except jinja_exceptions.TemplateError as exc:
+            raise PromptError(f"prompt '{self.id}' v{self.version}: {exc}") from exc
         return RenderedPrompt(
             id=self.id,
             version=self.version,

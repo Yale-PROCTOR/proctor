@@ -66,6 +66,70 @@ class ReplacementMetadata:
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
+@dataclass(frozen=True)
+class UnstructuredFailure:
+    diagnostics: str
+    failed_transformation: str | None
+
+
+@dataclass(frozen=True)
+class UnstructuredReplacement:
+    source: str
+    candidate_sha256: str
+    frozen_project_sha256: str
+    new_correspondence: tuple[CallableCorrespondence, ...]
+
+
+def load_unstructured_replacement(
+    text: str,
+) -> UnstructuredReplacement | UnstructuredFailure:
+    value = json.loads(text)
+    if isinstance(value, dict) and value.get("status") == "invalid":
+        value = _exact_object(
+            value,
+            {"status", "diagnostics", "failed_transformation"},
+            "unstructured response",
+        )
+        diagnostics = value["diagnostics"]
+        if not isinstance(diagnostics, str) or not diagnostics:
+            raise ObservationError("unstructured diagnostics must be a nonempty string")
+        failed = value["failed_transformation"]
+        if failed is not None and not isinstance(failed, str):
+            raise ObservationError(
+                "unstructured failed_transformation must be a string or null"
+            )
+        return UnstructuredFailure(diagnostics, failed)
+    value = _exact_object(
+        value,
+        {
+            "status",
+            "source",
+            "candidate_sha256",
+            "frozen_project_sha256",
+            "new_correspondence",
+        },
+        "unstructured response",
+    )
+    if value["status"] != "valid" or not isinstance(value["source"], str):
+        raise ObservationError("unstructured response must contain valid source")
+    for key in ("candidate_sha256", "frozen_project_sha256"):
+        if not isinstance(value[key], str) or _DIGEST.fullmatch(value[key]) is None:
+            raise ObservationError(
+                f"unstructured response {key} must be a SHA-256 digest"
+            )
+    if not isinstance(value["new_correspondence"], list):
+        raise ObservationError("unstructured new_correspondence must be an array")
+    return UnstructuredReplacement(
+        value["source"],
+        value["candidate_sha256"],
+        value["frozen_project_sha256"],
+        tuple(
+            _correspondence(record, "unstructured new_correspondence")
+            for record in value["new_correspondence"]
+        ),
+    )
+
+
 def _exact_object(value: Any, keys: set[str], where: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         raise ObservationError(f"{where} must contain exactly {sorted(keys)}")

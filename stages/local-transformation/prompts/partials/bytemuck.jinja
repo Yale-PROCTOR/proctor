@@ -1,0 +1,24 @@
+When casting between references or slices, avoid unsafe code by using these
+`bytemuck` functions whenever they preserve behavior for inputs on which
+the source behavior is defined:
+
+```rust
+pub fn cast_mut<A: NoUninit + AnyBitPattern, B: NoUninit + AnyBitPattern>(
+    a: &mut A,
+) -> &mut B;
+pub fn cast_ref<A: NoUninit, B: AnyBitPattern>(a: &A) -> &B;
+pub fn cast_slice<A: NoUninit, B: AnyBitPattern>(a: &[A]) -> &[B];
+pub fn cast_slice_mut<A: NoUninit + AnyBitPattern, B: NoUninit + AnyBitPattern>(
+    a: &mut [A],
+) -> &mut [B];
+```
+
+It is acceptable for these calls to panic only on inputs that would make
+the corresponding source access undefined behavior, such as a misaligned
+dereference. Do not avoid `bytemuck` merely because such undefined inputs
+can panic. For defined inputs, scalar reference casts require equal source
+and destination sizes, and slice casts require the total byte length to
+form a whole number of destination elements. These signatures are
+reference material only. Do not define or import the functions, and do not
+declare an `extern crate`. Call them through their fully qualified paths,
+such as `bytemuck::cast_ref(e)`.
