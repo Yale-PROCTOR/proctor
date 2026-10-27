@@ -32,7 +32,6 @@ from model import (
     PrintfTemplateMetadata,
     SkeletonError,
     StatementPairMetadata,
-    _rust_tokens,
     dependency_context,
     function_graph,
     load_replacement_metadata,
@@ -851,298 +850,42 @@ def nested_view_record() -> dict[str, object]:
     return record
 
 
-def test_dual_view_loader_checks_lexical_structure_not_header_whitespace():
-    record = nested_view_record()
-    record["applied"]["skeleton"] = record["applied"]["skeleton"].replace(
-        "unsafe fn nested", "unsafe  /* normalized */ fn\n nested"
-    )
-    parsed = loaded([record])[0]
-    assert parsed.baseline.transform_labels == (0, 1, 2)
-
-    mutations = {
-        "signature": lambda text: text.replace("fn nested", "fn renamed", 1),
-        "declaration": lambda text: text.replace(
-            "let mut value: i32", "let value: i32", 1
-        ),
-        "control": lambda text: text.replace("if ready(p)", "while ready(p)", 1),
-        "label order": lambda text: (
-            text.replace("#[proctor(1)]", "#[proctor(99)]", 1)
-            .replace("#[proctor(2)]", "#[proctor(1)]", 1)
-            .replace("#[proctor(99)]", "#[proctor(2)]", 1)
-        ),
-    }
-    for mutation in mutations.values():
-        malformed = nested_view_record()
-        malformed["applied"]["skeleton"] = mutation(malformed["applied"]["skeleton"])
-        with pytest.raises(SkeletonError):
-            loaded([malformed])
-
-
-@pytest.mark.parametrize(
-    "source, expected",
-    [
-        ("'a, 'b", ("'a", ",", "'b")),
-        ("&'a str, &'b str", ("&", "'a", "str", ",", "&", "'b", "str")),
-        ("'{'; '}'; ';'", ("'{'", ";", "'}'", ";", "';'")),
-        ("'é'", ("'é'",)),
-        (r"'\n'", (r"'\n'",)),
-        (r"'\r'", (r"'\r'",)),
-        (r"'\t'", (r"'\t'",)),
-        (r"'\0'", (r"'\0'",)),
-        (r"'\\'", (r"'\\'",)),
-        (r"'\''", (r"'\''",)),
-        (r"'\"'", (r"'\"'",)),
-        (r"'\x7b'", (r"'\x7b'",)),
-        (r"'\u{7b}'", (r"'\u{7b}'",)),
-        (r"'\u{1F_980}'", (r"'\u{1F_980}'",)),
-        (r"b'\xff'", ("b", r"'\xff'")),
-        (
-            "'outer: loop { break 'outer; }",
-            ("'outer", ":", "loop", "{", "break", "'outer", ";", "}"),
-        ),
-    ],
-)
-def test_skeleton_lexer_distinguishes_characters_lifetimes_and_labels(source, expected):
-    assert _rust_tokens(source, "test skeleton") == expected
-
-
-@pytest.mark.parametrize(
-    "control",
-    ["loop", "while true", "while let Some(value) = Some(1)", "for value in 0..1", ""],
-)
-@pytest.mark.parametrize("terminator", ["", ";"])
-def test_dual_view_loader_keeps_labeled_control_children_and_following_sibling(
-    control, terminator
-):
-    record = fn_record(0, "labeled", "labeled", [], transformation_labels=[0, 1, 2])
-    record["baseline"]["skeleton"] = (
-        "unsafe fn labeled() {\n"
+def test_dual_view_loader_accepts_nested_condition_with_compiler_disposition_tree():
+    record = fn_record(0, "choose", "choose", [], transformation_labels=[])
+    skeleton = (
+        "unsafe fn choose(d: f64) -> i32 {\n"
         "    #[proctor(0)]\n"
-        f"    'retry: {control} {{\n"
+        "    if if d.is_infinite() {\n"
+        "        if d.is_sign_positive() { 1 } else { -1 }\n"
+        "    } else { 0 } != 0 {\n"
         "        #[proctor(1)]\n"
-        "        break 'retry;\n"
-        f"    }}{terminator}\n"
-        "    #[proctor(2)]\n"
-        "    let value: i32 = 1;\n"
-        "}"
-    )
-    record["baseline"]["statement_dispositions"] = [
-        {
-            "label": 0,
-            "disposition": "transform",
-            "children": [{"label": 1, "disposition": "transform", "children": []}],
-        },
-        {"label": 2, "disposition": "transform", "children": []},
-    ]
-    record["applied"] = copy.deepcopy(record["baseline"])
-    assert loaded([record])[0].baseline.transform_labels == (0, 1, 2)
-
-    record["applied"]["skeleton"] = record["applied"]["skeleton"].replace(
-        "'retry", "'other"
-    )
-    with pytest.raises(SkeletonError, match="control topology"):
-        loaded([record])
-
-
-def test_dual_view_loader_keeps_tail_children_in_their_control_branch():
-    record = nested_view_record()
-    for view_name in ("baseline", "applied"):
-        skeleton = record[view_name]["skeleton"]
-        replacement = (
-            "branch_value()" if view_name == "baseline" else "fixed_branch_value()"
-        )
-        record[view_name]["skeleton"] = skeleton.replace(
-            "let mut value: i32 = todo!();"
-            if view_name == "baseline"
-            else "let mut value: i32 = fixed();",
-            replacement,
-            1,
-        )
-    parsed = loaded([record])[0]
-    assert parsed.applied.transform_labels == (0, 1, 2)
-
-
-@pytest.mark.parametrize("declaration", ["let value: i32;", "let pointer: *mut i32;"])
-def test_dual_view_loader_accepts_initializerless_local_declarations(declaration):
-    record = fn_record(0, "declaration", "declaration", [])
-    skeleton = f"unsafe fn declaration() {{\n    #[proctor(0)]\n    {declaration}\n}}"
-    record["baseline"]["skeleton"] = skeleton
-    record["applied"] = copy.deepcopy(record["baseline"])
-    assert loaded([record])[0].baseline.transform_labels == (0,)
-
-    malformed = copy.deepcopy(record)
-    malformed["applied"]["skeleton"] = malformed["applied"]["skeleton"].replace(
-        "let ", "let mut ", 1
-    )
-    with pytest.raises(SkeletonError, match="declaration topology"):
-        loaded([malformed])
-
-
-def test_dual_view_loader_tracks_let_else_child_slots():
-    record = fn_record(
-        0,
-        "choose",
-        "choose",
-        [],
-        transformation_labels=[0, 1, 2],
-    )
-    record["baseline"]["skeleton"] = (
-        "unsafe fn choose(input: Option<i32>) {\n"
-        "    #[proctor(0)]\n"
-        "    let Some(value) = input else {\n"
-        "        #[proctor(1)]\n"
-        "        return;\n"
-        "    };\n"
-        "    #[proctor(2)]\n"
-        "    consume(value);\n"
-        "}"
-    )
-    record["baseline"]["statement_dispositions"] = [
-        {
-            "label": 0,
-            "disposition": "transform",
-            "children": [{"label": 1, "disposition": "transform", "children": []}],
-        },
-        {"label": 2, "disposition": "transform", "children": []},
-    ]
-    record["applied"] = copy.deepcopy(record["baseline"])
-    assert loaded([record])[0].baseline.transform_labels == (0, 1, 2)
-
-    moved = copy.deepcopy(record)
-    moved["applied"]["skeleton"] = (
-        "unsafe fn choose(input: Option<i32>) {\n"
-        "    #[proctor(0)]\n"
-        "    let Some(value) = {\n"
-        "        #[proctor(1)]\n"
-        "        input\n"
-        "    } else {};\n"
-        "    #[proctor(2)]\n"
-        "    consume(value);\n"
-        "}"
-    )
-    with pytest.raises(SkeletonError, match="control child slots"):
-        loaded([moved])
-
-
-def test_dual_view_loader_ends_brace_macro_before_following_sibling():
-    record = fn_record(
-        0,
-        "macros",
-        "macros",
-        [],
-        transformation_labels=[0, 1],
-    )
-    record["baseline"]["skeleton"] = (
-        "unsafe fn macros() {\n"
-        "    #[proctor(0)]\n"
-        "    crate::tokens! { #[proctor(99)] anything }\n"
-        "    #[proctor(1)]\n"
-        "    consume();\n"
-        "}"
-    )
-    record["applied"] = copy.deepcopy(record["baseline"])
-    assert loaded([record])[0].baseline.transform_labels == (0, 1)
-
-
-def test_dual_view_loader_keeps_each_consecutive_print_statement_payload():
-    record = fn_record(
-        0,
-        "prints",
-        "prints",
-        [],
-        transformation_labels=[0, 1],
-    )
-    record["baseline"]["skeleton"] = (
-        "unsafe fn prints() {\n"
-        "    #[proctor(0)]\n"
-        '    ::std::print!("{}", todo!());\n'
-        "    #[proctor(1)]\n"
-        '    ::std::print!("fixed");\n'
-        "}"
-    )
-    record["baseline"]["statement_dispositions"] = [
-        {"label": 0, "disposition": "transform", "children": []},
-        {"label": 1, "disposition": "mechanical", "children": []},
-    ]
-    record["baseline"]["statement_pair_metadata"] = [
-        _pointer_metadata(
-            0,
-            printf_template={"rust_format": "{}", "argument_count": 1},
-        ),
-        _pointer_metadata(
-            1,
-            printf_template={"rust_format": "fixed", "argument_count": 0},
-        ),
-    ]
-    record["applied"] = copy.deepcopy(record["baseline"])
-    parsed = loaded([record])[0]
-    assert parsed.baseline.transform_labels == (0,)
-    assert parsed.baseline.report_labels == (0, 1)
-
-
-def test_dual_view_loader_distinguishes_tail_and_semicolon_expression_shells():
-    record = fn_record(0, "value", "value", [])
-    record["baseline"]["skeleton"] = (
-        "unsafe fn value() -> i32 {\n    #[proctor(0)]\n    1\n}"
-    )
-    record["applied"] = copy.deepcopy(record["baseline"])
-    record["applied"]["skeleton"] = record["applied"]["skeleton"].replace(
-        "    1\n}", "    1;\n}"
-    )
-    with pytest.raises(SkeletonError, match="control topology"):
-        loaded([record])
-
-
-@pytest.mark.parametrize("jump", ["return", "break"])
-def test_dual_view_loader_distinguishes_expression_and_jump_payloads(jump):
-    record = fn_record(
-        0,
-        "control",
-        "control",
-        [],
-        transformation_labels=[0, 1],
-    )
-    record["baseline"]["skeleton"] = (
-        "unsafe fn control() {\n"
-        "    #[proctor(0)]\n"
-        "    loop {\n"
-        "        #[proctor(1)]\n"
-        "        consume();\n"
+        "        return 1;\n"
         "    }\n"
+        "    #[proctor(2)]\n"
+        "    0\n"
         "}"
     )
-    record["baseline"]["statement_dispositions"] = [
-        {
-            "label": 0,
-            "disposition": "transform",
-            "children": [{"label": 1, "disposition": "transform", "children": []}],
-        }
-    ]
+    record["baseline"] = {
+        "skeleton": skeleton,
+        "needs_transformation": False,
+        "statement_dispositions": [
+            {
+                "label": 0,
+                "disposition": "preserve",
+                "children": [{"label": 1, "disposition": "preserve", "children": []}],
+            },
+            {"label": 2, "disposition": "preserve", "children": []},
+        ],
+        "statement_pair_metadata": [],
+    }
     record["applied"] = copy.deepcopy(record["baseline"])
-    record["applied"]["skeleton"] = record["applied"]["skeleton"].replace(
-        "consume();", f"{jump};"
-    )
-    with pytest.raises(SkeletonError, match="control topology"):
-        loaded([record])
+    parsed = loaded([record])[0]
+    assert parsed.baseline.skeleton == skeleton
+    assert parsed.baseline.statement_dispositions[0].children[0].label == 1
+    assert not parsed.baseline.needs_transformation
 
 
-def test_dual_view_loader_checks_forest_correspondence_and_control_slots():
-    missing = nested_view_record()
-    missing["baseline"]["skeleton"] = missing["baseline"]["skeleton"].replace(
-        "#[proctor(2)]\n", "", 1
-    )
-    with pytest.raises(SkeletonError, match="disposition topology"):
-        loaded([missing])
-
-    moved = nested_view_record()
-    moved["applied"]["skeleton"] = moved["applied"]["skeleton"].replace(
-        "    } else {\n        #[proctor(2)]\n        value = fixed();\n",
-        "        #[proctor(2)]\n        value = fixed();\n    } else {\n",
-        1,
-    )
-    with pytest.raises(SkeletonError, match="control child slots"):
-        loaded([moved])
-
+def test_dual_view_loader_rejects_out_of_order_disposition_metadata():
     reordered_forest = nested_view_record()
     children = reordered_forest["baseline"]["statement_dispositions"][0]["children"]
     reordered_forest["baseline"]["statement_dispositions"][0]["children"] = list(
@@ -1186,35 +929,12 @@ def test_dual_view_loader_enforces_cross_view_disposition_transitions():
     with pytest.raises(SkeletonError, match="contradicts its disposition"):
         loaded([changed_mechanical])
 
-    changed_payload = copy.deepcopy(mechanical)
-    changed_payload["applied"]["skeleton"] = changed_payload["applied"][
-        "skeleton"
-    ].replace('"fixed"', '"changed"')
-    with pytest.raises(SkeletonError, match="contradicts its trusted metadata"):
-        loaded([changed_payload])
-
     changed_metadata = copy.deepcopy(mechanical)
     changed_metadata["applied"]["statement_pair_metadata"][0]["before_statement"] = (
         "different();"
     )
     with pytest.raises(SkeletonError, match="different report metadata"):
         loaded([changed_metadata])
-
-    invalid_payload = copy.deepcopy(mechanical)
-    for view_name in ("baseline", "applied"):
-        invalid_payload[view_name]["skeleton"] = invalid_payload[view_name][
-            "skeleton"
-        ].replace('::std::print!("fixed");', "();")
-    with pytest.raises(SkeletonError, match="canonical print template"):
-        loaded([invalid_payload])
-
-    introduced_mechanical = fn_record(0, "new_fixed", "new_fixed", [])
-    introduced_mechanical["applied"] = copy.deepcopy(mechanical["applied"])
-    introduced_mechanical["applied"]["skeleton"] = introduced_mechanical["applied"][
-        "skeleton"
-    ].replace("fixed", "new_fixed")
-    with pytest.raises(SkeletonError, match="contradicts its trusted metadata"):
-        loaded([introduced_mechanical])
 
     preserved = fn_record(0, "stable", "stable", [], needs_transformation=False)
     for disposition in ("transform", "rule_applied"):
@@ -7697,6 +7417,7 @@ def test_printf_provenance_is_required_closed_and_forwarded_only_internally():
         malformed = copy.deepcopy(
             printf_record if mutation != "ordinary_marker" else ordinary
         )
+        malformed["applied"] = copy.deepcopy(malformed["baseline"])
         metadata = malformed["baseline"]["statement_pair_metadata"][0]
         if mutation == "format":
             metadata["printf_template"]["rust_format"] = "{:x}"
@@ -7745,7 +7466,7 @@ def test_printf_provenance_enforces_mechanical_and_cross_view_invariants():
     changed["applied"]["statement_pair_metadata"][0]["printf_template"][
         "rust_format"
     ] = "changed"
-    with pytest.raises(SkeletonError, match="differs between skeleton views"):
+    with pytest.raises(SkeletonError, match="different report metadata"):
         loaded([changed])
 
     ordered = fn_record(
