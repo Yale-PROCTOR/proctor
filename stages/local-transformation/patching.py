@@ -40,6 +40,8 @@ def apply_patch(base: str, patch: str) -> str:
             "'*** Update File: transformation.rs', ending with '*** End Patch'. "
             "Only updates to transformation.rs are allowed."
         )
+    while patch_lines[-2] == "*** End Patch":
+        patch_lines.pop()
     lines = base.split("\n") if base else []
     trailing_newline = bool(lines and lines[-1] == "")
     if trailing_newline:

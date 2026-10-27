@@ -53,6 +53,25 @@ def test_patch_preserves_mixed_line_endings_outside_additions():
     assert apply_patch(base, hunk("@@ d\n+end")) == base + "\r\nend"
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("trailing", ["", "\n"])
+@pytest.mark.parametrize("terminators", [1, 2, 4])
+def test_patch_accepts_repeated_trailing_terminators(newline, trailing, terminators):
+    patch = (
+        hunk("@@\n-before\n+after\n unchanged")
+        + "\n*** End Patch" * (terminators - 1)
+        + trailing
+    ).replace("\n", newline)
+    assert apply_patch(f"before{newline}unchanged{newline}", patch) == (
+        f"after{newline}unchanged{newline}"
+    )
+
+
+def test_patch_repeated_terminators_preserve_marker_text_in_file_contents():
+    patch = hunk("@@\n *** End Patch\n-old\n+*** End Patch") + "\n*** End Patch"
+    assert apply_patch("*** End Patch\nold", patch) == "*** End Patch\n*** End Patch"
+
+
 @pytest.mark.parametrize(
     "base, changes, expected",
     [
@@ -97,6 +116,27 @@ def test_patch_rejects_unsupported_or_malformed_responses(patch):
 
 
 @pytest.mark.parametrize(
+    "patch",
+    [
+        hunk("@@\n-a\n+b") + "\n*** End Patch\nExplanation",
+        hunk("@@\n-a\n+b") + "\n*** End Patch\n\n",
+        hunk("@@\n-a\n+b") + "\n\n*** End Patch",
+        hunk("@@\n-a\n+b") + "\n " + "\n*** End Patch",
+        hunk("@@\n-a\n+b") + "\n" + hunk("@@\n-b\n+c") + "\n*** End Patch",
+        hunk("@@\n-a\n+b\n*** End Patch\n@@\n-b\n+c") + "\n*** End Patch",
+        hunk("@@\n-a\n+b\n*** Update File: other.rs\n@@\n-a\n+b") + "\n*** End Patch",
+        hunk("@@\n-a\n+b\n*** Add File: other.rs\n+c") + "\n*** End Patch",
+        hunk("@@\n-a\n+b\n*** Delete File: other.rs") + "\n*** End Patch",
+        hunk("@@\n-a\n+b\n*** Move to: other.rs") + "\n*** End Patch",
+        hunk("@@\na\n+b") + "\n*** End Patch",
+    ],
+)
+def test_patch_repeated_terminators_do_not_relax_other_framing(patch):
+    with pytest.raises(PatchError):
+        apply_patch("a", patch)
+
+
+@pytest.mark.parametrize(
     "base, changes, diagnostic",
     [
         ("a\na", "@@\n-a\n+b", "ambiguous"),
@@ -107,11 +147,12 @@ def test_patch_rejects_unsupported_or_malformed_responses(patch):
         ("a", "@@\n+b", "locate"),
     ],
 )
+@pytest.mark.parametrize("extra_terminator", ["", "\n*** End Patch"])
 def test_patch_rejects_ambiguous_mismatched_or_overlapping_context(
-    base, changes, diagnostic
+    base, changes, diagnostic, extra_terminator
 ):
     with pytest.raises(PatchError, match=diagnostic):
-        apply_patch(base, hunk(changes))
+        apply_patch(base, hunk(changes) + extra_terminator)
 
 
 @pytest.mark.parametrize("unstructured", [False, True])
