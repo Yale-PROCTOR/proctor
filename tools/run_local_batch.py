@@ -16,7 +16,10 @@ def main() -> int:
         description="Run the local C2Rust/Crat configuration for each .tar.gz file."
     )
     parser.add_argument(
-        "path", type=Path, help="tarball or directory containing tarballs"
+        "paths",
+        nargs="+",
+        type=Path,
+        help="tarballs or directories containing tarballs",
     )
     parser.add_argument("--rule-set", type=Path, help="rule set JSON file")
     mode = parser.add_mutually_exclusive_group()
@@ -32,14 +35,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    target = args.path.resolve()
-    if target.is_file():
-        directory = target.parent
-    elif target.is_dir():
-        directory = target
-        target = None
-    else:
-        parser.error(f"not a file or directory: {args.path}")
+    tarballs: list[Path] = []
+    for path in args.paths:
+        target = path.resolve()
+        if target.is_file():
+            if target.name.endswith(".tar.gz"):
+                tarballs.append(target)
+        elif target.is_dir():
+            tarballs.extend(
+                sorted(path for path in target.glob("*.tar.gz") if path.is_file())
+            )
+        else:
+            parser.error(f"not a file or directory: {path}")
 
     if args.rule_set is None:
         rule_set = "empty-rule-set.json"
@@ -67,15 +74,10 @@ def main() -> int:
         else set()
     )
     failures: list[tuple[list[str], str, str]] = []
-    tarballs = sorted(
-        path
-        for path in directory.glob("*.tar.gz")
-        if path.is_file() and (target is None or path == target)
-    )
     pending: list[tuple[Path, str]] = []
-    for tarball in tarballs:
+    for tarball in dict.fromkeys(tarballs):
         archive_name = tarball.name[: -len(".tar.gz")]
-        name = f"{name_prefix}{directory.name}_{archive_name}"
+        name = f"{name_prefix}{tarball.parent.name}_{archive_name}"
         if not any(run == name or run.startswith(f"{name}-") for run in existing_runs):
             pending.append((tarball, name))
 
