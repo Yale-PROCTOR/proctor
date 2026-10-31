@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -53,17 +54,39 @@ def find_unsafe(directory: Path) -> list[str]:
 
 
 def main() -> None:
-    directories = sorted(
-        path
-        for path in ROOT.glob("runs/*/stages/02-local_transformation/out/rust")
-        if path.is_dir()
+    parser = argparse.ArgumentParser(
+        description="Aggregate unsafe operations across PROCTOR run directories."
     )
+    parser.add_argument(
+        "--prefix", default="", help="collect runs with this name prefix"
+    )
+    args = parser.parse_args()
+
+    directories = []
+    for run in sorted(ROOT.glob("runs/*")):
+        if not run.is_dir() or not run.name.startswith(args.prefix):
+            continue
+        stage = max(
+            (
+                path
+                for path in (run / "stages").glob("[0-9]*-*")
+                if path.is_dir() and path.name.partition("-")[0].isdigit()
+            ),
+            key=lambda path: int(path.name.partition("-")[0]),
+            default=None,
+        )
+        if stage is not None:
+            directory = stage / "out" / "rust"
+            if directory.is_dir():
+                directories.append(directory)
+
     counts: Counter[str] = Counter()
     if directories:
         with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as executor:
             for names in executor.map(find_unsafe, directories):
                 counts.update(classify(name) for name in names if name)
 
+    print(f"Collected directories: {len(directories)}")
     print("\t".join(feature[:7] for feature in FEATURES))
     print("\t".join(str(counts[feature]) for feature in FEATURES))
 
