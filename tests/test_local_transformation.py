@@ -4294,7 +4294,12 @@ def test_preparation_and_initialization_event_order_is_exact(
     assert output.status == "success"
     assert tools.events == [
         ("build_tools", Path((STAGE_DIR / "../crat").resolve())),
-        ("prepare", value.framework.workdir / "analysis", ("expand", "unexpand"), True),
+        (
+            "prepare",
+            value.framework.workdir / "analysis",
+            ("expand", "prepare", "unexpand"),
+            True,
+        ),
         (
             "make_skeleton",
             value.framework.workdir / "analysis",
@@ -4371,14 +4376,14 @@ def test_preparation_and_initialization_event_order_is_exact(
     )
     command_tools.crat = Path("/tools/crat")
     command_tools.environment = {}
-    command_tools.prepare(command_current, ("expand", "unexpand"), True)
+    command_tools.prepare(command_current, ("expand", "prepare", "unexpand"), True)
     expected = ["/tools/crat", "--inplace"]
     if config_present:
         expected.extend(["--config", str(command_current / "config.toml")])
     expected.extend(
         [
             "--pass",
-            "expand,unexpand",
+            "expand,prepare,unexpand",
             "--unexpand-use-print",
             str(command_current),
         ]
