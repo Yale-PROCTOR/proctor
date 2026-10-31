@@ -3541,6 +3541,9 @@ class FakeTools:
     def prepare(self, current, passes, use_print):
         self.events.append(("prepare", current, passes, use_print))
 
+    def postprocess(self, current):
+        self.events.append(("postprocess", current))
+
     def make_skeleton(self, current, output, rule_set=None, **kwargs):
         self.events.append(("make_skeleton", current, output, rule_set))
         output.write_text(json.dumps(self.skeletons), encoding="utf-8")
@@ -3870,6 +3873,151 @@ def test_final_build_failure_restores_source_and_manifest_together(tmp_path):
     assert not (value.outputs.artifacts_dir / "observations.json").exists()
 
 
+def test_postprocessing_publishes_built_split_project_after_observations(tmp_path):
+    value = stage_input(tmp_path)
+    source = value.inputs.rust_project
+    source.joinpath("Cargo.toml").write_text(
+        '[lib]\npath = "lib.rs"\n\n[[bin]]\nname = "driver"\npath = "driver.rs"\n'
+    )
+    source.joinpath("driver.rs").write_text("fn main() {}\n")
+    config = 'c_exposed_fns = ["external_api"]\n'
+    source.joinpath("config.toml").write_text(config)
+    source.joinpath("testinfra.toml").write_text('strategy = "cando2"\n')
+    original_manifest = source.joinpath("proctor.toml").read_bytes()
+    accepted = "pub unsafe fn target() {}\n"
+    finalized = accepted + "pub fn main() {}\n"
+    split_source = "pub mod nested;\npub fn main() {}\n"
+    split_files = {
+        "nested/mod.rs": "pub mod helpers;\n",
+        "nested/helpers.rs": "pub fn target() {}\n",
+    }
+    stale = value.framework.workdir / "final-project/obsolete.rs"
+    stale.parent.mkdir()
+    stale.write_text("stale split output\n")
+
+    class PostprocessingTools(FakeTools):
+        def finalize_project(self, *args, **kwargs):
+            super().finalize_project(*args, **kwargs)
+            args[3].write_text(finalized)
+
+        def postprocess(self, current):
+            super().postprocess(current)
+            assert (current / "lib.rs").read_text() == finalized
+            assert (current / "config.toml").read_text() == config
+            assert (current / "proctor.toml").read_bytes() == original_manifest
+            assert sum(event[0] == "extract_observations" for event in self.events) == 1
+            (current / "lib.rs").write_text(split_source)
+            for relative, contents in split_files.items():
+                path = current / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents)
+
+        def cargo_build(self, current, *, library_only=False):
+            if not library_only:
+                assert current == value.framework.workdir / "final-project"
+                assert (current / "lib.rs").read_text() == split_source
+                for relative, contents in split_files.items():
+                    assert (current / relative).read_text() == contents
+            return super().cargo_build(current, library_only=library_only)
+
+    observation = {"before_cleanup": True}
+    tools = PostprocessingTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        validators=[VALID],
+        candidates=[accepted],
+        observations=[
+            {
+                "schema_version": 1,
+                "observations": [observation],
+                "printf_observations": [],
+            }
+        ],
+    )
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=lambda settings, tracker: FakeClient([response()]),
+    )
+    assert output.status == "success", output.error
+    destination = value.outputs.rust_project
+    assert destination.joinpath("lib.rs").read_text() == split_source
+    for relative, contents in split_files.items():
+        assert destination.joinpath(relative).read_text() == contents
+    for relative in ("config.toml", "proctor.toml", "driver.rs", "testinfra.toml"):
+        assert (
+            destination.joinpath(relative).read_bytes()
+            == source.joinpath(relative).read_bytes()
+        )
+    assert not destination.joinpath("target").exists()
+    assert not destination.joinpath("obsolete.rs").exists()
+    assert source.joinpath("lib.rs").read_text() == "old\n"
+    assert (value.framework.workdir / "current/lib.rs").read_text() == finalized
+    assert (value.framework.workdir / "sccs/000000/accepted.rs").read_text() == accepted
+    assert json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
+        "observations"
+    ] == [observation]
+    assert tools.build_modes == [True, True, False]
+    assert output.metrics["cargo_builds"] == 3
+
+
+@pytest.mark.parametrize("failure", ["postprocess", "build", "build_exception"])
+def test_postprocessing_failures_preserve_accepted_work_without_publication(
+    tmp_path, failure
+):
+    class FailingTools(FakeTools):
+        def finalize_project(self, *args, **kwargs):
+            super().finalize_project(*args, **kwargs)
+            args[3].write_text("finalized source\n")
+
+        def postprocess(self, current):
+            super().postprocess(current)
+            (current / "lib.rs").write_text("pub mod partial;\n")
+            (current / "partial.rs").write_text("partial split output\n")
+            if failure == "postprocess":
+                raise StageFailure("ordinary Crat postprocess failed with exit code 7")
+
+        def cargo_build(self, current, *, library_only=False):
+            result = super().cargo_build(current, library_only=library_only)
+            if not library_only:
+                assert (current / "partial.rs").is_file()
+                if failure == "build_exception":
+                    raise OSError("postprocessed cargo invocation failed")
+                return CommandResult(7, "", "postprocessed project failed to build")
+            return result
+
+    tools = FailingTools(
+        skeletons=[fn_record(0, "target", "target", [])],
+        validators=[VALID],
+        candidates=["accepted source\n"],
+    )
+    value, output = run_fake(tmp_path, tools, FakeClient([response()]))
+    assert output.status == "failure"
+    assert {
+        "postprocess": "ordinary Crat postprocess failed",
+        "build": "final cargo build failed (7)",
+        "build_exception": "postprocessed cargo invocation failed",
+    }[failure] in output.error
+    work = value.framework.workdir
+    assert (work / "current/lib.rs").read_text() == "accepted source\n"
+    assert not (work / "current/partial.rs").exists()
+    assert (work / "current/proctor.toml").read_bytes() == (
+        value.inputs.rust_project / "proctor.toml"
+    ).read_bytes()
+    assert (work / "sccs/000000/accepted.rs").read_text() == "accepted source\n"
+    assert (work / "sccs/000000/accepted-observations/000000.json").is_file()
+    assert (value.inputs.rust_project / "lib.rs").read_text() == "old\n"
+    assert not value.outputs.rust_project.exists()
+    assert not any(
+        (value.outputs.artifacts_dir / name).exists()
+        for name in ("statement-pairs.md", "observations.json", "statistics.json")
+    )
+    assert not any(event[0] == "merge_observations" for event in tools.events)
+    assert output.metrics["cargo_builds"] == (2 if failure == "postprocess" else 3)
+    assert output.metrics["compilation_failures"] == int(failure == "build")
+    assert output.metrics["repair_calls"] == 0
+
+
 def anchorless_rule_set(tmp_path):
     path = tmp_path / "anchorless-rules.json"
     i32 = {"kind": "primitive", "name": "i32"}
@@ -4144,7 +4292,8 @@ def test_preparation_and_initialization_event_order_is_exact(
             value.framework.workdir / "current",
             value.framework.workdir / "current/proctor.toml",
         ),
-        ("cargo_build", value.framework.workdir / "current", "pub struct S;\n"),
+        ("postprocess", value.framework.workdir / "final-project"),
+        ("cargo_build", value.framework.workdir / "final-project", "pub struct S;\n"),
         (
             "merge_observations",
             (),
@@ -4203,6 +4352,55 @@ def test_preparation_and_initialization_event_order_is_exact(
         ]
     )
     assert commands == [expected]
+
+
+@pytest.mark.parametrize("config_present", [False, True])
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_postprocess_invokes_existing_crat_cleanup_with_project_config(
+    tmp_path, config_present, returncode
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    config = project / "config.toml"
+    contents = 'c_exposed_fns = ["external_api"]\npasses = []\n'
+    if config_present:
+        config.write_text(contents)
+    calls = []
+
+    def runner(command, *, cwd=None, env=None):
+        calls.append((command, env))
+        return CommandResult(returncode, "pass output\n", "pass diagnostics\n")
+
+    tools = CratTools(tmp_path / "cleanup.log", run_command=runner)
+    tools.crat = Path("/tools/crat")
+    tools.environment = {"DIR": "/tools"}
+    if returncode:
+        with pytest.raises(
+            StageFailure, match="ordinary Crat postprocess.*exit code 7"
+        ):
+            tools.postprocess(project)
+    else:
+        tools.postprocess(project)
+    expected = ["/tools/crat", "--inplace"]
+    if config_present:
+        expected.extend(["--config", str(config)])
+        assert config.read_text() == contents
+    expected.extend(
+        [
+            "--pass",
+            "interface,unsafe,unexpand,split",
+            "--unsafe-remove-unused",
+            "--unsafe-remove-no-mangle",
+            "--unsafe-replace-pub",
+            "--unsafe-remove-extern-c",
+            "--unexpand-use-print",
+            str(project),
+        ]
+    )
+    assert calls == [(expected, tools.environment)]
+    log = tools.log_path.read_text()
+    assert "pass output\n" in log
+    assert "pass diagnostics\n" in log
 
 
 @pytest.mark.parametrize(
@@ -5281,6 +5479,7 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
         "extract_observations",
         "assemble_project",
         "finalize_project",
+        "postprocess",
         "cargo_build",
         "merge_observations",
     ]
@@ -7159,10 +7358,13 @@ def test_missing_required_paths_fail_before_side_effects(tmp_path, mutation):
     assert original_files == input_files()
 
 
+@pytest.mark.parametrize("scratch", ["current", "final-project"])
 @pytest.mark.parametrize("relation", ["equal", "ancestor", "descendant"])
-def test_artifact_destination_must_not_overlap_current_workspace(tmp_path, relation):
+def test_artifact_destination_must_not_overlap_working_projects(
+    tmp_path, relation, scratch
+):
     value = stage_input(tmp_path)
-    current = value.framework.workdir / "current"
+    current = value.framework.workdir / scratch
     artifacts = {
         "equal": current,
         "ancestor": value.framework.workdir,
@@ -7175,8 +7377,23 @@ def test_artifact_destination_must_not_overlap_current_workspace(tmp_path, relat
     tools = FakeTools()
     output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
     assert output.status == "failure"
-    assert "overlaps working Rust project" in output.error
+    assert "overlaps working" in output.error
     assert not tools.events
+
+
+@pytest.mark.parametrize("relative", ["final-project", "final-project/output"])
+def test_output_destination_cannot_overlap_postprocessing_project(tmp_path, relative):
+    value = stage_input(tmp_path)
+    value = replace(
+        value,
+        outputs=replace(value.outputs, rust_project=value.framework.workdir / relative),
+    )
+    tools = FakeTools()
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "output Rust project overlaps final working project" in output.error
+    assert not tools.events
+    assert not value.outputs.rust_project.exists()
 
 
 def _pointer_metadata(
@@ -8647,6 +8864,7 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
         "extract_observations",
         "assemble_project",
         "finalize_project",
+        "postprocess",
         "cargo_build",
         "merge_observations",
     ]
@@ -9462,6 +9680,7 @@ def test_concurrent_workers_reuse_private_projects_and_preserve_all_usage(tmp_pa
     assert operations[assembly:] == [
         "assemble_project",
         "finalize_project",
+        "postprocess",
         "cargo_build",
         "merge_observations",
     ]
@@ -9810,6 +10029,7 @@ def test_frozen_bundle_cannot_be_overwritten_by_tool_outputs(tmp_path, operation
     "relative",
     [
         "work/current/usage.jsonl",
+        "work/final-project/usage.jsonl",
         "work/analysis/usage.jsonl",
         "work/workers/00/usage.jsonl",
         "work/sccs/000000/usage.jsonl",
@@ -9858,6 +10078,7 @@ def test_usage_log_cannot_alias_an_existing_worker_log_symlink(tmp_path):
         "workers",
         "sccs",
         "final-rollback",
+        "final-project",
         "workers/00",
         "sccs/000000",
     ],
