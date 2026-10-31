@@ -2638,6 +2638,12 @@ def run_stage(
                     shutil.rmtree(final_project)
                 shutil.copytree(current, final_project)
                 active_tools.postprocess(final_project)
+                if (current / "testinfra.toml").is_file():
+                    for name in ("tests", "runner"):
+                        if (current / name).is_dir():
+                            shutil.copytree(
+                                current / name, final_project / name, dirs_exist_ok=True
+                            )
                 state.metrics.cargo_builds += 1
                 return active_tools.cargo_build(final_project)
 

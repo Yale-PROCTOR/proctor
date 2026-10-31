@@ -3883,6 +3883,16 @@ def test_postprocessing_publishes_built_split_project_after_observations(tmp_pat
     config = 'c_exposed_fns = ["external_api"]\n'
     source.joinpath("config.toml").write_text(config)
     source.joinpath("testinfra.toml").write_text('strategy = "cando2"\n')
+    harness_files = {
+        "tests/oracle.rs": "#[test] fn oracle() {}\n",
+        "tests/helpers/mod.rs": "pub fn helper() {}\n",
+        "runner/src/main.rs": "fn main() {}\n",
+        "runner/Cargo.toml": '[package]\nname = "runner"\nversion = "0.1.0"\n',
+    }
+    for relative, contents in harness_files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
     original_manifest = source.joinpath("proctor.toml").read_bytes()
     accepted = "pub unsafe fn target() {}\n"
     finalized = accepted + "pub fn main() {}\n"
@@ -3906,6 +3916,11 @@ def test_postprocessing_publishes_built_split_project_after_observations(tmp_pat
             assert (current / "config.toml").read_text() == config
             assert (current / "proctor.toml").read_bytes() == original_manifest
             assert sum(event[0] == "extract_observations" for event in self.events) == 1
+            for name in ("tests", "runner"):
+                for path in (current / name).rglob("*.rs"):
+                    path.unlink()
+            (current / "tests/helpers").rmdir()
+            (current / "runner/src").rmdir()
             (current / "lib.rs").write_text(split_source)
             for relative, contents in split_files.items():
                 path = current / relative
@@ -3917,6 +3932,8 @@ def test_postprocessing_publishes_built_split_project_after_observations(tmp_pat
                 assert current == value.framework.workdir / "final-project"
                 assert (current / "lib.rs").read_text() == split_source
                 for relative, contents in split_files.items():
+                    assert (current / relative).read_text() == contents
+                for relative, contents in harness_files.items():
                     assert (current / relative).read_text() == contents
             return super().cargo_build(current, library_only=library_only)
 
@@ -3956,6 +3973,9 @@ def test_postprocessing_publishes_built_split_project_after_observations(tmp_pat
     assert destination.joinpath("lib.rs").read_text() == split_source
     for relative, contents in split_files.items():
         assert destination.joinpath(relative).read_text() == contents
+    for relative, contents in harness_files.items():
+        assert destination.joinpath(relative).read_text() == contents
+        assert source.joinpath(relative).read_text() == contents
     for relative in ("config.toml", "proctor.toml", "driver.rs", "testinfra.toml"):
         assert (
             destination.joinpath(relative).read_bytes()
@@ -4400,7 +4420,7 @@ def test_postprocess_invokes_existing_crat_cleanup_with_project_config(
     expected.extend(
         [
             "--pass",
-            "interface,unsafe,unexpand,split",
+            "expand,interface,unsafe,unexpand,split",
             "--unsafe-remove-unused",
             "--unsafe-remove-no-mangle",
             "--unsafe-replace-pub",
