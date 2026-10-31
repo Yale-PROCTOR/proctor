@@ -259,6 +259,23 @@ class CratTools:
         )
         self._run("ordinary Crat postprocess", command, env=self.environment)
 
+    def wrapper_bounds(self, request: Path, output: Path) -> dict[str, Any]:
+        assert self.crat_tool is not None
+        self._validate_project_outputs((output,), (), (request,))
+        self._output_operation(
+            "crat-tool wrapper-bounds",
+            [
+                str(self.crat_tool),
+                "wrapper-bounds",
+                "--input",
+                str(request),
+                "--output",
+                str(output),
+            ],
+            output,
+        )
+        return json.loads(output.read_text(encoding="utf-8"))
+
     @staticmethod
     def _clear_output(path: Path) -> None:
         if path.is_symlink() or path.is_file():
