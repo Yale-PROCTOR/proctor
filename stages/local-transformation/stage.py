@@ -499,7 +499,14 @@ def _validate_boundaries(
         raise StageFailure(
             f"output Rust project destination already exists: {destination}"
         )
-    for directory in ("analysis", "current", "workers", "sccs", "final-rollback"):
+    for directory in (
+        "analysis",
+        "current",
+        "workers",
+        "sccs",
+        "final-rollback",
+        "final-project",
+    ):
         root = workdir / directory
         if root.is_symlink():
             raise StageFailure(f"scratch directory must not be a symlink: {root}")
@@ -599,8 +606,16 @@ def _validate_boundaries(
             or current_resolved in path.parents
         ):
             raise StageFailure(f"{name} overlaps working Rust project: {path}")
-    for directory in ("analysis", "workers", "sccs", "final-rollback"):
+    for directory in (
+        "analysis",
+        "workers",
+        "sccs",
+        "final-rollback",
+        "final-project",
+    ):
         root = (workdir / directory).resolve()
+        if directory == "final-project" and _paths_overlap(destination_resolved, root):
+            raise StageFailure("output Rust project overlaps final working project")
         for name, path in current_sensitive_paths.items():
             if _paths_overlap(path, root):
                 raise StageFailure(f"{name} overlaps working directory: {root}")
@@ -2489,14 +2504,23 @@ def run_stage(
                 raise StageFailure(
                     "finalized project manifest changed target or API declarations"
                 )
-            state.metrics.cargo_builds += 1
+            final_project = workdir / "final-project"
+
+            def postprocess_and_build() -> CommandResult:
+                if final_project.exists():
+                    shutil.rmtree(final_project)
+                shutil.copytree(current, final_project)
+                active_tools.postprocess(final_project)
+                state.metrics.cargo_builds += 1
+                return active_tools.cargo_build(final_project)
+
             final_build = install_final_transaction(
                 library_source,
                 finalized_source,
                 current / "proctor.toml",
                 finalized_manifest,
                 workdir / "final-rollback",
-                lambda: active_tools.cargo_build(current),
+                postprocess_and_build,
             )
             if final_build.returncode != 0:
                 state.metrics.compilation_failures += 1
@@ -2511,7 +2535,7 @@ def run_stage(
             tuple(state.accepted_observation_documents), merged_observations
         )
         _publish_final_outputs(
-            current,
+            final_project,
             destination,
             report_path,
             report,

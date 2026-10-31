@@ -239,6 +239,26 @@ class CratTools:
         command.append(str(current_project))
         self._run("ordinary Crat prepare", command, env=self.environment)
 
+    def postprocess(self, current_project: Path) -> None:
+        assert self.crat is not None
+        command = [str(self.crat), "--inplace"]
+        config = current_project / "config.toml"
+        if config.is_file():
+            command.extend(["--config", str(config)])
+        command.extend(
+            [
+                "--pass",
+                "interface,unsafe,unexpand,split",
+                "--unsafe-remove-unused",
+                "--unsafe-remove-no-mangle",
+                "--unsafe-replace-pub",
+                "--unsafe-remove-extern-c",
+                "--unexpand-use-print",
+                str(current_project),
+            ]
+        )
+        self._run("ordinary Crat postprocess", command, env=self.environment)
+
     @staticmethod
     def _clear_output(path: Path) -> None:
         if path.is_symlink() or path.is_file():
