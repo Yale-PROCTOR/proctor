@@ -19,6 +19,7 @@ from typing import Any, Literal, cast
 import tomli_w
 
 from final_validation import validate_project
+from wrapper_bounds import infer_wrapper_bounds
 from libc_guidance import render_libc_guidance
 from printf_guidance import render_printf_guidance
 from model import (
@@ -72,7 +73,7 @@ from proctor.contracts import (
 )
 from proctor.contracts.manifest import ManifestError, ProjectManifest
 from proctor.llm.client import LlmClient, RateLimiter
-from proctor.llm.types import Response
+from proctor.llm.types import Request, Response
 from proctor.usage.pricing import PricingTable
 from proctor.usage.tracker import UsageTracker, read_usage
 
@@ -549,11 +550,15 @@ def _validate_boundaries(
         "final-rollback",
         "final-project",
         "test-validation",
+        "wrapper-bounds",
     ):
         root = workdir / directory
         if root.is_symlink():
             raise StageFailure(f"scratch directory must not be a symlink: {root}")
-        if directory in {"workers", "sccs", "test-validation"} and root.is_dir():
+        if (
+            directory in {"workers", "sccs", "test-validation", "wrapper-bounds"}
+            and root.is_dir()
+        ):
             for child in root.iterdir():
                 if child.is_symlink():
                     raise StageFailure(
@@ -666,6 +671,7 @@ def _validate_boundaries(
         "final-rollback",
         "final-project",
         "test-validation",
+        "wrapper-bounds",
     ):
         root = (workdir / directory).resolve()
         if directory == "final-project" and _paths_overlap(destination_resolved, root):
@@ -674,6 +680,8 @@ def _validate_boundaries(
             destination_resolved, root
         ):
             raise StageFailure("output Rust project overlaps test validation scratch")
+        if directory == "wrapper-bounds" and _paths_overlap(destination_resolved, root):
+            raise StageFailure("output Rust project overlaps wrapper bounds scratch")
         for name, path in current_sensitive_paths.items():
             if _paths_overlap(path, root):
                 raise StageFailure(f"{name} overlaps working directory: {root}")
@@ -2675,6 +2683,52 @@ def run_stage(
                 state.metrics.compilation_failures += 1
             return result
 
+        bound_client = None
+        bound_tracker = UsageTracker(
+            usage_path,
+            run_id=stage_input.run_id,
+            stage=STAGE_ID,
+            item=stage_input.item,
+            pricing=PricingTable.from_config(stage_input.framework.llm),
+        )
+
+        def complete_bounds(request: Request) -> Response:
+            nonlocal bound_client
+            state.prompts_used.add("wrapper_bound_inference")
+            before = bound_tracker.record_count
+            settings = {**stage_input.framework.llm, "context_overflow": "error"}
+            try:
+                if bound_client is None:
+                    factory = llm_client_factory or (
+                        lambda config, tracker: LlmClient(config, tracker=tracker)
+                    )
+                    bound_client = factory(settings, bound_tracker)
+                response = bound_client.complete(request)
+            except Exception as exc:
+                if bound_tracker.record_count == before:
+                    bound_tracker.record(
+                        metadata=request.metadata,
+                        provider=str(settings.get("provider", "unknown")),
+                        model=str(settings.get("model", "")),
+                        usage=None,
+                        latency_s=0,
+                        finish_reason="error",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
+            _record_untracked_response(bound_tracker, before, request, response)
+            return response
+
+        bound_report = infer_wrapper_bounds(
+            final_project,
+            workdir=workdir,
+            stage_dir=stage_dir,
+            tools=active_tools,
+            complete=complete_bounds,
+            build=build_repair,
+            run_id=stage_input.run_id,
+            dump_exchanges=config["dump_llm_exchanges"],
+        )
         validation = validate_project(
             final_project,
             workdir=workdir,
@@ -2684,6 +2738,7 @@ def run_stage(
             c_project=stage_input.inputs.c_project,
             runner=validation_runner,
         )
+        validation["wrapper_bounds"] = bound_report
         state.validation_report = validation
         _publish_final_outputs(
             final_project,
