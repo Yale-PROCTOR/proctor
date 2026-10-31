@@ -6,6 +6,7 @@ exec = ["python3", "main.py"]
 warmup = ["python3", "main.py", "--build-only"]
 
 [requires]
+c_project = "optional"
 rust_project = "required"
 rule_set = "optional"
 
@@ -18,3 +19,9 @@ max_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number
 max_unstructured_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number of additional LLM calls for signature-only SCC repair; zero disables the fallback" }
 crat_dir = { type = "string", default = "../crat", doc = "crat checkout, relative to this stage" }
 dump_llm_exchanges = { type = "bool", default = false, doc = "persist each rendered prompt and LLM response under stage artifacts" }
+testinfra_dir = { type = "string", default = "../test-infrastructure", doc = "test infrastructure checkout, relative to this stage" }
+max_validation_repairs = { type = "integer", default = 3, doc = "maximum final test repair agent invocations; zero validates without repair" }
+validation_timeout_s = { type = "integer", default = 600, doc = "timeout for each independent test suite invocation" }
+validation_repair_agent = { type = "string", default = "opencode", doc = "coding agent used for final test repair; currently opencode" }
+validation_repair_model = { type = "string", doc = "explicit agent model; required only to repair failing tests, with no fallback to the transformation model" }
+validation_repair_timeout_s = { type = "integer", default = 900, doc = "timeout for each final repair agent invocation" }
