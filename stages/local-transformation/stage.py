@@ -2513,7 +2513,7 @@ def run_stage(
         _ensure_required_dependencies(analysis)
         if library_relative is None:
             library_relative = _library_relative_path(analysis)
-        active_tools.prepare(analysis, ("expand", "unexpand"), True)
+        active_tools.prepare(analysis, ("expand", "prepare", "unexpand"), True)
         if (source / "testinfra.toml").is_file():
             for name in ("tests", "runner"):
                 if (source / name).is_dir():
