@@ -40,7 +40,6 @@ order = [
   "abstraction_recovery",
   "discipline_repair",
   "local_transformation",
-  "test_validation",
 ]
 
 [stages.c2rust]
@@ -100,11 +99,17 @@ max_attempts_per_target = 2
 
 [stages.local_transformation]
 uses = "stages/local-transformation"
-timeout_s = 3600
+timeout_s = 10800
 
 [stages.local_transformation.config]
 workers = 8
 dump_llm_exchanges = true
+testinfra_dir = "../test-infrastructure"
+max_validation_repairs = 3
+validation_timeout_s = 600
+validation_repair_agent = "opencode"
+validation_repair_model = "openrouter/openai/gpt-6.1-sol"
+validation_repair_timeout_s = 900
 
 [stages.test_validation]
 uses = "stages/test-infrastructure"

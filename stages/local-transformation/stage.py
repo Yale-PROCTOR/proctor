@@ -18,6 +18,7 @@ from typing import Any, Literal, cast
 
 import tomli_w
 
+from final_validation import validate_project
 from libc_guidance import render_libc_guidance
 from printf_guidance import render_printf_guidance
 from model import (
@@ -137,6 +138,7 @@ class RunState:
     accepted_observation_documents: list[Path] = field(default_factory=list)
     accepted_views: dict[int, SkeletonView] = field(default_factory=dict)
     unstructured_sccs: set[tuple[int, ...]] = field(default_factory=set)
+    validation_report: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +255,12 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
             "workers",
             "max_repairs",
             "max_unstructured_repairs",
+            "max_validation_repairs",
+            "testinfra_dir",
+            "validation_timeout_s",
+            "validation_repair_agent",
+            "validation_repair_model",
+            "validation_repair_timeout_s",
         }
     )
     if unknown:
@@ -282,12 +290,46 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
         raise StageFailure(
             "config.max_unstructured_repairs must be a nonnegative integer"
         )
+    max_validation_repairs = config.get("max_validation_repairs", 3)
+    if (
+        isinstance(max_validation_repairs, bool)
+        or not isinstance(max_validation_repairs, int)
+        or max_validation_repairs < 0
+    ):
+        raise StageFailure(
+            "config.max_validation_repairs must be a nonnegative integer"
+        )
+    testinfra_dir = config.get("testinfra_dir", "../test-infrastructure")
+    if not isinstance(testinfra_dir, str) or not testinfra_dir:
+        raise StageFailure("config.testinfra_dir must be a nonempty string")
+    repair_agent = config.get("validation_repair_agent", "opencode")
+    if repair_agent != "opencode":
+        raise StageFailure("config.validation_repair_agent must be opencode")
+    repair_model = config.get("validation_repair_model")
+    if repair_model is not None and (
+        not isinstance(repair_model, str) or not repair_model.strip()
+    ):
+        raise StageFailure("config.validation_repair_model must be a nonempty string")
+    validation_timeout = config.get("validation_timeout_s", 600)
+    repair_timeout = config.get("validation_repair_timeout_s", 900)
+    for name, timeout in (
+        ("validation_timeout_s", validation_timeout),
+        ("validation_repair_timeout_s", repair_timeout),
+    ):
+        if type(timeout) is not int or timeout <= 0:
+            raise StageFailure(f"config.{name} must be a positive integer")
     return {
         "workers": workers,
         "max_repairs": max_repairs,
         "max_unstructured_repairs": max_unstructured_repairs,
         "crat_dir": str((stage_dir / crat_dir).resolve()),
         "dump_llm_exchanges": dump_llm_exchanges,
+        "max_validation_repairs": max_validation_repairs,
+        "testinfra_dir": str((stage_dir / testinfra_dir).resolve()),
+        "validation_timeout_s": validation_timeout,
+        "validation_repair_agent": repair_agent,
+        "validation_repair_model": repair_model,
+        "validation_repair_timeout_s": repair_timeout,
     }
 
 
@@ -506,11 +548,12 @@ def _validate_boundaries(
         "sccs",
         "final-rollback",
         "final-project",
+        "test-validation",
     ):
         root = workdir / directory
         if root.is_symlink():
             raise StageFailure(f"scratch directory must not be a symlink: {root}")
-        if directory in {"workers", "sccs"} and root.is_dir():
+        if directory in {"workers", "sccs", "test-validation"} and root.is_dir():
             for child in root.iterdir():
                 if child.is_symlink():
                     raise StageFailure(
@@ -521,6 +564,7 @@ def _validate_boundaries(
         "outputs.rust_project": destination.resolve(),
         "framework.workdir": workdir.resolve(),
         "config.crat_dir": Path(config["crat_dir"]).resolve(),
+        "config.testinfra_dir": Path(config["testinfra_dir"]).resolve(),
     }
     if stage_input.outputs.artifacts_dir is not None:
         writable_paths["outputs.artifacts_dir"] = (
@@ -537,6 +581,11 @@ def _validate_boundaries(
             or source_resolved in path.parents
         ):
             raise StageFailure(f"{name} overlaps input Rust project: {path}")
+    c_project = stage_input.inputs.c_project
+    if c_project is not None:
+        for name, path in writable_paths.items():
+            if _paths_overlap(path, c_project.resolve()):
+                raise StageFailure(f"{name} overlaps input C project: {path}")
     report_path = (
         stage_input.outputs.artifacts_dir / "statement-pairs.md"
         if stage_input.outputs.artifacts_dir is not None
@@ -576,6 +625,9 @@ def _validate_boundaries(
     if observations_resolved == report_resolved:
         raise StageFailure("statement-pairs and observations artifact paths overlap")
     statistics_resolved = statistics_path.resolve()
+    validation_resolved = report_path.with_name("test-validation.json").resolve()
+    if _paths_overlap(validation_resolved, destination_resolved):
+        raise StageFailure("test validation report overlaps output Rust project")
     if _paths_overlap(statistics_resolved, destination_resolved):
         raise StageFailure(
             "statistics artifact path overlaps output Rust project: "
@@ -591,6 +643,7 @@ def _validate_boundaries(
         "statement-pairs report": report_resolved,
         "observations artifact": observations_resolved,
         "statistics artifact": statistics_resolved,
+        "test validation report": validation_resolved,
         "framework usage log": (
             stage_input.framework.usage_log or workdir / "usage.jsonl"
         ).resolve(),
@@ -612,10 +665,15 @@ def _validate_boundaries(
         "sccs",
         "final-rollback",
         "final-project",
+        "test-validation",
     ):
         root = (workdir / directory).resolve()
         if directory == "final-project" and _paths_overlap(destination_resolved, root):
             raise StageFailure("output Rust project overlaps final working project")
+        if directory == "test-validation" and _paths_overlap(
+            destination_resolved, root
+        ):
+            raise StageFailure("output Rust project overlaps test validation scratch")
         for name, path in current_sensitive_paths.items():
             if _paths_overlap(path, root):
                 raise StageFailure(f"{name} overlaps working directory: {root}")
@@ -635,11 +693,18 @@ def _validate_boundaries(
         )
     ]
     log_root = (stage_input.outputs.artifacts_dir or workdir).resolve()
+    validation_logs = log_root / "test-validation-logs"
+    if validation_logs.is_symlink():
+        raise StageFailure("test validation logs must not be a symlink")
+    if _paths_overlap(destination_resolved, validation_logs):
+        raise StageFailure("output Rust project overlaps test validation logs")
     reserved.extend(
         (
             report_resolved,
             observations_resolved,
             statistics_resolved,
+            validation_resolved,
+            validation_logs,
             destination_resolved,
             (log_root / "local-transformation.log").resolve(),
         )
@@ -716,7 +781,9 @@ def _copy_final(
 
     destination.mkdir()
     mark_destination_created()
-    shutil.copytree(current, destination, ignore=ignore, dirs_exist_ok=True)
+    shutil.copytree(
+        current, destination, ignore=ignore, dirs_exist_ok=True, symlinks=True
+    )
 
 
 def _usage_summary(records: list[dict[str, Any]]) -> UsageSummary | None:
@@ -778,6 +845,17 @@ def _output(
     records: list[dict[str, Any]] = []
     if state.usage_path is not None:
         records = read_usage(state.usage_path)[state.usage_start :]
+    models = _models(records)
+    if (
+        state.validation_report is not None
+        and state.validation_report["repair_attempts"]
+    ):
+        models += (
+            ModelInfo(
+                provider=state.validation_report["repair_agent"],
+                model=state.validation_report["repair_model"],
+            ),
+        )
     return StageOutput(
         status=status,
         stage_id=STAGE_ID,
@@ -786,7 +864,7 @@ def _output(
             rust_project=destination if status == "success" else None
         ),
         config_used=state.config_used,
-        models=_models(records),
+        models=models,
         usage=_usage_summary(records),
         prompts=tuple(
             PromptUse(id=prompt_id, version=PROMPT_VERSION)
@@ -1397,19 +1475,24 @@ def _publish_final_outputs(
         '    "preserve_shell": 0,\n    "rule_applied": 0,\n'
         '    "transform": 0,\n    "mechanical": 0\n  }\n}\n'
     ),
+    validation: str | None = None,
 ) -> None:
     observations_path = observations_path or report_path.with_name("observations.json")
     statistics_path = statistics_path or report_path.with_name("statistics.json")
+    validation_path = report_path.with_name("test-validation.json")
     report_temporary: Path | None = None
     observations_temporary: Path | None = None
     statistics_temporary: Path | None = None
+    validation_temporary: Path | None = None
     destination_created = False
     report_published = False
     observations_published = False
     statistics_published = False
+    validation_published = False
     report_identity: tuple[int, int] | None = None
     observations_identity: tuple[int, int] | None = None
     statistics_identity: tuple[int, int] | None = None
+    validation_identity: tuple[int, int] | None = None
 
     def mark_destination_created() -> None:
         nonlocal destination_created
@@ -1447,6 +1530,15 @@ def _publish_final_outputs(
         statistics_temporary = Path(temporary_name)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
             output.write(statistics)
+        if validation is not None:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=validation_path.parent,
+                prefix=f".{validation_path.name}.",
+                suffix=".tmp",
+            )
+            validation_temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+                output.write(validation)
         _copy_final(current, destination, mark_destination_created)
         temporary_stat = os.lstat(report_temporary)
         report_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
@@ -1463,13 +1555,29 @@ def _publish_final_outputs(
         os.replace(statistics_temporary, statistics_path)
         statistics_temporary = None
         statistics_published = True
+        if validation_temporary is not None:
+            temporary_stat = os.lstat(validation_temporary)
+            validation_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+            os.replace(validation_temporary, validation_path)
+            validation_temporary = None
+            validation_published = True
     except Exception as primary:
         cleanup_errors: list[str] = []
         cleanup_targets = [
             (report_temporary, _remove_exact_report),
             (observations_temporary, _remove_exact_report),
             (statistics_temporary, _remove_exact_report),
+            (validation_temporary, _remove_exact_report),
         ]
+        if validation_published:
+            cleanup_targets.append(
+                (
+                    validation_path,
+                    lambda path: _remove_published_artifact_if_owned(
+                        path, validation_identity
+                    ),
+                )
+            )
         if statistics_published:
             cleanup_targets.append(
                 (
@@ -2329,6 +2437,7 @@ def run_stage(
     stage_dir: Path | None = None,
     tools: Any | None = None,
     llm_client_factory: Callable[[dict[str, Any], UsageTracker], Any] | None = None,
+    validation_runner: Callable[..., Any] | None = None,
 ) -> StageOutput:
     stage_dir = (stage_dir or Path(__file__).parent).resolve()
     state = RunState()
@@ -2364,6 +2473,9 @@ def run_stage(
         _clear_stale_artifact(report_path, "statement-pairs report")
         _clear_stale_artifact(observations_path, "observations artifact")
         _clear_stale_artifact(statistics_path, "statistics artifact")
+        _clear_stale_artifact(
+            report_path.with_name("test-validation.json"), "test validation report"
+        )
         state.config_used = config
         artifacts = stage_input.outputs.artifacts_dir
         log_path = (
@@ -2386,11 +2498,26 @@ def run_stage(
         analysis = workdir / "analysis"
         if analysis.exists():
             shutil.rmtree(analysis)
-        shutil.copytree(source, analysis)
+        alias = source / "translated_rust"
+        shutil.copytree(
+            source,
+            analysis,
+            ignore=lambda directory, names: (
+                {"translated_rust"}
+                if Path(directory) == source
+                and alias.is_symlink()
+                and alias.resolve() == source.resolve()
+                else set()
+            ),
+        )
         _ensure_required_dependencies(analysis)
         if library_relative is None:
             library_relative = _library_relative_path(analysis)
         active_tools.prepare(analysis, ("expand", "unexpand"), True)
+        if (source / "testinfra.toml").is_file():
+            for name in ("tests", "runner"):
+                if (source / name).is_dir():
+                    shutil.copytree(source / name, analysis / name, dirs_exist_ok=True)
         library_source = analysis / library_relative
         if not library_source.is_file():
             raise StageFailure(
@@ -2534,6 +2661,24 @@ def run_stage(
         active_tools.merge_observations(
             tuple(state.accepted_observation_documents), merged_observations
         )
+
+        def build_repair(project: Path) -> CommandResult:
+            state.metrics.cargo_builds += 1
+            result = active_tools.cargo_build(project)
+            if result.returncode != 0:
+                state.metrics.compilation_failures += 1
+            return result
+
+        validation = validate_project(
+            final_project,
+            workdir=workdir,
+            artifacts=stage_input.outputs.artifacts_dir or workdir,
+            config=config,
+            build=build_repair,
+            c_project=stage_input.inputs.c_project,
+            runner=validation_runner,
+        )
+        state.validation_report = validation
         _publish_final_outputs(
             final_project,
             destination,
@@ -2543,6 +2688,7 @@ def run_stage(
             merged_observations,
             statistics_path,
             _statistics_json(state),
+            validation=json.dumps(validation, indent=2) + "\n",
         )
         return _output("success", state, destination=destination)
     except DependencyNormalizationFailure as exc:

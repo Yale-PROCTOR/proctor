@@ -3938,6 +3938,18 @@ def test_postprocessing_publishes_built_split_project_after_observations(tmp_pat
         stage_dir=STAGE_DIR,
         tools=tools,
         llm_client_factory=lambda settings, tracker: FakeClient([response()]),
+        validation_runner=lambda *args, **kwargs: CommandResult(
+            0,
+            json.dumps(
+                {
+                    "passed": True,
+                    "tests_count": 1,
+                    "successes_count": 1,
+                    "failures_count": 0,
+                    "errors_count": 0,
+                }
+            ),
+        ),
     )
     assert output.status == "success", output.error
     destination = value.outputs.rust_project
@@ -6904,6 +6916,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
     assert manifest["exec"] == ["python3", "main.py"]
     assert manifest["warmup"] == ["python3", "main.py", "--build-only"]
     assert manifest["requires"] == {
+        "c_project": "optional",
         "rust_project": "required",
         "rule_set": "optional",
     }
@@ -6914,6 +6927,12 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
         "max_unstructured_repairs",
         "crat_dir",
         "dump_llm_exchanges",
+        "testinfra_dir",
+        "max_validation_repairs",
+        "validation_timeout_s",
+        "validation_repair_agent",
+        "validation_repair_model",
+        "validation_repair_timeout_s",
     }
     assert manifest["config"]["workers"]["default"] == 4
     assert manifest["config"]["max_repairs"]["default"] == 5
@@ -6921,8 +6940,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
     assert manifest["config"]["crat_dir"]["default"] == "../crat"
     assert manifest["config"]["dump_llm_exchanges"]["default"] is False
     assert not (
-        {"c_project", "test_package"}
-        & (set(manifest["requires"]) | set(manifest["produces"]))
+        {"test_package"} & (set(manifest["requires"]) | set(manifest["produces"]))
     )
     project = tomllib.loads((STAGE_DIR / "pyproject.toml").read_text())
     assert "proctor" in project["project"]["dependencies"]
@@ -6992,6 +7010,12 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
         "max_unstructured_repairs": 5,
         "crat_dir": str((STAGE_DIR / "../crat").resolve()),
         "dump_llm_exchanges": False,
+        "testinfra_dir": str((STAGE_DIR / "../test-infrastructure").resolve()),
+        "max_validation_repairs": 3,
+        "validation_timeout_s": 600,
+        "validation_repair_agent": "opencode",
+        "validation_repair_model": None,
+        "validation_repair_timeout_s": 900,
     }
     assert output.metrics == {
         "unstructured_repair_calls": 0,
