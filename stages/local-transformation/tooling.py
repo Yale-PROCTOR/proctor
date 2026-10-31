@@ -248,7 +248,7 @@ class CratTools:
         command.extend(
             [
                 "--pass",
-                "interface,unsafe,unexpand,split",
+                "expand,interface,unsafe,unexpand,split",
                 "--unsafe-remove-unused",
                 "--unsafe-remove-no-mangle",
                 "--unsafe-replace-pub",
