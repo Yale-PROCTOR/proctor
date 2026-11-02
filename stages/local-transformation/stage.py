@@ -2171,7 +2171,7 @@ def _process_scc(
             )
             if metadata.unfilled_stub_items:
                 diagnostics = (
-                    "Complete the unfilled whole-function stubs: "
+                    "Complete all unfilled transformation holes: "
                     + ", ".join(
                         f"{item_id}:{records_by_id[item_id].path}"
                         for item_id in metadata.unfilled_stub_items
@@ -2179,7 +2179,7 @@ def _process_scc(
                 )
                 if mechanical:
                     raise StageFailure(
-                        f"mechanical SCC candidate contains unfilled whole-function stubs: {diagnostics}"
+                        f"mechanical SCC candidate contains unfilled transformation holes: {diagnostics}"
                     )
                 state.metrics.structural_failures += 1
                 latest_failed = transformation
