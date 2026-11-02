@@ -146,9 +146,22 @@ def ensure_crat_built(crat_dir: Path, log_file: Path) -> Path:
     binary = crat_dir / "target" / "release" / "crat"
     marker = crat_dir / "target" / ".proctor-build-sha"
     head = git_head(crat_dir)
-    if binary.is_file() and marker.is_file() and marker.read_text().strip() == head:
+    host = subprocess.check_output(
+        ["rustc", "--print", "host-tuple"], cwd=crat_dir, text=True
+    ).strip()
+    target_deps = crat_dir / "deps_crate" / "target" / host / "debug" / "deps"
+    if (
+        binary.is_file()
+        and target_deps.is_dir()
+        and marker.is_file()
+        and marker.read_text().strip() == head
+    ):
         return binary
-    run_logged(["cargo", "build"], log_file, cwd=crat_dir / "deps_crate")
+    run_logged(
+        ["cargo", "build", "--target", host],
+        log_file,
+        cwd=crat_dir / "deps_crate",
+    )
     run_logged(["cargo", "build", "--release", "--bin", "crat"], log_file, cwd=crat_dir)
     if not binary.is_file():
         raise StageFailure(f"crat build produced no binary at {binary}")
