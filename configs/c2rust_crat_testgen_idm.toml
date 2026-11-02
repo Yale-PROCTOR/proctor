@@ -1,0 +1,55 @@
+# Pipeline: C source -> c2rust -> CRAT -> test generation -> idiomaticity.
+#
+# Only OPENAI_API_KEY is needed, for the idiomaticity agent
+
+[run]
+provides = ["c_project"]
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = ["c2rust", "crat", "test_generation", "idiomaticity"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 900
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.test_generation]
+uses = "stages/test-infrastructure"
+timeout_s = 3600
+
+[stages.test_generation.config]
+command = "generate"
+strategy = "cando2"
+agent = "opencode"
+model = "opencode/nemotron-3.5-super-vl-free"
+attempts = 3
+min_coverage = 80.0
+
+[stages.idiomaticity]
+uses = "stages/idiomaticity-agent"
+timeout_s = 3600
+
+[stages.idiomaticity.config]
+model="openrouter/nvidia/nemotron-3.5-super-vl:free"
+base_url="https://openrouter.ai/api/v1"
+api_key_env="OPENROUTER_API_KEY"
+max_attempts = 5

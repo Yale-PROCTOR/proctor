@@ -1,0 +1,81 @@
+# Pipeline: C source -> c2rust -> CRAT -> test generation -> abstraction
+# recovery -> discipline repair -> idiomaticity.
+
+[run]
+provides = ["c_project"]
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = [
+  "c2rust",
+  "crat",
+  "test_generation",
+  "abstraction_recovery",
+  "discipline_repair",
+  "idiomaticity",
+]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 900
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.test_generation]
+uses = "stages/test-infrastructure"
+timeout_s = 3600
+
+[stages.test_generation.config]
+command = "generate"
+strategy = "cando2"
+agent = "opencode"
+model = "openai/gpt-5.6"
+attempts = 3
+min_coverage = 80.0
+
+[stages.abstraction_recovery]
+uses = "stages/abstraction-recovery"
+timeout_s = 2400
+
+[stages.abstraction_recovery.config]
+backend = "opencode"       # agentic (OpenAI credits), likelier to preserve the
+model = "openai/gpt-5.6"   # extern "C"/#[repr(C)] ABI than the single-shot llm.
+max_candidates = 1
+max_repair_iterations = 3
+on_give_up = "skip"
+
+[stages.discipline_repair]
+uses = "stages/discipline-repair"
+timeout_s = 1800
+
+[stages.discipline_repair.config]
+agent = "opencode"
+model = "openai/gpt-5.6"
+max_attempts_per_target = 2
+
+[stages.idiomaticity]
+uses = "stages/idiomaticity-agent"
+timeout_s = 3600
+
+[stages.idiomaticity.config]
+model = "openai/gpt-5.6"
+base_url="https://openrouter.ai/api/v1"
+api_key_env="OPENROUTER_API_KEY"
+max_attempts = 5

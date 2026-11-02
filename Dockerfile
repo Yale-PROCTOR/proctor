@@ -85,7 +85,7 @@ RUN uv sync
 # the image's LLVM), crat (pulls its pinned nightly via
 # rust-toolchain.toml), stage venvs, and the index crate.
 RUN uv run proctor warmup -c tests/e2e/translation_smoke.toml
-RUN uv run proctor warmup -c configs/c2rust_crat_testgen_disrep.toml
+RUN uv run proctor warmup -c configs/c2rust_crat_testgen_absrec_disrep_idm.toml
 
 # Put the built tools on PATH (reference tractor-crat-dockerfile parity):
 # c2rust-transpile is a plain binary; `crat` is a wrapper script that
