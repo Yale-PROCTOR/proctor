@@ -13,3 +13,6 @@
 [submodule "stages/discipline-repair"]
 	path = stages/discipline-repair
 	url = https://github.com/Yale-PROCTOR/discipline_repair
+[submodule "stages/idiomaticity-agent"]
+	path = stages/idiomaticity-agent
+	url = https://github.com/Yale-PROCTOR/agent
