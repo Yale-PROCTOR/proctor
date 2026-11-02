@@ -10228,12 +10228,20 @@ def stub_repair_records(mixed):
     )
 
 
-def stub_repair_response(mixed, unfilled):
+def stub_repair_response(mixed, unfilled, *, nested=False):
     names = ["first", "second"] if mixed else ["first"]
     return (
         "```rust\n"
         + "\n".join(
-            f"unsafe fn {name}() {{ #[proctor(0)] {'todo!()' if index == unfilled else '()'} }}"
+            f"unsafe fn {name}() {{ #[proctor(0)] "
+            + (
+                "let value: i32 = todo!(); consume(value);"
+                if nested and index == unfilled
+                else "todo!()"
+                if index == unfilled
+                else "()"
+            )
+            + " }"
             for index, name in enumerate(names)
         )
         + "\n```"
@@ -10241,8 +10249,9 @@ def stub_repair_response(mixed, unfilled):
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_unfilled_whole_function_stub_uses_local_repair_before_build_or_observation(
-    tmp_path, mixed
+@pytest.mark.parametrize("nested", [False, True])
+def test_unfilled_transformation_hole_uses_local_repair_before_build_or_observation(
+    tmp_path, mixed, nested
 ):
     item_id = 1 if mixed else 0
     tools = UnfilledStubTools(
@@ -10260,7 +10269,10 @@ def test_unfilled_whole_function_stub_uses_local_repair_before_build_or_observat
     )
     client = FakeClient(
         patch_responses(
-            [stub_repair_response(mixed, item_id), stub_repair_response(mixed, None)]
+            [
+                stub_repair_response(mixed, item_id, nested=nested),
+                stub_repair_response(mixed, None),
+            ]
         )
     )
     value, output = run_fake(tmp_path, tools, client)
@@ -10279,7 +10291,7 @@ def test_unfilled_whole_function_stub_uses_local_repair_before_build_or_observat
         if operation == "add_functions"
     )
     repair_prompt = client.requests[1].messages[0].content
-    assert "Complete the unfilled whole-function stubs" in repair_prompt
+    assert "Complete all unfilled transformation holes" in repair_prompt
     assert f"{item_id}:{'second' if mixed else 'first'}" in repair_prompt
     assert "todo!()" in repair_prompt
     assert json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
@@ -10368,7 +10380,7 @@ def test_mechanical_whole_function_stub_remains_fatal_without_llm_repair(tmp_pat
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "failure"
     assert (
-        "mechanical SCC candidate contains unfilled whole-function stubs"
+        "mechanical SCC candidate contains unfilled transformation holes"
         in output.error
     )
     assert not client.requests
