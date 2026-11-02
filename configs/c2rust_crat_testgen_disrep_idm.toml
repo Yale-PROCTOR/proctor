@@ -39,7 +39,7 @@ timeout_s = 3600
 command = "generate"
 strategy = "cando2"
 agent = "opencode"
-model = "opencode/nemotron-3.5-super-vl-free"
+model = "opencode/beam-free"
 attempts = 3
 min_coverage = 80.0
 
@@ -49,7 +49,7 @@ timeout_s = 1800
 
 [stages.discipline_repair.config]
 agent = "opencode"
-model = "opencode/nemotron-3.5-super-vl-free"
+model = "opencode/beam-free"
 max_attempts_per_target = 2
 
 [stages.idiomaticity]

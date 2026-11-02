@@ -52,13 +52,11 @@ passes = [
 
 [stages.test_generation]
 uses = "stages/test-infrastructure"
-timeout_s = 1800
+timeout_s = 3600
 
 [stages.test_generation.config]
 command = "generate"
 strategy = "cando2"
-target_kind = "bin"   # array_list is a CLI application; crat emits both a lib
-                      # and bin target, so auto-detection can't choose — pin it.
 agent = "opencode"
 model = "openai/gpt-5.6"
 attempts = 3
