@@ -109,14 +109,3 @@ validation_timeout_s = 600
 validation_repair_agent = "opencode"
 validation_repair_model = "openrouter/openai/gpt-6.1-sol"
 validation_repair_timeout_s = 900
-
-[stages.test_validation]
-uses = "stages/test-infrastructure"
-timeout_s = 1800
-
-[stages.test_validation.config]
-command = "run"
-strategy = "cando2"
-target_kind = "bin"
-collect_coverage = false
-complete_vectors = false

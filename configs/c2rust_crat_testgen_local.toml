@@ -1,0 +1,71 @@
+# Pipeline: C source -> c2rust -> CRAT -> test generation -> local transformation
+
+[run]
+provides = ["c_project", "rule_set"]
+
+[testing]
+after_each_stage = false
+
+[llm]
+provider = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-6-luna"
+
+[llm.pricing."openai/openai/gpt-6-luna"]
+input = 0.10
+output = 0.50
+cached_input = 0.01
+
+[llm.extra]
+reasoning_effort = "medium"
+
+[pipeline]
+order = ["c2rust", "crat", "test_generation", "local_transformation"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 900
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.test_generation]
+uses = "stages/test-infrastructure"
+timeout_s = 1800
+
+[stages.test_generation.config]
+command = "generate"
+strategy = "cando2"
+agent = "opencode"
+model = "openrouter/openai/gpt-6.1-terra"
+attempts = 3
+min_coverage = 80.0
+
+[stages.local_transformation]
+uses = "stages/local-transformation"
+timeout_s = 10800
+
+[stages.local_transformation.config]
+workers = 8
+dump_llm_exchanges = true
+testinfra_dir = "../test-infrastructure"
+max_validation_repairs = 3
+validation_timeout_s = 600
+validation_repair_agent = "opencode"
+validation_repair_model = "openrouter/openai/gpt-6.1-sol"
+validation_repair_timeout_s = 900
