@@ -1145,6 +1145,35 @@ def render_dependency_entry(record: ItemRecord) -> str:
     return f"### {record.kind} `{name}`\n\n```rust\n{text}\n```"
 
 
+def group_functions(
+    functions: tuple[int, ...],
+    records_by_id: dict[int, ItemRecord],
+    limit: int,
+) -> tuple[tuple[int, ...], ...]:
+    groups: list[tuple[int, ...]] = []
+    members: list[int] = []
+    names: set[str | None] = set()
+    size = 0
+    for item_id in functions:
+        record = records_by_id[item_id]
+        assert record.annotated_source is not None
+        assert record.baseline is not None and record.applied is not None
+        weight = len(record.annotated_source) + max(
+            len(record.baseline.skeleton), len(record.applied.skeleton)
+        )
+        if members and (size + weight > limit or record.name in names):
+            groups.append(tuple(sorted(members)))
+            members = []
+            names = set()
+            size = 0
+        members.append(item_id)
+        names.add(record.name)
+        size += weight
+    if members:
+        groups.append(tuple(sorted(members)))
+    return tuple(groups)
+
+
 def render_transformation_targets(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
@@ -1185,14 +1214,16 @@ def dependency_context(
     recursive_singleton = (
         len(members) == 1 and members[0] in records_by_id[members[0]].dependencies
     )
-    scc_signatures = set(members) if len(members) > 1 or recursive_singleton else set()
+    member_signatures = (
+        set(members) if len(members) > 1 or recursive_singleton else set()
+    )
     direct = {
         dependency
         for member in members
         for dependency in records_by_id[member].dependencies
         if dependency not in member_set
     }
-    selected = scc_signatures | direct
+    selected = member_signatures | direct
 
     def render(ids: set[int]) -> str:
         return "\n\n".join(
@@ -1202,7 +1233,7 @@ def dependency_context(
     mandatory = render(selected)
     if len(mandatory) > limit:
         raise ContextOverflow(
-            f"SCC {','.join(map(str, members))} mandatory dependency context has "
+            f"group {','.join(map(str, members))} mandatory dependency context has "
             f"{len(mandatory)} characters, exceeding limit {limit}"
         )
     frontier = set(direct)
