@@ -1,6 +1,6 @@
 id = "local_transformation"
 version = "0.1.0"
-description = "Transform independent pointer-local SCCs concurrently with validated LLM output."
+description = "Transform bounded groups of pointer-local functions concurrently with validated LLM output."
 
 exec = ["python3", "main.py"]
 warmup = ["python3", "main.py", "--build-only"]
@@ -14,9 +14,10 @@ rule_set = "optional"
 rust_project = true
 
 [config]
-workers = { type = "integer", default = 4, doc = "positive number of workers, each owning an SCC through generation, private compilation, repair, and observation extraction" }
-max_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number of repairs per SCC after its initial generation, shared across structural and compilation failures and baseline fallback" }
-max_unstructured_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number of additional LLM calls for signature-only SCC repair; zero disables the fallback" }
+workers = { type = "integer", default = 4, doc = "positive number of workers, each owning a function group through generation, private compilation, repair, and observation extraction" }
+max_group_chars = { type = "integer", default = 15000, doc = "positive soft limit on grouped annotated source plus the larger baseline/applied skeleton; oversized functions run alone" }
+max_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number of structured repair calls per group, shared across structural and compilation failures and baseline fallback" }
+max_unstructured_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number of signature-only repair calls per group; rule-free compilation failures skip structured repair" }
 crat_dir = { type = "string", default = "../crat", doc = "crat checkout, relative to this stage" }
 dump_llm_exchanges = { type = "bool", default = false, doc = "persist each rendered prompt and LLM response under stage artifacts" }
 testinfra_dir = { type = "string", default = "../test-infrastructure", doc = "test infrastructure checkout, relative to this stage" }

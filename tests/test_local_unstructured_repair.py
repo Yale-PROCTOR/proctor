@@ -144,7 +144,7 @@ def test_stripped_seed_can_succeed_without_additional_llm_calls(
     assert output.status == "success", output.error
     assert len(client.requests) == (2 if trigger == "repeat" else 1)
     assert output.metrics["unstructured_repair_calls"] == 0
-    assert output.metrics["unstructured_scc_count"] == 1
+    assert output.metrics["unstructured_group_count"] == 1
     assert output.config_used["max_unstructured_repairs"] == 5
     assert [(prompt.id, prompt.version) for prompt in output.prompts] == [
         ("local_transformation", 1)
@@ -156,7 +156,7 @@ def test_stripped_seed_can_succeed_without_additional_llm_calls(
     assert (value.outputs.rust_project / "lib.rs").read_text() == "accepted seed\n"
     assert not [event for event in tools.events if event[0] == "extract_observations"]
     assert not list(
-        (value.framework.workdir / "sccs/000000").glob("accepted-*observation*")
+        (value.framework.workdir / "groups/000000").glob("accepted-*observation*")
     )
     observations = json.loads(
         (value.outputs.artifacts_dir / "observations.json").read_text()
@@ -165,7 +165,7 @@ def test_stripped_seed_can_succeed_without_additional_llm_calls(
     statistics = json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     )
-    assert statistics["unstructured_scc_count"] == 1
+    assert statistics["unstructured_group_count"] == 1
     assert statistics["statements"]["total"] == 0
 
 
@@ -231,7 +231,7 @@ def test_unstructured_repair_uses_clean_prompt_fresh_diagnostics_and_usage(
     assert usage[-1]["prompt_id"] == "unstructured_repair"
     assert usage[-1]["prompt_version"] == 1
     root = value.outputs.artifacts_dir or value.framework.workdir
-    exchange = root / "llm-exchanges/scc-0/unstructured-01"
+    exchange = root / "llm-exchanges/group-0/unstructured-01"
     assert (exchange / "prompt.md").read_text() == prompt
     assert (exchange / "response.md").read_text() == patch_response(SEED, REPAIRED)
     assert (exchange / "repair-base.rs").read_text() == SEED
@@ -277,7 +277,7 @@ def test_unstructured_budget_counts_all_additional_calls_and_zero_disables(
     assert output.metrics["unstructured_repair_calls"] == expected
     assert output.metrics["repair_calls"] == expected
     assert output.usage.calls == len(client.requests) == expected + 1
-    assert output.metrics["unstructured_scc_count"] == 0
+    assert output.metrics["unstructured_group_count"] == 0
     assert ("unstructured repair calls" in output.error) == bool(expected)
     assert len(
         [event for event in tools.events if event[0] == "prepare_unstructured"]
@@ -419,7 +419,7 @@ def test_mixed_strategies_retain_only_structured_scc_observations_and_pairs(tmp_
         tmp_path,
         tools,
         FakeClient([response("first"), response("second")]),
-        config={"max_repairs": 0},
+        config={"max_group_chars": 1, "max_repairs": 0},
     )
     assert output.status == "success", output.error
     document = json.loads(
@@ -438,7 +438,7 @@ def test_mixed_strategies_retain_only_structured_scc_observations_and_pairs(tmp_
     assert (
         statistics["statements"]["transform"] == statistics["statements"]["total"] == 1
     )
-    assert statistics["unstructured_scc_count"] == 1
+    assert statistics["unstructured_group_count"] == 1
     assert statistics["function_scc_count"] == 2
 
 
@@ -488,7 +488,7 @@ def test_accepted_unstructured_source_is_rechecked_before_assembly(tmp_path):
         tmp_path,
         tools,
         FakeClient([response("first"), response("second")]),
-        config={"max_repairs": 0},
+        config={"max_group_chars": 1, "max_repairs": 0},
     )
     assert output.status == "failure"
     assert "accepted unstructured source digest mismatch" in output.error

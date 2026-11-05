@@ -2205,7 +2205,7 @@ def test_proctor_libc_call_guidance_uses_only_current_scc_resolved_paths():
     assert stage_module._proctor_libc_call_guidance((), records_by_id) == ""
 
     empty = render_prompt(PromptRenderInput("DEPENDENCY", "TARGETS"))
-    assert "source calls in the current SCC" not in empty.text
+    assert "source calls in the current group" not in empty.text
     rendered = render_prompt(
         PromptRenderInput("DEPENDENCY", "TARGETS", proctor_libc_call_guidance=guidance)
     )
@@ -3985,7 +3985,9 @@ def test_postprocessing_publishes_built_split_project_after_observations(tmp_pat
     assert not destination.joinpath("obsolete.rs").exists()
     assert source.joinpath("lib.rs").read_text() == "old\n"
     assert (value.framework.workdir / "current/lib.rs").read_text() == finalized
-    assert (value.framework.workdir / "sccs/000000/accepted.rs").read_text() == accepted
+    assert (
+        value.framework.workdir / "groups/000000/accepted.rs"
+    ).read_text() == accepted
     assert json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
         "observations"
     ] == [observation]
@@ -4036,8 +4038,8 @@ def test_postprocessing_failures_preserve_accepted_work_without_publication(
     assert (work / "current/proctor.toml").read_bytes() == (
         value.inputs.rust_project / "proctor.toml"
     ).read_bytes()
-    assert (work / "sccs/000000/accepted.rs").read_text() == "accepted source\n"
-    assert (work / "sccs/000000/accepted-observations/000000.json").is_file()
+    assert (work / "groups/000000/accepted.rs").read_text() == "accepted source\n"
+    assert (work / "groups/000000/accepted-observations/000000.json").is_file()
     assert (value.inputs.rust_project / "lib.rs").read_text() == "old\n"
     assert not value.outputs.rust_project.exists()
     assert not any(
@@ -4339,7 +4341,7 @@ def test_preparation_and_initialization_event_order_is_exact(
     ]
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 0,
         "scc_count": 0,
         "llm_generation_calls": 0,
@@ -5061,7 +5063,7 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
     assert (value.outputs.rust_project / "lib.rs").read_text() == "mechanically fixed\n"
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 0,
@@ -5074,7 +5076,7 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
         "llm_unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_scc_count": 1,
         "llm_transformation_calls": 0,
         "llm_repair_calls": 0,
@@ -5117,7 +5119,7 @@ def test_failed_applied_build_falls_back_once_to_baseline_with_shared_budget(tmp
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
         "llm_unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_scc_count": 1,
         "llm_transformation_calls": 0,
         "llm_repair_calls": 1,
@@ -5174,7 +5176,7 @@ def test_statistics_count_recursive_final_views_across_all_functions(tmp_path):
         "llm_transformation_calls": 1,
         "llm_repair_calls": 0,
         "llm_unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "statements": {
             "total": 4,
             "preserve": 1,
@@ -5287,9 +5289,9 @@ def test_statistics_include_exact_recursive_mechanical_counts(tmp_path):
 def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_path):
     rule_set = anchorless_rule_set(tmp_path)
     first = apply_rules(
-        fn_record(0, "first", "first", [1]),
+        fn_record(0, "first", "first", [1], transformation_labels=[0, 1]),
         rule_labels=[0],
-        transform_labels=[],
+        transform_labels=[1],
     )
     second = fn_record(1, "second", "second", [0])
     tools = FakeTools(
@@ -5321,7 +5323,7 @@ def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_p
     )
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 2,
         "scc_count": 1,
         "llm_generation_calls": 2,
@@ -5332,7 +5334,7 @@ def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_p
     }
 
 
-def test_printf_rule_build_failure_uses_whole_scc_baseline_once(tmp_path):
+def test_failed_rule_generated_functions_group_for_baseline_repair(tmp_path):
     rule_set = anchorless_rule_set(tmp_path)
     printf_member = fn_record(
         0,
@@ -5391,11 +5393,13 @@ def test_printf_rule_build_failure_uses_whole_scc_baseline_once(tmp_path):
         builds=[
             CommandResult(0),
             CommandResult(101, "applied out", "applied err"),
+            CommandResult(101, "second out", "second err"),
             CommandResult(0),
         ],
         validators=[VALID],
         candidates=[
             "unsafe fn printf_member() { rule_value(); }\n"
+            "unsafe fn ordinary_member() {}\n",
             "unsafe fn ordinary_member() {}\n",
             'unsafe fn printf_member() { ::std::print!("fixed"); }\n'
             "unsafe fn ordinary_member() {}\n",
@@ -5415,24 +5419,26 @@ def test_printf_rule_build_failure_uses_whole_scc_baseline_once(tmp_path):
     _, output = run_fake(tmp_path, tools, client, rule_set=rule_set)
     assert output.status == "success"
     replacements = [event for event in tools.events if event[0] == "add_functions"]
-    assert len(replacements) == 2
-    assert replacements[1][3] == "fn printf_member() {}\nfn ordinary_member() {}\n"
+    assert len(replacements) == 3
+    assert replacements[2][3] == "fn printf_member() {}\nfn ordinary_member() {}\n"
     assert [item["view"] for item in replacements[0][2]["items"]] == [
-        printf_member["applied"],
-        ordinary_member["applied"],
+        printf_member["applied"]
     ]
     assert [item["view"] for item in replacements[1][2]["items"]] == [
+        ordinary_member["applied"]
+    ]
+    assert [item["view"] for item in replacements[2][2]["items"]] == [
         printf_member["baseline"],
         ordinary_member["baseline"],
     ]
     assert all(
         replacement[2]["items"][0]["view"]["skeleton"].count('::std::print!("fixed");')
         == 1
-        for replacement in replacements
+        for replacement in (replacements[0], replacements[2])
     )
     assert len(client.requests) == 1
     assert output.metrics["repair_calls"] == 1
-    assert output.metrics["compilation_failures"] == 1
+    assert output.metrics["compilation_failures"] == 2
     assert len([event for event in tools.events if event[0] == "validate"]) == 1
 
 
@@ -5564,7 +5570,7 @@ def test_repairs_before_applied_build_failure_are_not_reset_on_fallback(tmp_path
     assert "unsafe fn target()" in client.requests[3].messages[0].content
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 4,
@@ -5629,7 +5635,7 @@ def test_applied_fallback_and_baseline_repairs_share_configured_repair_limit(
     assert len(client.requests) == response_count
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": response_count,
@@ -5710,7 +5716,7 @@ def test_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
     assert len([event for event in tools.events if event[0] == "add_functions"]) == 2
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 2,
         "scc_count": 2,
         "llm_generation_calls": 0,
@@ -5721,7 +5727,7 @@ def test_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
     }
 
 
-def test_mixed_scc_still_uses_one_llm_request(tmp_path):
+def test_mixed_scc_compiles_preserved_function_without_llm_rewriting(tmp_path):
     tools = FakeTools(
         skeletons=[
             fn_record(
@@ -5736,23 +5742,19 @@ def test_mixed_scc_still_uses_one_llm_request(tmp_path):
         builds=[CommandResult(0), CommandResult(0)],
         validators=[VALID],
         candidates=[
-            "unsafe fn preserved() { () }\nunsafe fn changed() { transformed(); }\n"
+            "unsafe fn preserved() { () }\n",
+            "unsafe fn preserved() { () }\nunsafe fn changed() { transformed(); }\n",
         ],
     )
-    client = FakeClient(
-        [
-            "```rust\n"
-            "unsafe fn preserved() { #[proctor(0)] 999 }\n"
-            "unsafe fn changed() { #[proctor(0)] () }\n"
-            "```"
-        ]
-    )
+    client = FakeClient(["```rust\nunsafe fn changed() { #[proctor(0)] () }\n```"])
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "success"
     assert len(client.requests) == 1
-    replacement = next(event for event in tools.events if event[0] == "add_functions")
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
+    assert len(replacements) == 2
+    replacement = replacements[1]
     items = replacement[2]["items"]
-    assert [item["view"]["needs_transformation"] for item in items] == [False, True]
+    assert [item["view"]["needs_transformation"] for item in items] == [True]
     emitted = (value.outputs.rust_project / "lib.rs").read_text()
     assert "unsafe fn preserved() { () }" in emitted
     assert "999" not in emitted
@@ -5760,7 +5762,7 @@ def test_mixed_scc_still_uses_one_llm_request(tmp_path):
     assert output.metrics["llm_generation_calls"] == 1
 
 
-def test_mixed_mechanical_printf_and_transform_scc_keep_canonical_statement(
+def test_mixed_scc_compiles_mechanical_printf_separately_from_transformation(
     tmp_path,
 ):
     mechanical = printf_record(0, "fixed", "fixed", [1], argument_count=0)
@@ -5774,14 +5776,14 @@ def test_mixed_mechanical_printf_and_transform_scc_keep_canonical_statement(
             assert {
                 item["item_id"]: item["transform_labels"]
                 for item in metadata_value["current_items"]
-            } == {0: [], 1: [0]}
+            } == {1: [0]}
             super().extract_observations(observation_source, metadata, output)
 
     tools = MixedTools(
         skeletons=[mechanical, transformed],
         builds=[CommandResult(0), CommandResult(0)],
         validators=[VALID],
-        candidates=["accepted mixed SCC\n"],
+        candidates=["accepted fixed function\n", "accepted changed function\n"],
         sidecars=[
             {
                 "statements": [
@@ -5791,6 +5793,10 @@ def test_mixed_mechanical_printf_and_transform_scc_keep_canonical_statement(
                         "label": 0,
                         "after_statement": ('#[proctor(0)]\n::std::print!("hello");'),
                     },
+                ],
+            },
+            {
+                "statements": [
                     {
                         "item_id": 1,
                         "path": "changed",
@@ -5800,7 +5806,7 @@ def test_mixed_mechanical_printf_and_transform_scc_keep_canonical_statement(
                         ),
                     },
                 ],
-            }
+            },
         ],
         observations=[
             {
@@ -5813,7 +5819,6 @@ def test_mixed_mechanical_printf_and_transform_scc_keep_canonical_statement(
     client = FakeClient(
         [
             "```rust\n"
-            f"{canonical}\n\n"
             'unsafe fn changed() { #[proctor(0)] ::std::print!("{}", changed_value); }\n'
             "```"
         ]
@@ -5822,8 +5827,10 @@ def test_mixed_mechanical_printf_and_transform_scc_keep_canonical_statement(
     assert output.status == "success"
     assert len(client.requests) == 1
     validation = next(event for event in tools.events if event[0] == "validate")
-    replacement = next(event for event in tools.events if event[0] == "add_functions")
-    for request in (validation[1], replacement[2]):
+    replacements = [event for event in tools.events if event[0] == "add_functions"]
+    replacement = replacements[0]
+    assert [item["id"] for item in validation[1]["expected_functions"]] == [1]
+    for request in (replacement[2],):
         items = request.get("expected_functions", request.get("items"))
         fixed = next(item for item in items if item["id"] == 0)
         assert fixed["view"]["skeleton"] == canonical
@@ -5867,7 +5874,7 @@ def test_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_path):
         candidates=["scalar\n", "pointer\n", "root\n"],
     )
     client = FakeClient([response("pointer_leaf"), response("root")])
-    _, output = run_fake(tmp_path, tools, client)
+    _, output = run_fake(tmp_path, tools, client, config={"max_group_chars": 1})
     assert output.status == "success"
     replacements = [
         event[2]["items"][0]["name"]
@@ -5914,16 +5921,18 @@ def test_mechanical_signature_change_adds_implementation_without_wrapper(tmp_pat
     assert output.metrics["cargo_builds"] == 3
 
 
-def test_mechanical_build_failure_is_fatal_without_repair(tmp_path):
+def test_mechanical_build_failure_stops_when_unstructured_repair_is_disabled(tmp_path):
     tools = FakeTools(
         skeletons=[printf_record(0, "target", "target", [], argument_count=0)],
         builds=[CommandResult(0), CommandResult(101, "out", "bad")],
         candidates=["broken\n"],
     )
     client = FakeClient([])
-    value, output = run_fake(tmp_path, tools, client)
+    value, output = run_fake(
+        tmp_path, tools, client, config={"max_unstructured_repairs": 0}
+    )
     assert output.status == "failure"
-    assert "mechanical SCC candidate cargo build --lib failed" in output.error
+    assert "exhausted 0 unstructured repair calls" in output.error
     assert client.requests == []
     assert output.metrics["repair_calls"] == 0
     assert output.metrics["compilation_failures"] == 1
@@ -5960,7 +5969,7 @@ def test_mechanical_replacer_failure_is_fatal_without_repair(tmp_path):
     assert output.status == "failure"
     assert (
         output.error
-        == "StageFailure: SCC job 0: StageFailure: mechanical replacement rejected"
+        == "StageFailure: group job 0: StageFailure: mechanical replacement rejected"
     )
     assert client.requests == []
     assert output.metrics["repair_calls"] == 0
@@ -6119,6 +6128,16 @@ def test_printf_guidance_is_identical_across_initial_validation_and_build_repair
         argument_count=1,
         rule_applied=True,
     )
+    for view_name in ("baseline", "applied"):
+        view = rule_member[view_name]
+        view["skeleton"] = (
+            view["skeleton"].rsplit("}", 1)[0] + "#[proctor(1)] todo!(); }"
+        )
+        view["needs_transformation"] = True
+        view["statement_dispositions"].append(
+            {"label": 1, "disposition": "transform", "children": []}
+        )
+        view["statement_pair_metadata"].append(_pointer_metadata(1))
     rule_member["printf_format_specifiers"] = ["%#x", "%d"]
     rule_member["proctor_libc_function_paths"] = ["proctor_libc::isalpha"]
     llm_member = printf_record(
@@ -6505,7 +6524,7 @@ def test_repeated_transformations_fail_scc_before_revalidation(
     )
     assert output.status == "failure"
     assert output.error.endswith(
-        f"SCC 0 repeated transformation at generation {failed_count} "
+        f"group 0 repeated transformation at generation {failed_count} "
         "(first seen at generation 0)"
     )
     assert len(client.requests) == output.usage.calls == failed_count + 1
@@ -6518,7 +6537,7 @@ def test_repeated_transformations_fail_scc_before_revalidation(
     assert (
         len([event for event in tools.events if event[0] == "validate"]) == failed_count
     )
-    jobdir = value.framework.workdir / "sccs/000000"
+    jobdir = value.framework.workdir / "groups/000000"
     assert (
         jobdir / "last-failed-transformation.txt"
     ).read_text() == extract_code_block(responses[0]).candidate
@@ -6549,7 +6568,7 @@ def test_repeated_invalid_patch_exhausts_budget_without_validator(tmp_path):
     assert output.metrics["repair_calls"] == 2
     assert output.metrics["structural_failures"] == 3
     assert not [event for event in tools.events if event[0] == "validate"]
-    jobdir = value.framework.workdir / "sccs/000000"
+    jobdir = value.framework.workdir / "groups/000000"
     assert (jobdir / "last-failed-transformation.txt").read_text() == "no fence"
 
 
@@ -6575,7 +6594,7 @@ def test_repeat_detection_compares_the_complete_scc_output(tmp_path):
             fn_record(1, "second", "second", [0]),
         ],
         validators=[INVALID, VALID],
-        candidates=["accepted SCC\n"],
+        candidates=["accepted group\n"],
     )
     client = FakeClient(
         patch_responses(
@@ -6599,7 +6618,7 @@ def test_repeat_history_is_private_to_each_scc(tmp_path):
             fn_record(1, "second::target", "target", []),
         ],
         validators=[VALID, VALID],
-        candidates=["first SCC\n", "second SCC\n"],
+        candidates=["first group\n", "second group\n"],
     )
     _, output = run_fake(tmp_path, tools, FakeClient([response(), response()]))
     assert output.status == "success", output.error
@@ -6777,7 +6796,10 @@ def test_later_scc_resets_source_and_uses_immutable_skeleton_prompt(tmp_path):
         candidates=["after-callee\n", "after-caller\n"],
     )
     _, output = run_fake(
-        tmp_path, tools, FakeClient([response("callee"), response("caller")])
+        tmp_path,
+        tools,
+        FakeClient([response("callee"), response("caller")]),
+        config={"max_group_chars": 1},
     )
     assert output.status == "success"
     assert [event[3] for event in tools.events if event[0] == "add_functions"] == [
@@ -6948,6 +6970,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
     assert manifest["produces"] == {"rust_project": True}
     assert set(manifest["config"]) == {
         "workers",
+        "max_group_chars",
         "max_repairs",
         "max_unstructured_repairs",
         "crat_dir",
@@ -6960,6 +6983,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
         "validation_repair_timeout_s",
     }
     assert manifest["config"]["workers"]["default"] == 4
+    assert manifest["config"]["max_group_chars"]["default"] == 15_000
     assert manifest["config"]["max_repairs"]["default"] == 5
     assert manifest["config"]["max_unstructured_repairs"]["default"] == 5
     assert manifest["config"]["crat_dir"]["default"] == "../crat"
@@ -7031,6 +7055,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
     ]
     assert output.config_used == {
         "workers": 1,
+        "max_group_chars": 15_000,
         "max_repairs": 5,
         "max_unstructured_repairs": 5,
         "crat_dir": str((STAGE_DIR / "../crat").resolve()),
@@ -7044,7 +7069,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
     }
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 1,
@@ -7095,7 +7120,7 @@ def test_dump_llm_exchanges_preserves_each_generation(tmp_path, artifacts):
         if value.outputs.artifacts_dir is not None
         else value.framework.workdir
     )
-    exchange_root = root / "llm-exchanges" / "scc-0"
+    exchange_root = root / "llm-exchanges" / "group-0"
     for generation, raw_response in enumerate([first_response, second_response]):
         generation_dir = exchange_root / f"generation-{generation:02d}"
         assert generation_dir.joinpath("prompt.md").read_text(encoding="utf-8") == (
@@ -8338,7 +8363,7 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
     assert len(client.requests) == 3
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 3,
@@ -8351,7 +8376,7 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
         "llm_unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_scc_count": 1,
         "llm_transformation_calls": 1,
         "llm_repair_calls": 2,
@@ -8423,16 +8448,17 @@ def test_sccs_use_frozen_interfaces_without_promoting_earlier_bodies(tmp_path):
         tmp_path,
         tools,
         FakeClient([response("leaf"), response("root")]),
+        config={"max_group_chars": 1},
     )
     assert output.status == "success"
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert replacements[0][2]["accepted_correspondence"] == []
     assert replacements[1][2]["accepted_correspondence"] == []
     first = json.loads(
-        (tmp_path / "work/sccs/000000/replacement-request.json").read_text()
+        (tmp_path / "work/groups/000000/replacement-request.json").read_text()
     )
     second = json.loads(
-        (tmp_path / "work/sccs/000001/replacement-request.json").read_text()
+        (tmp_path / "work/groups/000001/replacement-request.json").read_text()
     )
     assert [item["id"] for item in first["items"]] == [0]
     assert [item["id"] for item in second["items"]] == [1]
@@ -8495,14 +8521,15 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
         tools,
         FakeClient([response("leaf"), response("root")]),
         rule_set=rule_set,
+        config={"max_group_chars": 1},
     )
     assert output.status == "success"
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert [event[2]["items"][0]["id"] for event in replacements] == [0, 1]
     merge = next(event for event in tools.events if event[0] == "merge_observations")
     assert [str(path.relative_to(value.framework.workdir)) for path in merge[1]] == [
-        "sccs/000000/accepted-observations/000000.json",
-        "sccs/000001/accepted-observations/000000.json",
+        "groups/000000/accepted-observations/000000.json",
+        "groups/000001/accepted-observations/000000.json",
     ]
     assert [json.loads(path.read_text()) for path in merge[1]] == [
         {
@@ -8522,7 +8549,7 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
     assert published["observations"] == [leaf, leaf, root0, root1]
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 2,
         "scc_count": 2,
         "llm_generation_calls": 2,
@@ -8535,7 +8562,7 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
         "llm_unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_scc_count": 2,
         "llm_transformation_calls": 2,
         "llm_repair_calls": 0,
@@ -8599,6 +8626,7 @@ def test_accepted_pairs_sort_by_item_and_label_not_scc_schedule(tmp_path):
         tmp_path,
         tools,
         FakeClient([response("independent"), response("leaf"), response("root")]),
+        config={"max_group_chars": 1},
     )
     assert output.status == "success"
     processed = [
@@ -8919,7 +8947,7 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
     ]
     assert output.metrics == {
         "unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 1,
@@ -8932,7 +8960,7 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
         (value.outputs.artifacts_dir / "statistics.json").read_text()
     ) == {
         "llm_unstructured_repair_calls": 0,
-        "unstructured_scc_count": 0,
+        "unstructured_group_count": 0,
         "function_scc_count": 1,
         "llm_transformation_calls": 1,
         "llm_repair_calls": 0,
@@ -9000,7 +9028,7 @@ def test_empty_document_is_always_published_beside_statement_pairs(tmp_path):
         statistics = report.with_name("statistics.json")
         assert json.loads(statistics.read_text()) == {
             "llm_unstructured_repair_calls": 0,
-            "unstructured_scc_count": 0,
+            "unstructured_group_count": 0,
             "function_scc_count": 0,
             "llm_transformation_calls": 0,
             "llm_repair_calls": 0,
@@ -9699,7 +9727,7 @@ def test_concurrent_workers_reuse_private_projects_and_preserve_all_usage(tmp_pa
             clients.append(client)
         return client
 
-    value = stage_input(tmp_path, config={"workers": 2})
+    value = stage_input(tmp_path, config={"max_group_chars": 1, "workers": 2})
     output = run_stage(
         value, stage_dir=STAGE_DIR, tools=tools, llm_client_factory=factory
     )
@@ -9738,7 +9766,7 @@ def test_concurrent_workers_reuse_private_projects_and_preserve_all_usage(tmp_pa
 
 def test_single_worker_reuses_one_project_and_serializes_sccs(tmp_path):
     tools = ConcurrentTools(3)
-    value = stage_input(tmp_path, config={"workers": 1})
+    value = stage_input(tmp_path, config={"max_group_chars": 1, "workers": 1})
     output = run_stage(
         value,
         stage_dir=STAGE_DIR,
@@ -9776,7 +9804,7 @@ def test_failure_stops_dispatch_and_waits_for_inflight_usage(tmp_path, monkeypat
             return super().cargo_build(current, library_only=library_only)
 
     tools = FailingTools(5)
-    value = stage_input(tmp_path, config={"workers": 2})
+    value = stage_input(tmp_path, config={"max_group_chars": 1, "workers": 2})
     output = run_stage(
         value,
         stage_dir=STAGE_DIR,
@@ -9799,7 +9827,7 @@ def test_failure_stops_dispatch_and_waits_for_inflight_usage(tmp_path, monkeypat
         event[0] in {"assemble_project", "finalize_project", "merge_observations"}
         for event in tools.events
     )
-    assert (value.framework.workdir / "sccs/000001/accepted.rs").is_file()
+    assert (value.framework.workdir / "groups/000001/accepted.rs").is_file()
     assert len(list((value.framework.workdir / "workers").glob("*/failure.txt"))) == 1
 
 
@@ -9826,8 +9854,8 @@ def test_default_workers_share_one_rate_limiter_across_clients(tmp_path, monkeyp
                 limiters.append(limiter)
 
     monkeypatch.setattr(stage_module, "LlmClient", Client)
-    value = stage_input(tmp_path)
-    value = replace(value, config={})
+    value = stage_input(tmp_path, config={"max_group_chars": 1})
+    value = replace(value, config={"max_group_chars": 1})
     tools = ConcurrentTools(6)
     output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
     assert output.status == "success", output.error
@@ -9899,7 +9927,7 @@ def test_exhausted_structural_repairs_retain_latest_failure_without_exchange_dum
         tmp_path, tools, FakeClient(responses), config={"max_unstructured_repairs": 0}
     )
     assert output.status == "failure"
-    jobdir = value.framework.workdir / "sccs/000000"
+    jobdir = value.framework.workdir / "groups/000000"
     assert (jobdir / "last-failed-patch.txt").read_text() == responses[-1]
     assert (jobdir / "repair-base.rs").read_text() == tools.skeletons[0]["applied"][
         "skeleton"
@@ -9921,7 +9949,7 @@ def test_final_build_failure_retains_all_successful_scc_results(tmp_path):
             return super().cargo_build(current, library_only=True)
 
     tools = IntegrationFailureTools(3)
-    value = stage_input(tmp_path, config={"workers": 2})
+    value = stage_input(tmp_path, config={"max_group_chars": 1, "workers": 2})
     output = run_stage(
         value,
         stage_dir=STAGE_DIR,
@@ -9932,11 +9960,11 @@ def test_final_build_failure_retains_all_successful_scc_results(tmp_path):
     assert "final cargo build failed (8)" in output.error
     assert output.metrics["llm_generation_calls"] == 3
     assert output.metrics["repair_calls"] == 0
-    assert len(list((value.framework.workdir / "sccs").glob("*/accepted.rs"))) == 3
+    assert len(list((value.framework.workdir / "groups").glob("*/accepted.rs"))) == 3
     assert (
         len(
             list(
-                (value.framework.workdir / "sccs").glob(
+                (value.framework.workdir / "groups").glob(
                     "*/accepted-replacement-observation-metadata.json"
                 )
             )
@@ -10021,7 +10049,9 @@ def test_independent_observation_metadata_rejects_wrong_frozen_identity(
         validators=[VALID],
         candidates=["candidate\n"],
     )
-    value, output = run_fake(tmp_path, tools, FakeClient([response("first")]))
+    value, output = run_fake(
+        tmp_path, tools, FakeClient([response("first")]), config={"max_group_chars": 1}
+    )
     assert output.status == "failure"
     assert diagnostic in output.error
     assert output.metrics["cargo_builds"] == 1
@@ -10081,7 +10111,7 @@ def test_frozen_bundle_cannot_be_overwritten_by_tool_outputs(tmp_path, operation
         "work/final-project/usage.jsonl",
         "work/analysis/usage.jsonl",
         "work/workers/00/usage.jsonl",
-        "work/sccs/000000/usage.jsonl",
+        "work/groups/000000/usage.jsonl",
         "work/frozen-project.json",
         "work/assembled.rs",
         "work/assembled.json",
@@ -10125,11 +10155,11 @@ def test_usage_log_cannot_alias_an_existing_worker_log_symlink(tmp_path):
         "analysis",
         "current",
         "workers",
-        "sccs",
+        "groups",
         "final-rollback",
         "final-project",
         "workers/00",
-        "sccs/000000",
+        "groups/000000",
     ],
 )
 @pytest.mark.parametrize("target_kind", ["input", "crat", "external", "dangling"])
@@ -10298,7 +10328,7 @@ def test_unfilled_transformation_hole_uses_local_repair_before_build_or_observat
         "observations"
     ] == [{"accepted": True}]
     assert (
-        value.framework.workdir / "sccs/000000/accepted.rs"
+        value.framework.workdir / "groups/000000/accepted.rs"
     ).read_text() == "repaired candidate\n"
 
 
@@ -10338,7 +10368,7 @@ def test_unfilled_whole_function_stub_exhausts_shared_repair_budget_without_obse
         event[0] in {"extract_observations", "assemble_project", "finalize_project"}
         for event in tools.events
     )
-    assert not list((value.framework.workdir / "sccs").glob("*/accepted.rs"))
+    assert not list((value.framework.workdir / "groups").glob("*/accepted.rs"))
     assert not value.outputs.rust_project.exists()
     assert not (value.outputs.artifacts_dir / "observations.json").exists()
 
@@ -10380,7 +10410,7 @@ def test_mechanical_whole_function_stub_remains_fatal_without_llm_repair(tmp_pat
     value, output = run_fake(tmp_path, tools, client)
     assert output.status == "failure"
     assert (
-        "mechanical SCC candidate contains unfilled transformation holes"
+        "mechanical group candidate contains unfilled transformation holes"
         in output.error
     )
     assert not client.requests
@@ -10412,7 +10442,7 @@ def test_build_rewriting_candidate_source_fails_before_acceptance_or_observation
         event[0] in {"extract_observations", "assemble_project", "finalize_project"}
         for event in tools.events
     )
-    assert not list((value.framework.workdir / "sccs").glob("*/accepted.rs"))
+    assert not list((value.framework.workdir / "groups").glob("*/accepted.rs"))
     assert not value.outputs.rust_project.exists()
     assert not any(
         (value.outputs.artifacts_dir / name).exists()

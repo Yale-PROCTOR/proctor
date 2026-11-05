@@ -1,7 +1,7 @@
 +++
 id = "local_transformation"
 version = 1
-description = "Transform one Rust function SCC against Crat skeletons."
+description = "Transform one Rust function group against Crat skeletons."
 variables = ["dependency_context", "transformation_targets", "repair_context", "repair_base", "use_xj_scanf_guidance", "libc_guidance", "printf_guidance", "proctor_libc_call_guidance", "foreign_static_guidance"]
 +++
 You are transforming unsafe Rust functions generated from C.
