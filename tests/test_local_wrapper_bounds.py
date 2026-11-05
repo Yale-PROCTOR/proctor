@@ -16,15 +16,22 @@ from tests.test_local_transformation import FakeTools, STAGE_DIR, stage_input
 
 INTERNALS = {
     "first": "unsafe fn first_internal(p: &[i32], n: usize) -> i32 { p[n - 1] }",
-    "second": "unsafe fn second_internal(a: &[u8], b: &mut [u8], n: usize) { b[..n].copy_from_slice(&a[..n]); }",
+    "second": (
+        "unsafe fn second_internal<'a>(a: Option<&[u8]>, b: Option<&'a mut [u8]>, "
+        "n: usize) -> Option<&'a mut [u8]> { b.map(|b| { if let Some(a) = a { "
+        "b[..n].copy_from_slice(&a[..n]); } b }) }"
+    ),
 }
 WRAPPERS = {
     "first": """unsafe fn first(p: *const i32, n: usize) -> i32 {
     first_internal(if p.is_null() { &[] } else { std::slice::from_raw_parts(p, 1_000_000) }, n)
 }""",
-    "second": """unsafe fn second(a: *const u8, b: *mut u8, n: usize) {
-    second_internal(if a.is_null() { &[] } else { std::slice::from_raw_parts(a, 1_000_000) },
-                    if b.is_null() { &mut [] } else { std::slice::from_raw_parts_mut(b, 1_000_000) }, n)
+    "second": """unsafe fn second(a: *const u8, b: *mut u8, n: usize) -> *mut u8 {
+    (second_internal(if a.is_null() { ::core::option::Option::None }
+                     else { ::core::option::Option::Some(::core::slice::from_raw_parts(a, 1_000_000)) },
+                     if b.is_null() { ::core::option::Option::None }
+                     else { ::core::option::Option::Some(::core::slice::from_raw_parts_mut(b, 1_000_000)) }, n))
+        .map_or(::core::ptr::null_mut(), |slice| slice.as_mut_ptr())
 }""",
 }
 SOURCE = (
