@@ -1,7 +1,7 @@
 +++
 id = "unstructured_repair"
 version = 1
-description = "Repair a complete Rust function SCC using fixed target signatures and freely rewritten bodies."
+description = "Repair a complete Rust function group using fixed target signatures and freely rewritten bodies."
 variables = ["dependency_context", "transformation_targets", "repair_context", "repair_base", "use_xj_scanf_guidance", "libc_guidance", "printf_guidance", "proctor_libc_call_guidance", "foreign_static_guidance"]
 +++
 You are repairing Rust functions generated from C after constrained transformation

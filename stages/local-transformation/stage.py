@@ -35,6 +35,7 @@ from model import (
     ObservationError,
     dependency_context,
     function_graph,
+    group_functions,
     strongly_connected_components,
     load_skeletons,
     load_replacement_metadata,
@@ -109,7 +110,7 @@ class Metrics:
     compilation_failures: int = 0
     cargo_builds: int = 0
     unstructured_repair_calls: int = 0
-    unstructured_scc_count: int = 0
+    unstructured_group_count: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -121,7 +122,7 @@ class Metrics:
             "compilation_failures": self.compilation_failures,
             "cargo_builds": self.cargo_builds,
             "unstructured_repair_calls": self.unstructured_repair_calls,
-            "unstructured_scc_count": self.unstructured_scc_count,
+            "unstructured_group_count": self.unstructured_group_count,
         }
 
 
@@ -138,7 +139,7 @@ class RunState:
     )
     accepted_observation_documents: list[Path] = field(default_factory=list)
     accepted_views: dict[int, SkeletonView] = field(default_factory=dict)
-    unstructured_sccs: set[tuple[int, ...]] = field(default_factory=set)
+    unstructured_groups: set[tuple[int, ...]] = field(default_factory=set)
     validation_report: dict[str, Any] | None = None
 
 
@@ -156,6 +157,19 @@ class AcceptedStatementPair:
     path: str
     metadata: StatementPairMetadata
     after_statement: str
+
+
+@dataclass(frozen=True)
+class CompilationFailure:
+    item_id: int
+    transformation: str
+    diagnostics: str
+
+
+@dataclass(frozen=True)
+class TransformationGroup:
+    members: tuple[int, ...]
+    failures: tuple[CompilationFailure, ...] = ()
 
 
 def _uses_xj_scanf_guidance(
@@ -202,7 +216,7 @@ def _proctor_libc_call_guidance(
         return ""
     identities = ", ".join(f"`{path}`" for path in paths)
     return (
-        "The following source calls in the current SCC resolve to functions supplied "
+        "The following source calls in the current group resolve to functions supplied "
         f"by `proctor_libc`: {identities}. These calls implement this pipeline's "
         "approved semantics safely and idiomatically. When rewriting a transformation "
         "region containing one, retain the same resolved `proctor_libc` callee rather "
@@ -254,6 +268,7 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
             "crat_dir",
             "dump_llm_exchanges",
             "workers",
+            "max_group_chars",
             "max_repairs",
             "max_unstructured_repairs",
             "max_validation_repairs",
@@ -275,6 +290,9 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
     workers = config.get("workers", 4)
     if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
         raise StageFailure("config.workers must be a positive integer")
+    max_group_chars = config.get("max_group_chars", 15_000)
+    if type(max_group_chars) is not int or max_group_chars <= 0:
+        raise StageFailure("config.max_group_chars must be a positive integer")
     max_repairs = config.get("max_repairs", 5)
     if (
         isinstance(max_repairs, bool)
@@ -321,6 +339,7 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
             raise StageFailure(f"config.{name} must be a positive integer")
     return {
         "workers": workers,
+        "max_group_chars": max_group_chars,
         "max_repairs": max_repairs,
         "max_unstructured_repairs": max_unstructured_repairs,
         "crat_dir": str((stage_dir / crat_dir).resolve()),
@@ -546,7 +565,7 @@ def _validate_boundaries(
         "analysis",
         "current",
         "workers",
-        "sccs",
+        "groups",
         "final-rollback",
         "final-project",
         "test-validation",
@@ -556,7 +575,7 @@ def _validate_boundaries(
         if root.is_symlink():
             raise StageFailure(f"scratch directory must not be a symlink: {root}")
         if (
-            directory in {"workers", "sccs", "test-validation", "wrapper-bounds"}
+            directory in {"workers", "groups", "test-validation", "wrapper-bounds"}
             and root.is_dir()
         ):
             for child in root.iterdir():
@@ -667,7 +686,7 @@ def _validate_boundaries(
     for directory in (
         "analysis",
         "workers",
-        "sccs",
+        "groups",
         "final-rollback",
         "final-project",
         "test-validation",
@@ -1063,7 +1082,7 @@ def _load_replacement_statement_pairs(
         if expected.get(key) != function_path:
             raise StageFailure(
                 f"replacement statement-pairs sidecar item/path is outside the "
-                f"current SCC request: {item_id}:{function_path}"
+                f"current group request: {item_id}:{function_path}"
             )
         result.append(
             ReplacementStatementPair(
@@ -1079,7 +1098,7 @@ def _load_replacement_statement_pairs(
         extra = sorted(actual_keys - set(expected))
         raise StageFailure(
             "replacement statement-pairs sidecar labels do not exactly match "
-            f"the current SCC request; missing={missing}, extra={extra}"
+            f"the current group request; missing={missing}, extra={extra}"
         )
     return tuple(result)
 
@@ -1116,7 +1135,7 @@ def _load_and_validate_replacement_metadata(
     )
     if metadata.accepted_correspondence:
         raise StageFailure(
-            "independent SCC metadata cannot contain accepted dependencies"
+            "independent group metadata cannot contain accepted dependencies"
         )
     if metadata.dependency_correspondence != expected_dependencies:
         raise StageFailure(
@@ -1455,7 +1474,7 @@ def _statistics_json(state: RunState) -> str:
         ),
         "llm_repair_calls": state.metrics.repair_calls,
         "llm_unstructured_repair_calls": state.metrics.unstructured_repair_calls,
-        "unstructured_scc_count": state.metrics.unstructured_scc_count,
+        "unstructured_group_count": state.metrics.unstructured_group_count,
         "statements": {
             "total": sum(counts.values()),
             **counts,
@@ -1478,7 +1497,7 @@ def _publish_final_outputs(
     statistics: str = (
         '{\n  "function_scc_count": 0,\n'
         '  "llm_transformation_calls": 0,\n  "llm_repair_calls": 0,\n'
-        '  "llm_unstructured_repair_calls": 0,\n  "unstructured_scc_count": 0,\n'
+        '  "llm_unstructured_repair_calls": 0,\n  "unstructured_group_count": 0,\n'
         '  "statements": {\n    "total": 0,\n    "preserve": 0,\n'
         '    "preserve_shell": 0,\n    "rule_applied": 0,\n'
         '    "transform": 0,\n    "mechanical": 0\n  }\n}\n'
@@ -1686,7 +1705,7 @@ def _load_unstructured_candidate(
     )
     if result.new_correspondence != expected:
         raise StageFailure(
-            "unstructured candidate identities differ from the requested SCC"
+            "unstructured candidate identities differ from the requested group"
         )
     return result
 
@@ -1719,7 +1738,7 @@ def _extract_transformation(
     return extraction
 
 
-def _process_unstructured_scc(
+def _process_unstructured_group(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
     *,
@@ -1736,7 +1755,12 @@ def _process_unstructured_scc(
     exchange_root: Path | None,
     max_repairs: int,
     state: RunState,
+    initial_diagnostics: str | None = None,
 ) -> None:
+    if initial_diagnostics is not None and max_repairs == 0:
+        raise StageFailure(
+            f"group {','.join(map(str, members))} exhausted 0 unstructured repair calls"
+        )
     preparation_request = workdir / "unstructured-preparation-request.json"
     preparation_output = workdir / "unstructured-preparation.json"
     write_json(
@@ -1750,7 +1774,7 @@ def _process_unstructured_scc(
     targets = prepared["targets"]
     if not isinstance(targets, list) or len(targets) != len(members):
         raise StageFailure(
-            "unstructured preparation must cover exactly the requested SCC"
+            "unstructured preparation must cover exactly the requested group"
         )
     for item_id, target in zip(sorted(members), targets, strict=True):
         record = records_by_id[item_id]
@@ -1790,10 +1814,12 @@ def _process_unstructured_scc(
         unstructured=True,
     )
     latest_failed = transformation
+    if initial_diagnostics is not None:
+        transformation = None
     stub_base = "\n\n".join(
         f"{target['signature']} {{ todo!() }}" for target in targets
     )
-    diagnostics: str | None = None
+    diagnostics = initial_diagnostics
     patch_failure: tuple[str, str] | None = None
     seen_results: dict[str, int] = {}
     calls = 0
@@ -1802,7 +1828,7 @@ def _process_unstructured_scc(
         if transformation is None:
             if calls == max_repairs:
                 raise StageFailure(
-                    f"SCC {','.join(map(str, members))} exhausted {max_repairs} unstructured repair calls"
+                    f"group {','.join(map(str, members))} exhausted {max_repairs} unstructured repair calls"
                 )
             calls += 1
             base = latest_failed or stub_base
@@ -1830,9 +1856,9 @@ def _process_unstructured_scc(
             request = llm_request(rendered, run_id=stage_input.run_id, members=members)
             exchange_dir = None
             if exchange_root is not None:
-                scc = "_".join(map(str, sorted(members)))
+                group = "_".join(map(str, sorted(members)))
                 exchange_dir = (
-                    exchange_root / f"scc-{scc}" / f"unstructured-{calls:02d}"
+                    exchange_root / f"group-{group}" / f"unstructured-{calls:02d}"
                 )
                 exchange_dir.mkdir(parents=True, exist_ok=True)
                 (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
@@ -1877,7 +1903,7 @@ def _process_unstructured_scc(
                     transformation, encoding="utf-8"
                 )
                 raise StageFailure(
-                    f"SCC {','.join(map(str, members))} repeated unstructured transformation "
+                    f"group {','.join(map(str, members))} repeated unstructured transformation "
                     f"at attempt {calls} (first seen at attempt {seen_results[transformation]})"
                 )
             seen_results[transformation] = calls
@@ -1922,8 +1948,8 @@ def _process_unstructured_scc(
                     )
                 shutil.copyfile(library_source, workdir / "accepted.rs")
                 shutil.copyfile(response_path, workdir / "accepted-unstructured.json")
-                state.unstructured_sccs.add(members)
-                state.metrics.unstructured_scc_count += 1
+                state.unstructured_groups.add(members)
+                state.metrics.unstructured_group_count += 1
                 return
             state.metrics.compilation_failures += 1
             latest_failed = transformation
@@ -1940,7 +1966,7 @@ def _process_unstructured_scc(
         transformation = None
 
 
-def _process_scc(
+def _process_group(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
     *,
@@ -1957,7 +1983,8 @@ def _process_scc(
     max_repairs: int,
     max_unstructured_repairs: int,
     state: RunState,
-) -> None:
+    failures: tuple[CompilationFailure, ...] = (),
+) -> CompilationFailure | None:
     duplicate_names: dict[str, list[ItemRecord]] = {}
     for item_id in members:
         record = records_by_id[item_id]
@@ -1968,7 +1995,7 @@ def _process_scc(
             ", ".join(f"{record.id}:{record.path}" for record in values)
             for values in duplicates
         )
-        raise StageFailure(f"duplicate function names inside SCC: {detail}")
+        raise StageFailure(f"duplicate function names inside group: {detail}")
 
     use_xj_scanf_guidance = _uses_xj_scanf_guidance(members, records_by_id)
     libc_guidance = _libc_guidance(members, records_by_id)
@@ -1984,14 +2011,48 @@ def _process_scc(
         item_id: cast(SkeletonView, records_by_id[item_id].baseline)
         for item_id in members
     }
-    active_views = applied_views
-    latest_failed: str | None = None
-    latest_diagnostics: str | None = None
+    active_views = baseline_views if failures else applied_views
+    latest_failed = (
+        "\n\n".join(failure.transformation for failure in failures)
+        if failures
+        else None
+    )
+    latest_diagnostics = (
+        "\n\n".join(
+            f"Function {failure.item_id}:{records_by_id[failure.item_id].path}:\n"
+            f"{failure.diagnostics}"
+            for failure in failures
+        )
+        if failures
+        else None
+    )
+    if failures and not any(
+        view.contains_rule_application for view in applied_views.values()
+    ):
+        _process_unstructured_group(
+            members,
+            records_by_id,
+            transformations=[cast(str, latest_failed)],
+            stage_input=stage_input,
+            current=current,
+            analysis=analysis,
+            frozen=frozen,
+            library_source=library_source,
+            workdir=workdir,
+            tools=tools,
+            client=client,
+            tracker=tracker,
+            exchange_root=exchange_root,
+            max_repairs=max_unstructured_repairs,
+            state=state,
+            initial_diagnostics=latest_diagnostics,
+        )
+        return None
     patch_failure: tuple[str, str] | None = None
     seen_results: dict[str, int] = {}
-    transformations: list[str] = []
+    transformations: list[str] = [latest_failed] if latest_failed is not None else []
     stopping_reason: str | None = None
-    generation = 0
+    generation = 1 if failures else 0
     mechanical = not any(view.needs_transformation for view in active_views.values())
 
     while generation <= max_repairs:
@@ -2030,9 +2091,9 @@ def _process_scc(
             request = llm_request(rendered, run_id=stage_input.run_id, members=members)
             exchange_dir: Path | None = None
             if exchange_root is not None:
-                scc = "_".join(str(item_id) for item_id in sorted(members))
+                group = "_".join(str(item_id) for item_id in sorted(members))
                 exchange_dir = (
-                    exchange_root / f"scc-{scc}" / f"generation-{generation:02d}"
+                    exchange_root / f"group-{group}" / f"generation-{generation:02d}"
                 )
                 exchange_dir.mkdir(parents=True, exist_ok=True)
                 (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
@@ -2087,7 +2148,7 @@ def _process_scc(
                     transformation, encoding="utf-8"
                 )
                 stopping_reason = (
-                    f"SCC {','.join(map(str, members))} repeated transformation "
+                    f"group {','.join(map(str, members))} repeated transformation "
                     f"at generation {generation} (first seen at generation "
                     f"{previous_generation})"
                 )
@@ -2179,7 +2240,7 @@ def _process_scc(
                 )
                 if mechanical:
                     raise StageFailure(
-                        f"mechanical SCC candidate contains unfilled transformation holes: {diagnostics}"
+                        f"mechanical group candidate contains unfilled transformation holes: {diagnostics}"
                     )
                 state.metrics.structural_failures += 1
                 latest_failed = transformation
@@ -2251,6 +2312,9 @@ def _process_scc(
             f"cargo build --lib stderr:\n{build.stderr}"
         )
         (workdir / "compiler-diagnostics.txt").write_text(diagnostics, encoding="utf-8")
+        if mechanical:
+            assert len(members) == 1
+            return CompilationFailure(members[0], transformation, diagnostics)
         rule_involved = any(
             view.contains_rule_application for view in active_views.values()
         )
@@ -2262,23 +2326,17 @@ def _process_scc(
             mechanical = False
             generation += 1
             continue
-        if mechanical:
-            raise StageFailure(
-                "mechanical SCC candidate cargo build --lib failed "
-                f"({build.returncode})\nstdout:\n{build.stdout}"
-                f"\nstderr:\n{build.stderr}"
-            )
         latest_failed = transformation
         latest_diagnostics = diagnostics
         generation += 1
 
     stopping_reason = (
         stopping_reason
-        or f"SCC {','.join(map(str, members))} exhausted {max_repairs} repair calls"
+        or f"group {','.join(map(str, members))} exhausted {max_repairs} repair calls"
     )
     if max_unstructured_repairs:
         (workdir / "structured-stop.txt").write_text(stopping_reason, encoding="utf-8")
-        _process_unstructured_scc(
+        _process_unstructured_group(
             members,
             records_by_id,
             transformations=transformations,
@@ -2294,6 +2352,9 @@ def _process_scc(
             exchange_root=exchange_root,
             max_repairs=max_unstructured_repairs,
             state=state,
+            initial_diagnostics=latest_diagnostics
+            if failures and generation == 1
+            else None,
         )
         return
     raise StageFailure(stopping_reason)
@@ -2307,14 +2368,14 @@ def _merge_job_state(state: RunState, job: RunState) -> None:
             getattr(state.metrics, name) + getattr(job.metrics, name),
         )
     state.prompts_used.update(job.prompts_used)
-    state.unstructured_sccs.update(job.unstructured_sccs)
+    state.unstructured_groups.update(job.unstructured_groups)
     state.statement_pairs.update(job.statement_pairs)
     state.accepted_observation_documents.extend(job.accepted_observation_documents)
     state.accepted_views.update(job.accepted_views)
 
 
-def _run_scc_workers(
-    schedule: tuple[tuple[int, ...], ...],
+def _run_group_workers(
+    components: tuple[tuple[int, ...], ...],
     records_by_id: dict[int, ItemRecord],
     *,
     stage_input: StageInput,
@@ -2329,6 +2390,26 @@ def _run_scc_workers(
     state: RunState,
     llm_client_factory: Callable[[dict[str, Any], UsageTracker], Any] | None,
 ) -> tuple[tuple[tuple[int, ...], Path], ...]:
+    ordered = tuple(item_id for members in components for item_id in members)
+    positions = {item_id: index for index, item_id in enumerate(ordered)}
+    limit = state.config_used["max_group_chars"]
+    transforming = tuple(
+        item_id
+        for item_id in ordered
+        if cast(SkeletonView, records_by_id[item_id].applied).needs_transformation
+    )
+    schedule = [
+        TransformationGroup(members)
+        for members in group_functions(transforming, records_by_id, limit)
+    ]
+    schedule.extend(
+        TransformationGroup((item_id,))
+        for item_id in ordered
+        if not cast(SkeletonView, records_by_id[item_id].applied).needs_transformation
+    )
+    schedule.sort(
+        key=lambda group: min(positions[item_id] for item_id in group.members)
+    )
     count = min(state.config_used["workers"], len(schedule))
     settings = dict(stage_input.framework.llm)
     settings["context_overflow"] = "error"
@@ -2343,6 +2424,8 @@ def _run_scc_workers(
     failures: dict[int, str] = {}
     jobs: dict[int, RunState] = {}
     accepted: dict[int, tuple[tuple[int, ...], Path]] = {}
+    deferred: dict[int, CompilationFailure] = {}
+    contexts: dict[int, tuple[Path, Any, UsageTracker, Any]] = {}
     artifacts = stage_input.outputs.artifacts_dir
     log_root = artifacts or workdir
     logs = tuple(log_root / f"worker-{index:02d}.log" for index in range(count))
@@ -2354,34 +2437,38 @@ def _run_scc_workers(
         root = workdir / "workers" / f"{index:02d}"
         job_index = -index - 1
         try:
-            if root.exists():
-                shutil.rmtree(root)
-            root.mkdir(parents=True)
-            current = root / "project"
-            shutil.copytree(
-                template,
-                current,
-                ignore=lambda directory, names: (
-                    {"target"} if Path(directory) == template else set()
-                ),
-            )
-            worker_tools = tools.fork(logs[index], current / "target")
-            tracker = UsageTracker(
-                usage_path,
-                run_id=stage_input.run_id,
-                stage=STAGE_ID,
-                item=stage_input.item,
-                pricing=PricingTable.from_config(settings),
-            )
-            client = factory(dict(settings), tracker)
+            if index not in contexts:
+                if root.exists():
+                    shutil.rmtree(root)
+                root.mkdir(parents=True)
+                current = root / "project"
+                shutil.copytree(
+                    template,
+                    current,
+                    ignore=lambda directory, names: (
+                        {"target"} if Path(directory) == template else set()
+                    ),
+                )
+                worker_tools = tools.fork(logs[index], current / "target")
+                tracker = UsageTracker(
+                    usage_path,
+                    run_id=stage_input.run_id,
+                    stage=STAGE_ID,
+                    item=stage_input.item,
+                    pricing=PricingTable.from_config(settings),
+                )
+                client = factory(dict(settings), tracker)
+                contexts[index] = current, worker_tools, tracker, client
+            current, worker_tools, tracker, client = contexts[index]
             while True:
                 with dispatch:
                     if failures or next_job == len(schedule):
                         return
                     job_index = next_job
                     next_job += 1
-                members = schedule[job_index]
-                jobdir = workdir / "sccs" / f"{job_index:06d}"
+                group = schedule[job_index]
+                members = group.members
+                jobdir = workdir / "groups" / f"{job_index:06d}"
                 if jobdir.exists():
                     shutil.rmtree(jobdir)
                 jobdir.mkdir(parents=True)
@@ -2390,7 +2477,7 @@ def _run_scc_workers(
                 shutil.copyfile(template / library_relative, current / library_relative)
                 job = RunState()
                 jobs[job_index] = job
-                _process_scc(
+                compilation_failure = _process_group(
                     members,
                     records_by_id,
                     stage_input=stage_input,
@@ -2408,8 +2495,12 @@ def _run_scc_workers(
                         "max_unstructured_repairs"
                     ],
                     state=job,
+                    failures=group.failures,
                 )
-                accepted[job_index] = (members, jobdir / "accepted.rs")
+                if compilation_failure is None:
+                    accepted[job_index] = (members, jobdir / "accepted.rs")
+                else:
+                    deferred[compilation_failure.item_id] = compilation_failure
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
             with dispatch:
@@ -2417,26 +2508,49 @@ def _run_scc_workers(
             root.mkdir(parents=True, exist_ok=True)
             (root / "failure.txt").write_text(detail + "\n", encoding="utf-8")
 
-    # Submit the workers, not the SCCs, so failures stop further dispatch while
-    # already running SCCs finish and record all usage before stage reporting.
+    # Submit the workers, not the groups, so failures stop further dispatch while
+    # already running groups finish and record all usage before stage reporting.
     try:
         with ThreadPoolExecutor(
-            max_workers=count, thread_name_prefix="local-scc"
+            max_workers=count, thread_name_prefix="local-group"
         ) as pool:
             futures = [pool.submit(worker, index) for index in range(count)]
             for future in futures:
                 future.result()
+            if not failures and deferred:
+                for rule_generated in (True, False):
+                    failed_functions = tuple(
+                        item_id
+                        for item_id in ordered
+                        if item_id in deferred
+                        and cast(
+                            SkeletonView, records_by_id[item_id].applied
+                        ).contains_rule_application
+                        == rule_generated
+                    )
+                    schedule.extend(
+                        TransformationGroup(
+                            members,
+                            tuple(deferred[item_id] for item_id in members),
+                        )
+                        for members in group_functions(
+                            failed_functions, records_by_id, limit
+                        )
+                    )
+                futures = [pool.submit(worker, index) for index in range(count)]
+                for future in futures:
+                    future.result()
     finally:
         for index in sorted(jobs):
             _merge_job_state(state, jobs[index])
     if failures:
         raise StageFailure(
             "; ".join(
-                f"SCC job {index}: {detail}"
+                f"group job {index}: {detail}"
                 for index, detail in sorted(failures.items())
             )
         )
-    return tuple(accepted[index] for index in range(len(schedule)))
+    return tuple(accepted[index] for index in sorted(accepted))
 
 
 def run_stage(
@@ -2575,7 +2689,7 @@ def run_stage(
                 if config["dump_llm_exchanges"]
                 else None
             )
-            accepted = _run_scc_workers(
+            accepted = _run_group_workers(
                 schedule,
                 records_by_id,
                 stage_input=stage_input,
@@ -2592,7 +2706,7 @@ def run_stage(
             )
         for members, accepted_source in accepted:
             accepted_dir = accepted_source.parent
-            if members in state.unstructured_sccs:
+            if members in state.unstructured_groups:
                 result = _load_unstructured_candidate(
                     accepted_dir / "accepted-unstructured.json",
                     members,

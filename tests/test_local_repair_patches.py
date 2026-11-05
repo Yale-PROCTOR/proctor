@@ -262,7 +262,7 @@ def test_invalid_patches_preserve_base_and_code_failure_then_clear_after_applica
     ]
     assert output.metrics["repair_calls"] == 4
     assert output.usage.calls == output.metrics["llm_generation_calls"] == 5
-    exchange = value.outputs.artifacts_dir / "llm-exchanges/scc-0"
+    exchange = value.outputs.artifacts_dir / "llm-exchanges/group-0"
     assert (exchange / "generation-02/repair-base.rs").read_text() == initial_code
     assert not (exchange / "generation-02/transformation.rs").exists()
     assert (exchange / "generation-03/transformation.rs").read_text() == second_code
