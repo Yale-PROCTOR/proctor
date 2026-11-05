@@ -93,7 +93,9 @@ def record_inputs(run_dir: Path, supplied: dict[str, Path]) -> dict[str, Path]:
             # Skip cargo build output: it's never a real input, it's large, and
             # its 0600 incremental *.lock files (left in a corpus slot by a prior
             # verify) are unreadable to the container's uid and abort the copy.
-            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("target"))
+            shutil.copytree(
+                src, dst, symlinks=True, ignore=shutil.ignore_patterns("target")
+            )
         elif src.is_file():
             shutil.copy2(src, dst)
         else:

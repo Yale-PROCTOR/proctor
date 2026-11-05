@@ -8,7 +8,7 @@ from typing import Any
 from proctor.config.model import PipelineConfig
 from proctor.contracts.stage_io import StageInput
 from proctor.orchestrator.events import read_events
-from proctor.orchestrator.run import resume_run, start_run
+from proctor.orchestrator.run import record_inputs, resume_run, start_run
 
 FAKE = Path(__file__).parent / "fake_stages" / "fake"
 
@@ -46,6 +46,44 @@ def _start(config: PipelineConfig, tmp_path: Path, src: Path) -> Any:
         config_files=[],
         overrides=[],
     )
+
+
+def test_record_inputs_preserves_project_symlinks(tmp_path: Path) -> None:
+    source = _source_project(tmp_path)
+    files = {
+        "src/lib.rs": "pub fn example() {}\n",
+        "testinfra.toml": 'strategy = "cando2"\n',
+        "test_vectors/1.json": "{}\n",
+        "runner/src/main.rs": "fn main() {}\n",
+    }
+    for relative, content in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    alias = source / "translated_rust"
+    alias.symlink_to(".", target_is_directory=True)
+    (source / "target").mkdir()
+    (source / "target" / "cache").write_text("build cache", encoding="utf-8")
+
+    run = tmp_path / "run"
+    recorded = record_inputs(run, {"rust_project": source})
+
+    destination = run / "inputs" / "rust"
+    assert recorded == {"rust_project": destination}
+    copied_alias = destination / "translated_rust"
+    assert copied_alias.is_symlink()
+    assert copied_alias.readlink() == Path(".")
+    assert copied_alias.resolve() == destination.resolve()
+    assert (destination / "Cargo.toml").read_bytes() == (
+        source / "Cargo.toml"
+    ).read_bytes()
+    assert not (destination / "target").exists()
+    for relative, content in files.items():
+        assert (destination / relative).read_text(encoding="utf-8") == content
+        assert (source / relative).read_text(encoding="utf-8") == content
+    assert alias.is_symlink()
+    assert alias.readlink() == Path(".")
+    assert (source / "target" / "cache").read_text(encoding="utf-8") == "build cache"
 
 
 def test_two_stage_chain(tmp_path: Path) -> None:
