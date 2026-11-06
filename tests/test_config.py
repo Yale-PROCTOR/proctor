@@ -129,3 +129,23 @@ def test_run_provides_validated() -> None:
     data["run"] = {"provides": ["floppy_disk"]}
     with pytest.raises(ConfigError, match="unknown artifact kinds"):
         PipelineConfig.from_dict(data)
+
+
+def _minimal(extra: dict) -> dict:
+    return {"pipeline": {"order": ["a"]}, "stages": {"a": {"uses": "x"}}, **extra}
+
+
+def test_metrics_settings_default_off() -> None:
+    m = PipelineConfig.from_dict(_minimal({})).metrics
+    assert not m.after_each_stage and m.idiomaticity == "first_last"
+
+
+def test_metrics_settings_parse_and_validate() -> None:
+    m = PipelineConfig.from_dict(
+        _minimal({"metrics": {"after_each_stage": True, "idiomaticity": "all"}})
+    ).metrics
+    assert m.after_each_stage and m.idiomaticity == "all"
+    with pytest.raises(ConfigError):
+        PipelineConfig.from_dict(_minimal({"metrics": {"idiomaticity": "sometimes"}}))
+    with pytest.raises(ConfigError):
+        PipelineConfig.from_dict(_minimal({"metrics": {"after_each_stage": "yes"}}))

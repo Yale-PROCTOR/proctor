@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from proctor.testing import metrics
+from proctor.testing.diff_eval import DiffReport
 from proctor.testing.idiomaticity_eval import IdiomReport
 from proctor.testing.unsafe_eval import UnsafeReport
 
@@ -31,6 +32,18 @@ def stub(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(metrics, "measure_unsafe", fake_unsafe)
     monkeypatch.setattr(metrics, "measure_idiomaticity", lambda c, **kw: _i(30))
+    monkeypatch.setattr(
+        metrics,
+        "measure_diff",
+        lambda b, a, **kw: DiffReport.from_json(
+            {
+                "files_changed": 2,
+                "lines_added": 7,
+                "lines_removed": 3,
+                "abi": {"ok": True},
+            }
+        ),
+    )
     return seq
 
 
@@ -88,3 +101,31 @@ def test_no_idiomaticity_flag(tmp_path: Path, monkeypatch, capsys) -> None:
     assert rc == 0
     # the idiomaticity line prints "N clippy lints"; it must be absent
     assert "clippy lints" not in capsys.readouterr().out
+
+
+def test_per_stage_diff_vs_previous(tmp_path: Path, stub, capsys) -> None:
+    run = tmp_path / "case"
+    _stage(run, "00", "c2rust")
+    _stage(run, "01", "crat")
+    out_json = tmp_path / "m.json"
+    assert metrics.main([str(run), "--no-idiomaticity", "--json", str(out_json)]) == 0
+    assert "2f +7 -3" in capsys.readouterr().out
+    rows = __import__("json").loads(out_json.read_text())
+    assert "diff" not in rows[0]  # first stage has nothing to diff against
+    assert rows[1]["diff"]["lines_added"] == 7 and rows[1]["diff"]["abi_ok"]
+
+
+def test_idiomaticity_first_last(tmp_path: Path, stub, monkeypatch) -> None:
+    run = tmp_path / "case"
+    for i, sid in enumerate(["c2rust", "crat", "abstraction_recovery"]):
+        _stage(run, f"0{i}", sid)
+    clippy_on: list[Path] = []
+    monkeypatch.setattr(
+        metrics, "measure_idiomaticity", lambda c, **kw: clippy_on.append(c) or _i(30)
+    )
+    rows = metrics.measure_run(run, idiomaticity="first-last")
+    assert [r.idiom is not None for r in rows] == [True, False, True]
+    assert [p.parent.parent.name for p in clippy_on] == [
+        "00-c2rust",
+        "02-abstraction_recovery",
+    ]
