@@ -2187,7 +2187,6 @@ def _process_group(
         statement_pairs_path = workdir / "replacement-statement-pairs.json"
         observation_source_path = workdir / "replacement-observation.rs"
         observation_metadata_path = workdir / "replacement-observation-metadata.json"
-        extracted_observations_path = workdir / "extracted-observations.json"
         write_json(
             replacement_request_path,
             replacement_request(
@@ -2204,7 +2203,6 @@ def _process_group(
                 statement_pairs_path,
                 observation_source_path,
                 observation_metadata_path,
-                extracted_observations_path,
             )
         ):
             tools.add_functions(
@@ -2276,22 +2274,6 @@ def _process_group(
                     observation_metadata_path,
                 ):
                     shutil.copyfile(path, workdir / f"accepted-{path.name}")
-                accepted_documents = list(state.accepted_observation_documents)
-                if any(view.transform_labels for view in active_views.values()):
-                    tools.extract_observations(
-                        observation_source_path,
-                        observation_metadata_path,
-                        extracted_observations_path,
-                    )
-                    accepted_dir = workdir / "accepted-observations"
-                    accepted_dir.mkdir(parents=True, exist_ok=True)
-                    retained = accepted_dir / f"{len(accepted_documents):06d}.json"
-                    if retained.exists() or retained.is_symlink():
-                        raise StageFailure(
-                            "accepted observation destination unexpectedly exists"
-                        )
-                    os.replace(extracted_observations_path, retained)
-                    accepted_documents.append(retained)
                 accepted_pairs = dict(state.statement_pairs)
                 _accept_statement_pairs(
                     statement_pairs,
@@ -2300,7 +2282,6 @@ def _process_group(
                     accepted_pairs,
                 )
                 state.statement_pairs = accepted_pairs
-                state.accepted_observation_documents = accepted_documents
                 accepted_views = dict(state.accepted_views)
                 accepted_views.update(active_views)
                 state.accepted_views = accepted_views

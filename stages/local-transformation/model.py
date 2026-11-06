@@ -425,7 +425,8 @@ class ItemRecord:
     foreign_function_names: tuple[str, ...] = ()
     foreign_static_names: tuple[str, ...] = ()
     declaration: str | None = None
-    definition: str | None = None
+    source_definition: str | None = None
+    target_definition: str | None = None
 
     @property
     def is_function(self) -> bool:
@@ -1029,7 +1030,14 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             signature_dependencies=signature_dependencies,
             dependencies=dependencies,
         )
-    required = {"id", "path", "kind", "definition", "dependencies"}
+    required = {
+        "id",
+        "path",
+        "kind",
+        "source_definition",
+        "target_definition",
+        "dependencies",
+    }
     if set(data) != required:
         raise SkeletonError(
             f"record {record_id} must contain exactly {sorted(required)}"
@@ -1038,7 +1046,8 @@ def _load_record(data: Any, index: int) -> ItemRecord:
         id=record_id,
         path=path,
         kind=kind,
-        definition=_string(data, "definition", record_id),
+        source_definition=_string(data, "source_definition", record_id),
+        target_definition=_string(data, "target_definition", record_id),
         dependencies=_dependencies(data, "dependencies", record_id),
     )
 
@@ -1130,7 +1139,7 @@ def strongly_connected_components(
 
 
 def render_dependency_entry(record: ItemRecord) -> str:
-    name = record.path.rsplit("::", 1)[-1]
+    name = record.path if record.kind in TYPE_KINDS else record.path.rsplit("::", 1)[-1]
     if record.kind == "Fn":
         return (
             f"### Function `{name}`\n\n"
@@ -1139,8 +1148,19 @@ def render_dependency_entry(record: ItemRecord) -> str:
             "Target signature:\n"
             f"```rust\n{record.target_signature}\n```"
         )
+    if (
+        record.kind not in {"Static", "Const"}
+        and record.source_definition != record.target_definition
+    ):
+        return (
+            f"### {record.kind} `{name}`\n\n"
+            f"Source definition:\n```rust\n{record.source_definition}\n```\n"
+            f"Target definition:\n```rust\n{record.target_definition}\n```"
+        )
     text = (
-        record.declaration if record.kind in {"Static", "Const"} else record.definition
+        record.declaration
+        if record.kind in {"Static", "Const"}
+        else record.target_definition
     )
     return f"### {record.kind} `{name}`\n\n```rust\n{text}\n```"
 
@@ -1224,6 +1244,20 @@ def dependency_context(
         if dependency not in member_set
     }
     selected = member_signatures | direct
+    pending = list(selected)
+    visited: set[int] = set()
+    while pending:
+        item_id = pending.pop()
+        if item_id in visited:
+            continue
+        visited.add(item_id)
+        record = records_by_id[item_id]
+        if record.kind in TYPE_KINDS:
+            if record.source_definition != record.target_definition:
+                selected.add(item_id)
+            pending.extend(record.dependencies)
+        else:
+            pending.extend(record.signature_dependencies)
 
     def render(ids: set[int]) -> str:
         return "\n\n".join(
@@ -1236,7 +1270,7 @@ def dependency_context(
             f"group {','.join(map(str, members))} mandatory dependency context has "
             f"{len(mandatory)} characters, exceeding limit {limit}"
         )
-    frontier = set(direct)
+    frontier = set(selected)
     while frontier:
         next_depth: set[int] = set()
         for item_id in sorted(frontier):
