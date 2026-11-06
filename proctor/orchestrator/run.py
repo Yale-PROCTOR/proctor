@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import tomli_w
 
@@ -45,6 +46,9 @@ _INPUT_DIRS = {
     "test_package": "tests",
     "rule_set": "rule_set",
 }
+
+if TYPE_CHECKING:
+    from proctor.testing.diff_eval import PublicApi
 
 
 class RunError(Exception):
@@ -185,6 +189,28 @@ def _maybe_gate_on_tests(
     return None
 
 
+def _metrics_api(config: PipelineConfig, state: dict[str, Path]) -> PublicApi | None:
+    """The C headers' public API, used to scope the per-stage ABI diff."""
+    c_project = state.get("c_project")
+    if not config.metrics.after_each_stage or c_project is None:
+        return None
+    from proctor.testing.diff_eval import public_api
+
+    try:
+        return public_api(c_project)
+    except OSError:
+        return None  # unscoped: stricter, never falsely clean
+
+
+def _finish_metrics(
+    config: PipelineConfig, run_dir: Path, api: PublicApi | None
+) -> None:
+    if config.metrics.after_each_stage:
+        from proctor.testing.metrics import record_run
+
+        record_run(run_dir, idiomaticity=config.metrics.idiomaticity, api=api)
+
+
 def execute_run(
     config: PipelineConfig,
     root: Path,
@@ -205,6 +231,7 @@ def execute_run(
 
     state = record_inputs(run_dir, supplied_inputs)
     events.emit("run_started", run_id=run_id, resume=resume)
+    metrics_api = _metrics_api(config, state)
 
     prompts_dir = root / "proctor" / "prompts" / "templates"
     upstream_key: str | None = None
@@ -326,6 +353,24 @@ def execute_run(
                         if gate_error:
                             error = gate_error
                         else:
+                            if (
+                                config.metrics.after_each_stage
+                                and "rust_project" in produced
+                            ):
+                                from proctor.testing.metrics import record_stage
+
+                                row = record_stage(
+                                    stage_run_dir,
+                                    stage_id,
+                                    state.get("rust_project"),
+                                    produced["rust_project"],
+                                    api=metrics_api,
+                                )
+                                events.emit(
+                                    "stage_metrics",
+                                    stage_id=stage_id,
+                                    ok=row is not None and "metrics_error" not in row,
+                                )
                             state.update(produced)
                             status = "success"
                 else:  # skipped: forward inputs unchanged
@@ -349,11 +394,13 @@ def execute_run(
         )
 
         if status == "failure" and config.run.on_stage_failure == "stop":
+            _finish_metrics(config, run_dir, metrics_api)
             events.emit("run_finished", run_id=run_id, ok=False)
             result_summary.final = dict(state)
             return result_summary
 
     result_summary.final = dict(state)
+    _finish_metrics(config, run_dir, metrics_api)
     events.emit("run_finished", run_id=run_id, ok=result_summary.ok)
     return result_summary
 

@@ -308,6 +308,30 @@ def _verify_case(
     return comparison
 
 
+def _case_metrics(run_dir: Path) -> dict[str, Any] | None:
+    """A compact per-stage view of the run's ``metrics.json`` (written when
+    ``[metrics] after_each_stage`` is on), or None."""
+    try:
+        data = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    stages = []
+    for r in data.get("stages", []):
+        d = r.get("diff") or {}
+        stages.append(
+            {
+                "stage": r.get("stage"),
+                "unsafe": (r.get("unsafe") or {}).get("score"),
+                "clippy": (r.get("idiomaticity") or {}).get("total"),
+                "files_changed": d.get("files_changed"),
+                "lines_added": d.get("lines_added"),
+                "lines_removed": d.get("lines_removed"),
+                "abi_ok": d.get("abi_ok"),
+            }
+        )
+    return {"summary": data.get("summary", {}), "stages": stages}
+
+
 def _case_summary(o: BenchOutcome) -> dict[str, Any]:
     run = o.run
     summary: dict[str, Any] = {
@@ -328,6 +352,10 @@ def _case_summary(o: BenchOutcome) -> dict[str, Any]:
             else []
         ),
     }
+    if isinstance(run, RunResult):
+        metrics = _case_metrics(run.run_dir)
+        if metrics is not None:
+            summary["metrics"] = metrics
     if o.vectors is not None:
         summary["vectors_ok"] = o.vectors_ok
         summary["vectors"] = [

@@ -133,3 +133,45 @@ def test_bench_match_no_cases_errors(tmp_path: Path) -> None:
     corpus = _corpus(tmp_path, {"a": False})
     with pytest.raises(RunError, match="matching"):
         run_bench(_config(), tmp_path, corpus, name="t", match="nope")
+
+
+def test_case_metrics_compacts_run_metrics(tmp_path: Path) -> None:
+    from proctor.orchestrator.bench import _case_metrics
+
+    assert _case_metrics(tmp_path) is None  # metrics off: nothing recorded
+    (tmp_path / "metrics.json").write_text(
+        json.dumps(
+            {
+                "stages": [
+                    {
+                        "stage": "c2rust",
+                        "unsafe": {"score": 50},
+                        "idiomaticity": {"total": 9},
+                    },
+                    {
+                        "stage": "crat",
+                        "unsafe": {"score": 20},
+                        "diff": {
+                            "files_changed": 3,
+                            "lines_added": 4,
+                            "lines_removed": 8,
+                            "abi_ok": True,
+                        },
+                    },
+                ],
+                "summary": {"unsafe_first": 50, "unsafe_final": 20},
+            }
+        )
+    )
+    m = _case_metrics(tmp_path)
+    assert m is not None and m["summary"]["unsafe_final"] == 20
+    assert m["stages"][0] == {
+        "stage": "c2rust",
+        "unsafe": 50,
+        "clippy": 9,
+        "files_changed": None,
+        "lines_added": None,
+        "lines_removed": None,
+        "abi_ok": None,
+    }
+    assert m["stages"][1]["lines_removed"] == 8 and m["stages"][1]["abi_ok"]

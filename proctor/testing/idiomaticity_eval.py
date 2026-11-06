@@ -97,6 +97,10 @@ def measure_idiomaticity(
     # for clippy.toml — we keep both in _CONF_DIR.
     env["CLIPPY_CONF_DIR"] = str(_CONF_DIR)
     env["PYTHONPATH"] = str(_TOOL_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+    # Build in the scratch workdir, never in the measured crate: clippy would
+    # otherwise leave a `target/` inside a stage's out/rust, which the next
+    # stage copies along with the crate.
+    env.setdefault("CARGO_TARGET_DIR", str((workdir / "cargo-target").resolve()))
 
     cmd = [
         sys.executable,

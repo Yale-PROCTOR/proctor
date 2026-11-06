@@ -81,6 +81,32 @@ class TestingSettings:
 
 
 @dataclass(frozen=True)
+class MetricsSettings:
+    """``[metrics]`` — measure every stage the same way (proctor-side, not
+    stage self-report). After each successful stage, write
+    ``stages/NN-<id>/metrics.json`` (unsafe + what changed vs the previous
+    stage); at run end, a run-level ``metrics.json`` with clippy on the stages
+    ``idiomaticity`` selects. Fail-open: a metrics error never fails a run."""
+
+    after_each_stage: bool = False
+    #: clippy costs two builds per crate: "first_last" (default) measures the
+    #: first and final crate, "all" every stage, "none" skips it.
+    idiomaticity: str = "first_last"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MetricsSettings:
+        after_each_stage = data.get("after_each_stage", False)
+        if not isinstance(after_each_stage, bool):
+            raise ConfigError("[metrics] after_each_stage must be a boolean")
+        idiomaticity = data.get("idiomaticity", "first_last")
+        if idiomaticity not in ("first_last", "all", "none"):
+            raise ConfigError(
+                "[metrics] idiomaticity must be 'first_last', 'all' or 'none'"
+            )
+        return cls(after_each_stage=after_each_stage, idiomaticity=idiomaticity)
+
+
+@dataclass(frozen=True)
 class StageEntry:
     """One ``[stages.<id>]`` table."""
 
@@ -130,6 +156,7 @@ class PipelineConfig:
     stages: dict[str, StageEntry]
     run: RunSettings = field(default_factory=RunSettings)
     testing: TestingSettings = field(default_factory=TestingSettings)
+    metrics: MetricsSettings = field(default_factory=MetricsSettings)
     llm_defaults: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -173,11 +200,16 @@ class PipelineConfig:
         if not isinstance(testing_raw, dict):
             raise ConfigError("[testing] must be a table")
 
+        metrics_raw = data.get("metrics", {})
+        if not isinstance(metrics_raw, dict):
+            raise ConfigError("[metrics] must be a table")
+
         return cls(
             order=tuple(order_raw),
             stages=stages,
             run=RunSettings.from_dict(run_raw),
             testing=TestingSettings.from_dict(testing_raw),
+            metrics=MetricsSettings.from_dict(metrics_raw),
             llm_defaults=llm_defaults,
             raw=data,
         )
