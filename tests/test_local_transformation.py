@@ -347,9 +347,71 @@ def type_record(
         "id": item_id,
         "path": path,
         "kind": kind,
-        "definition": definition,
+        "source_definition": definition,
+        "target_definition": definition,
         "dependencies": dependencies,
     }
+
+
+@pytest.mark.parametrize("kind", ["Struct", "Enum", "TyAlias"])
+def test_dependency_context_shows_both_changed_type_definitions(kind):
+    before = "pub struct Holder { pub pointer: *const i32 }"
+    after = "pub struct Holder<'a> { pub pointer: &'a i32 }"
+    record = type_record(0, "Holder", kind, before, [])
+    record["target_definition"] = after
+    records = loaded([record, fn_record(1, "read", "read", [0])])
+    text, _ = dependency_context((1,), {record.id: record for record in records})
+    assert "Source definition:" in text and "Target definition:" in text
+    assert text.count(before) == text.count(after) == 1
+    unchanged = loaded([type_record(0, "Holder", kind, before, [])])[0]
+    assert render_dependency_entry(unchanged).count(before) == 1
+
+
+def test_changed_transitive_type_definitions_are_mandatory_context():
+    changed = type_record(0, "Holder", "Struct", "struct Holder;", [])
+    changed["target_definition"] = "struct Holder<'a> { pointer: &'a i32 }"
+    records = loaded(
+        [
+            changed,
+            fn_record(1, "dependency", "dependency", [0], signature_dependencies=[0]),
+            fn_record(2, "target", "target", [1]),
+        ]
+    )
+    by_id = {record.id: record for record in records}
+    limit = len(render_dependency_entry(by_id[1])) + 1
+    with pytest.raises(ContextOverflow, match="mandatory dependency context"):
+        dependency_context((2,), by_id, limit=limit)
+
+
+def test_changed_mandatory_types_still_expand_unchanged_dependencies():
+    changed = type_record(0, "Holder", "Struct", "struct Holder;", [3])
+    changed["target_definition"] = "struct Holder<'a> { pointer: &'a Plain }"
+    records = loaded(
+        [
+            changed,
+            fn_record(1, "dependency", "dependency", [0], signature_dependencies=[0]),
+            fn_record(2, "target", "target", [1]),
+            type_record(3, "Plain", "Struct", "struct Plain { value: i32 }", []),
+        ]
+    )
+    text, selected = dependency_context((2,), {record.id: record for record in records})
+    assert 3 in selected
+    assert "struct Plain { value: i32 }" in text
+
+
+def test_dependency_type_headings_preserve_module_identity():
+    records = loaded(
+        [
+            type_record(0, "left::Holder", "Struct", "struct Holder { left: i32 }", []),
+            type_record(
+                1, "right::Holder", "Struct", "struct Holder { right: i64 }", []
+            ),
+            fn_record(2, "target", "target", [0, 1]),
+        ]
+    )
+    text, _ = dependency_context((2,), {record.id: record for record in records})
+    assert "### Struct `left::Holder`" in text
+    assert "### Struct `right::Holder`" in text
 
 
 def value_record(
@@ -1151,7 +1213,7 @@ def test_proctor_libc_function_path_wire_is_strict_and_function_only():
         loaded([non_function])
     assert str(error.value) == (
         "record 1 must contain exactly "
-        "['definition', 'dependencies', 'id', 'kind', 'path']"
+        "['dependencies', 'id', 'kind', 'path', 'source_definition', 'target_definition']"
     )
 
 
@@ -1205,7 +1267,8 @@ def test_kind_specific_fields_are_not_interchangeable():
             "id": 0,
             "path": "N",
             "kind": "Const",
-            "definition": "const N: usize = 1;",
+            "source_definition": "const N: usize = 1;",
+            "target_definition": "const N: usize = 1;",
             "signature_dependencies": [],
             "dependencies": [],
         },
@@ -1328,7 +1391,7 @@ def test_direct_function_static_and_type_entries_render_by_kind():
     text, _ = dependency_context((0,), records)
     assert records[1].source_signature in text
     assert records[2].declaration in text
-    assert records[20].definition in text
+    assert records[20].source_definition in text
     assert records[1].annotated_source not in text
 
 
@@ -2580,7 +2643,7 @@ def test_version_1_prompt_has_exact_hierarchy_and_safe_cast_guidance():
     assert rendered.content_hash == hashlib.sha256(expected.encode()).hexdigest()
     assert (
         rendered.content_hash
-        == "41150d693df36e8fb335a7bd86ae0b3207f53266dc228315fece9a6f30d9300f"
+        == "77601aa8050a42167f34e26c48a771e9e3f5628adaf5f2ef74abcdbc0309f0d4"
     )
     assert rendered.version == 1
     assert XJ_SCANF_GUIDANCE_MARKER not in rendered.text
@@ -3873,7 +3936,7 @@ def test_final_build_failure_restores_source_and_manifest_together(tmp_path):
     assert not (value.outputs.artifacts_dir / "observations.json").exists()
 
 
-def test_postprocessing_publishes_built_split_project_after_observations(tmp_path):
+def test_postprocessing_publishes_built_split_project_without_extraction(tmp_path):
     value = stage_input(tmp_path)
     source = value.inputs.rust_project
     source.joinpath("Cargo.toml").write_text(
@@ -3915,7 +3978,7 @@ def test_postprocessing_publishes_built_split_project_after_observations(tmp_pat
             assert (current / "lib.rs").read_text() == finalized
             assert (current / "config.toml").read_text() == config
             assert (current / "proctor.toml").read_bytes() == original_manifest
-            assert sum(event[0] == "extract_observations" for event in self.events) == 1
+            assert sum(event[0] == "extract_observations" for event in self.events) == 0
             for name in ("tests", "runner"):
                 for path in (current / name).rglob("*.rs"):
                     path.unlink()
@@ -3988,9 +4051,12 @@ def test_postprocessing_publishes_built_split_project_after_observations(tmp_pat
     assert (
         value.framework.workdir / "groups/000000/accepted.rs"
     ).read_text() == accepted
-    assert json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
-        "observations"
-    ] == [observation]
+    assert (
+        json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
+            "observations"
+        ]
+        == []
+    )
     assert tools.build_modes == [True, True, False]
     assert output.metrics["cargo_builds"] == 3
 
@@ -4039,7 +4105,7 @@ def test_postprocessing_failures_preserve_accepted_work_without_publication(
         value.inputs.rust_project / "proctor.toml"
     ).read_bytes()
     assert (work / "groups/000000/accepted.rs").read_text() == "accepted source\n"
-    assert (work / "groups/000000/accepted-observations/000000.json").is_file()
+    assert not (work / "groups/000000/accepted-observations").exists()
     assert (value.inputs.rust_project / "lib.rs").read_text() == "old\n"
     assert not value.outputs.rust_project.exists()
     assert not any(
@@ -5319,7 +5385,7 @@ def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_p
     assert len(client.requests) == 2
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
-        == 1
+        == 0
     )
     assert output.metrics == {
         "unstructured_repair_calls": 0,
@@ -5519,7 +5585,6 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
         "validate",
         "add_functions",
         "cargo_build",
-        "extract_observations",
         "assemble_project",
         "finalize_project",
         "postprocess",
@@ -5840,15 +5905,18 @@ def test_mixed_scc_compiles_mechanical_printf_separately_from_transformation(
     assert replacement[2]["transformation"].count(canonical) == 1
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
-        == 1
+        == 0
     )
     report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
     assert report.count("### Statement 0") == 2
     assert '::std::print!("hello");' in report
     assert '::std::print!("{}", changed_value);' in report
-    assert json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
-        "observations"
-    ] == [accepted_observation]
+    assert (
+        json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
+            "observations"
+        ]
+        == []
+    )
 
 
 def test_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_path):
@@ -6351,11 +6419,11 @@ def test_prepared_ctype_and_four_format_record_compose_through_stage_acceptance(
     operations = [event[0] for event in tools.events]
     assert operations.index("prepare") < operations.index("make_skeleton")
     assert operations.index("make_skeleton") < operations.index("add_functions")
-    assert operations.index("add_functions") < operations.index("extract_observations")
+    assert "extract_observations" not in operations
     merged = json.loads(
         (value.outputs.artifacts_dir / "observations.json").read_text(encoding="utf-8")
     )
-    assert merged["printf_observations"] == observations
+    assert merged["printf_observations"] == []
 
 
 def test_missing_fence_consumes_repair_without_validator_call(tmp_path):
@@ -6443,7 +6511,7 @@ def test_failed_candidate_build_restores_then_repairs(tmp_path):
     assert (value.outputs.rust_project / "lib.rs").read_text() == accepted
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
-        == 1
+        == 0
     )
 
 
@@ -8151,19 +8219,19 @@ def test_extraction_runs_only_after_successful_build(tmp_path):
     assert output.metrics["repair_calls"] == 1
     assert output.metrics["cargo_builds"] == 4
     operations = [event[0] for event in tools.events]
-    assert operations.count("extract_observations") == 1
+    assert operations.count("extract_observations") == 0
     build_indices = [
         index
         for index, operation in enumerate(operations)
         if operation == "cargo_build"
     ]
-    assert (
-        build_indices[-2] < operations.index("extract_observations") < build_indices[-1]
-    )
+    assert build_indices[-2] < build_indices[-1]
     assert not list(value.outputs.artifacts_dir.glob("*statement*pairs*.json"))
 
 
-def test_accepted_transform_print_extracts_after_build_only(tmp_path, monkeypatch):
+def test_accepted_transform_print_builds_and_publishes_without_extraction(
+    tmp_path, monkeypatch
+):
     record = printf_record(0, "target", "target", [], argument_count=1)
     printf_observation = {
         "producer": "target",
@@ -8185,8 +8253,7 @@ def test_accepted_transform_print_extracts_after_build_only(tmp_path, monkeypatc
 
     class AcceptedPrintTools(FakeTools):
         def merge_observations(self, inputs, output):
-            assert len(inputs) == 1
-            assert inputs[0].read_text() == extracted
+            assert inputs == ()
             self.events.append(("merge_observations", inputs, output))
             output.write_text(merged, encoding="utf-8")
 
@@ -8217,21 +8284,19 @@ def test_accepted_transform_print_extracts_after_build_only(tmp_path, monkeypatc
     assert operations.count("validate") == 3
     assert operations.count("add_functions") == 2
     assert operations.count("cargo_build") == 4
-    assert operations.count("extract_observations") == 1
+    assert operations.count("extract_observations") == 0
     build_indices = [
         index
         for index, operation in enumerate(operations)
         if operation == "cargo_build"
     ]
-    assert (
-        build_indices[-2] < operations.index("extract_observations") < build_indices[-1]
-    )
+    assert build_indices[-2] < build_indices[-1]
     assert operations.count("merge_observations") == 1
     assert len(publication_calls) == 1
     assert (value.outputs.artifacts_dir / "observations.json").read_text() == merged
 
 
-def test_python_keeps_both_observation_arrays_opaque(tmp_path):
+def test_python_keeps_merged_observation_bytes_opaque(tmp_path):
     record = printf_record(0, "target", "target", [], argument_count=1)
     extracted = (
         '{"schema_version":1,"observations":[{"nested":{"ordinary":'
@@ -8242,8 +8307,7 @@ def test_python_keeps_both_observation_arrays_opaque(tmp_path):
 
     class OpaqueBothFamiliesTools(FakeTools):
         def merge_observations(self, inputs, output):
-            assert len(inputs) == 1
-            assert inputs[0].read_bytes() == extracted.encode()
+            assert inputs == ()
             self.events.append(("merge_observations", inputs, output))
             output.write_bytes(merged.encode())
 
@@ -8261,7 +8325,7 @@ def test_python_keeps_both_observation_arrays_opaque(tmp_path):
     )
 
 
-def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_path):
+def test_final_accepted_repair_publishes_pairs_without_observations(tmp_path):
     rule_set = anchorless_rule_set(tmp_path)
     record = fn_record(
         0,
@@ -8301,13 +8365,7 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
 
     class AcceptedOnlyTools(FakeTools):
         def merge_observations(self, inputs, output):
-            assert len(inputs) == 1
-            extracted = json.loads(inputs[0].read_text())
-            assert extracted == {
-                "schema_version": 1,
-                "observations": [accepted_observation],
-                "printf_observations": [],
-            }
+            assert inputs == ()
             super().merge_observations(inputs, output)
 
     tools = AcceptedOnlyTools(
@@ -8339,22 +8397,20 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
     assert operations.count("validate") == 3
     assert operations.count("add_functions") == 2
     assert operations.count("cargo_build") == 4
-    assert operations.count("extract_observations") == 1
+    assert operations.count("extract_observations") == 0
     build_indices = [
         index
         for index, operation in enumerate(operations)
         if operation == "cargo_build"
     ]
-    assert (
-        build_indices[-2] < operations.index("extract_observations") < build_indices[-1]
-    )
+    assert build_indices[-2] < build_indices[-1]
     assert operations.count("merge_observations") == 1
     published = json.loads(
         (value.outputs.artifacts_dir / "observations.json").read_text()
     )
     assert published == {
         "schema_version": 1,
-        "observations": [accepted_observation],
+        "observations": [],
         "printf_observations": [],
     }
     report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
@@ -8395,7 +8451,7 @@ def test_only_the_final_accepted_repair_publishes_anchorless_observations(tmp_pa
     "failure",
     [StageFailure("extract failed"), "{ malformed"],
 )
-def test_post_acceptance_extraction_failure_is_fatal_not_repairable(tmp_path, failure):
+def test_stage_skips_observation_extraction_even_when_it_would_fail(tmp_path, failure):
     tools = FakeTools(
         skeletons=[
             fn_record(
@@ -8413,16 +8469,22 @@ def test_post_acceptance_extraction_failure_is_fatal_not_repairable(tmp_path, fa
     )
     client = FakeClient([response()])
     value, output = run_fake(tmp_path, tools, client)
-    assert output.status == "failure"
+    assert output.status == "success"
     assert len(client.requests) == 1
     assert len([event for event in tools.events if event[0] == "add_functions"]) == 1
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
-        == 1
+        == 0
     )
-    assert not value.outputs.rust_project.exists()
-    assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
-    assert not (value.outputs.artifacts_dir / "observations.json").exists()
+    assert value.outputs.rust_project.exists()
+    assert (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+    assert json.loads(
+        (value.outputs.artifacts_dir / "observations.json").read_text()
+    ) == {
+        "schema_version": 1,
+        "observations": [],
+        "printf_observations": [],
+    }
     for name in (
         "candidate.rs",
         "replacement-statement-pairs.json",
@@ -8464,7 +8526,7 @@ def test_sccs_use_frozen_interfaces_without_promoting_earlier_bodies(tmp_path):
     assert [item["id"] for item in second["items"]] == [1]
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
-        == 2
+        == 0
     )
 
 
@@ -8485,11 +8547,11 @@ def test_mechanical_scc_keeps_other_scc_interfaces_without_extracting(tmp_path):
     assert replacements[1][2]["accepted_correspondence"] == []
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
-        == 1
+        == 0
     )
 
 
-def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
+def test_multiple_groups_merge_no_observation_documents(tmp_path):
     rule_set = anchorless_rule_set(tmp_path)
     records = [
         fn_record(0, "leaf", "leaf", []),
@@ -8527,26 +8589,11 @@ def test_observations_retain_schedule_producer_and_duplicate_order(tmp_path):
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert [event[2]["items"][0]["id"] for event in replacements] == [0, 1]
     merge = next(event for event in tools.events if event[0] == "merge_observations")
-    assert [str(path.relative_to(value.framework.workdir)) for path in merge[1]] == [
-        "groups/000000/accepted-observations/000000.json",
-        "groups/000001/accepted-observations/000000.json",
-    ]
-    assert [json.loads(path.read_text()) for path in merge[1]] == [
-        {
-            "schema_version": 1,
-            "observations": [leaf, leaf],
-            "printf_observations": [],
-        },
-        {
-            "schema_version": 1,
-            "observations": [root0, root1],
-            "printf_observations": [],
-        },
-    ]
+    assert merge[1] == ()
     published = json.loads(
         (value.outputs.artifacts_dir / "observations.json").read_text()
     )
-    assert published["observations"] == [leaf, leaf, root0, root1]
+    assert published["observations"] == []
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
@@ -8850,8 +8897,7 @@ def test_markdown_uses_complete_before_and_canonical_after_snippets():
     assert "raw rejected" not in report
 
 
-def test_nonempty_artifact_is_pretty_deterministic_and_data_only(tmp_path):
-    observation = {"opaque": ["unchanged", 7, True]}
+def test_empty_observation_artifact_is_pretty_deterministic_and_data_only(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
         builds=[CommandResult(0), CommandResult(0)],
@@ -8860,7 +8906,7 @@ def test_nonempty_artifact_is_pretty_deterministic_and_data_only(tmp_path):
         observations=[
             {
                 "schema_version": 1,
-                "observations": [observation],
+                "observations": [],
                 "printf_observations": [],
             }
         ],
@@ -8872,7 +8918,7 @@ def test_nonempty_artifact_is_pretty_deterministic_and_data_only(tmp_path):
         json.dumps(
             {
                 "schema_version": 1,
-                "observations": [observation],
+                "observations": [],
                 "printf_observations": [],
             },
             indent=2,
@@ -8885,7 +8931,7 @@ def test_nonempty_artifact_is_pretty_deterministic_and_data_only(tmp_path):
     assert "proctor" not in path.read_text().lower()
 
 
-def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
+def test_empty_input_merge_output_remains_opaque(tmp_path):
     rule_set = anchorless_rule_set(tmp_path)
     observation = {
         "source_expression": {"sentinel": "accepted"},
@@ -8900,10 +8946,7 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
     class OpaqueTools(FakeTools):
         def merge_observations(self, inputs, output):
             self.events.append(("merge_observations", inputs, output))
-            assert len(inputs) == 1
-            raw = inputs[0].read_text()
-            assert '"pointer_anchors": []' in raw
-            assert '"sentinel": "accepted"' in raw
+            assert inputs == ()
             output.write_text(merged, encoding="utf-8")
 
     tools = OpaqueTools(
@@ -8938,7 +8981,6 @@ def test_anchorless_observation_document_remains_opaque_until_merge(tmp_path):
         "validate",
         "add_functions",
         "cargo_build",
-        "extract_observations",
         "assemble_project",
         "finalize_project",
         "postprocess",
@@ -9750,10 +9792,10 @@ def test_concurrent_workers_reuse_private_projects_and_preserve_all_usage(tmp_pa
     document = json.loads(
         (value.outputs.artifacts_dir / "observations.json").read_text()
     )
-    assert document["observations"] == [{"item": index} for index in range(count)]
+    assert document["observations"] == []
     operations = [event[0] for event in tools.events]
     assembly = operations.index("assemble_project")
-    assert operations[:assembly].count("extract_observations") == count
+    assert operations[:assembly].count("extract_observations") == 0
     assert operations[assembly:] == [
         "assemble_project",
         "finalize_project",
@@ -10314,19 +10356,17 @@ def test_unfilled_transformation_hole_uses_local_repair_before_build_or_observat
     builds = [event[2] for event in tools.events if event[0] == "cargo_build"]
     assert builds == ["normalized\n", "repaired candidate\n", "repaired candidate\n"]
     operations = [event[0] for event in tools.events]
-    assert operations.count("extract_observations") == 1
-    assert operations.index("extract_observations") > max(
-        index
-        for index, operation in enumerate(operations)
-        if operation == "add_functions"
-    )
+    assert operations.count("extract_observations") == 0
     repair_prompt = client.requests[1].messages[0].content
     assert "Complete all unfilled transformation holes" in repair_prompt
     assert f"{item_id}:{'second' if mixed else 'first'}" in repair_prompt
     assert "todo!()" in repair_prompt
-    assert json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
-        "observations"
-    ] == [{"accepted": True}]
+    assert (
+        json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
+            "observations"
+        ]
+        == []
+    )
     assert (
         value.framework.workdir / "groups/000000/accepted.rs"
     ).read_text() == "repaired candidate\n"
@@ -10450,15 +10490,19 @@ def test_build_rewriting_candidate_source_fails_before_acceptance_or_observation
     )
 
 
-def test_mutated_retained_candidate_fails_digest_check_before_assembly(tmp_path):
-    class RetainedSourceRewritingTools(FakeTools):
-        def extract_observations(self, observation_source, metadata, output):
-            super().extract_observations(observation_source, metadata, output)
-            (observation_source.parent / "accepted.rs").write_text(
-                "changed retained candidate\n"
-            )
+def test_mutated_retained_candidate_fails_digest_check_before_assembly(
+    tmp_path, monkeypatch
+):
+    run_workers = stage_module._run_group_workers
 
-    tools = RetainedSourceRewritingTools(
+    def mutate_retained(*args, **kwargs):
+        accepted = run_workers(*args, **kwargs)
+        accepted[0][1].write_text("changed retained candidate\n")
+        return accepted
+
+    monkeypatch.setattr(stage_module, "_run_group_workers", mutate_retained)
+
+    tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
         validators=[VALID],
         candidates=["original candidate\n"],

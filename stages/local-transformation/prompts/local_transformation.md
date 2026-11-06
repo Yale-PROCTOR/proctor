@@ -11,6 +11,11 @@ the transformation goal. A dependency's source signature is its signature
 before transformation; its target signature is how transformed code must call
 it.
 
+A type's source definition describes the original code; its target definition
+is the fixed definition used by transformed code. When they differ, rewrite
+field accesses and construction using the target definition. A type shown
+once has the same source and target definition. Do not rewrite these definitions.
+
 Implement every function in Transformation Targets exactly once. Emit no
 other top-level item. Use Dependency Context only as reference; do not emit or
 redefine its functions, types, statics, or constants.
