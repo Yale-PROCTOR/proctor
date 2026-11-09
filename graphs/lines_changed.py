@@ -1,7 +1,11 @@
 r"""Stacked bars of the lines one pipeline stage changed, one bar per case.
 
-Usage (from the repo root; needs rustfmt on PATH, builds diff_metrics if
-missing):
+The script runs tools/diff_metrics itself on every pair of crates, building
+it first if needed. It does not read existing diff_metrics output, such as the
+metrics.json a run writes with `[metrics] after_each_stage`, so the chart
+always reflects the crates on disk and the current tool.
+
+Usage (from the repo root; needs rustfmt on PATH):
 
     # one stage, compared with the stage right before it
     uv run --with matplotlib python graphs/lines_changed.py \
@@ -11,9 +15,16 @@ missing):
     uv run --with matplotlib python graphs/lines_changed.py \
         out/<bench> --stage abstraction_recovery --before c2rust -o lines.png
 
+    # any two crates or stage dirs, before then after
+    uv run --with matplotlib python graphs/lines_changed.py \
+        --pair ~/ex1 ~/ex2 -o lines.png
+
 Each path is a stage dir (.../stages/NN-<id>), a case run dir or a bench dir;
 pass several for several bars. Options:
 
+    --pair A B       compare A (before) with B (after), each a crate dir or a
+                     stage dir; repeat for more bars. A plain crate has no C
+                     headers, so its bar has no C API segment
     --stage ID       stage to chart in case/bench dirs (default: each case's
                      last stage that produced Rust)
     --before ID      stage to compare against (default: the one right before)
@@ -84,12 +95,12 @@ plt.rcParams.update(
 
 @dataclass(frozen=True)
 class Target:
-    """One bar: a stage's output and the output of the stage before it."""
+    """One bar: a crate before and after, with names for the chart."""
 
-    case: str
-    case_dir: Path
-    stage_dir: Path
-    before_dir: Path
+    case: str  # bar label
+    case_dir: Path | None  # run dir holding inputs/c, if any
+    after_name: str  # e.g. the stage id
+    before_name: str
     before: Path
     after: Path
 
@@ -148,11 +159,31 @@ def _target(stage_dir: Path, before_stage: str | None) -> Target:
     return Target(
         case_dir.name,
         case_dir,
-        stage_dir,
-        before_dir,
+        _stage_id(stage_dir),
+        _stage_id(before_dir),
         before_dir / "out" / "rust",
         after,
     )
+
+
+def _crate(path: Path) -> tuple[Path, str, Path | None]:
+    """(crate, name, run dir) for a crate dir or a stage dir."""
+    path = path.resolve()
+    if (path / "Cargo.toml").is_file():
+        return path, path.name, None
+    rust = _rust(path)
+    if rust is None:
+        raise SystemExit(
+            f"{path}: neither a crate (Cargo.toml) nor a stage with out/rust"
+        )
+    return rust, _stage_id(path), path.parent.parent
+
+
+def pair_target(before: Path, after: Path) -> Target:
+    """A bar for two explicit crates or stage dirs, before then after."""
+    b, b_name, _ = _crate(before)
+    a, a_name, run = _crate(after)
+    return Target(run.name if run else a_name, run, a_name, b_name, b, a)
 
 
 def _pick(case_dir: Path, stage: str | None) -> Path | None:
@@ -304,7 +335,7 @@ def api_lines(lines: list[str], capi: tuple[PublicApi, set[str]] | None) -> list
 
 def measure(t: Target) -> Row:
     d = measure_diff(t.before, t.after)
-    capi = c_api(t.case_dir, t.before)
+    capi = c_api(t.case_dir, t.before) if t.case_dir else None
     lines: list[str] = []
     api: Counter[str] = Counter()
     untouched = api_untouched = 0
@@ -409,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument(
         "paths",
-        nargs="+",
+        nargs="*",
         type=Path,
         help="stage dirs (…/stages/NN-<id>), case run dirs, or bench dirs",
     )
@@ -425,17 +456,29 @@ def main(argv: list[str] | None = None) -> int:
         metavar="STAGE",
         help="stage id to compare against (default: the stage right before)",
     )
+    ap.add_argument(
+        "--pair",
+        nargs=2,
+        action="append",
+        type=Path,
+        default=[],
+        metavar=("BEFORE", "AFTER"),
+        help="compare two crate or stage dirs directly; repeat for more bars",
+    )
     ap.add_argument("--title", help="chart title (default: lines changed by <stage>)")
     ap.add_argument("--json", type=Path, help="also write the per-case counts as JSON")
     args = ap.parse_args(argv)
 
-    found = targets(args.paths, args.stage, args.before)
+    if not args.paths and not args.pair:
+        ap.error("give stage/case/bench dirs, or --pair BEFORE AFTER")
+    found = targets(args.paths, args.stage, args.before) if args.paths else []
+    found += [pair_target(b, a) for b, a in args.pair]
     if not found:
         print("no stage outputs to chart", file=sys.stderr)
         return 1
     with ThreadPoolExecutor(8) as pool:
         rows = list(pool.map(measure, found))
-    pairs = sorted({(_stage_id(t.stage_dir), _stage_id(t.before_dir)) for t in found})
+    pairs = sorted({(t.after_name, t.before_name) for t in found})
     title = args.title or "Lines changed by " + ", ".join(
         f"{stage} (vs {before})" for stage, before in pairs
     )
