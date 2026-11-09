@@ -7,10 +7,9 @@ edition = "2021"
 # (rustfmt-normalized) and the exported-symbol ABI (signatures + reachable type
 # layouts). See PROVENANCE.md.
 #
-# Deps match measure_unsafety's set, plus toml for reading Cargo targets.
+# toml reads Cargo targets; the rest is parsing (syn, quote), the CLI and JSON.
 [dependencies]
 clap = { version = "4.5.37", features = ["derive"] }
-proc-macro2 = { version = "1.0.95", features = ["span-locations"] }
 quote = "1.0.40"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
