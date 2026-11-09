@@ -134,10 +134,21 @@ vectors only, but `metrics.sh` can be pointed at *any* run dir to score it. Unsa
 source-only (works even if the crate doesn't build); idiomaticity runs clippy (needs the crate
 to build). Survey: `plan_docs/{unsafe,idiomaticity}_evaluation_plan.md`.
 
-### Measure every stage during a run
+### Measure code-change metrics
 
-To see what each stage did without measuring afterwards, turn on `[metrics]` in the
-pipeline config. It is off by default.
+`tools/diff_metrics` compares a crate before and after a stage. It reports the files and
+lines the stage changed (after rustfmt, so reformatting doesn't count) and whether the
+exported C ABI still matches: removed or changed `extern "C"` functions and changed
+`#[repr(C)]` layouts. With `--api`, only the API in the C headers counts. It reads the
+source only, so neither crate needs to build. `tools/diff_metrics/EXAMPLE_OUTPUT.md` walks
+through a real report.
+
+```bash
+cargo build --release --manifest-path tools/diff_metrics/Cargo.toml
+tools/diff_metrics/target/release/diff_metrics --before <crate> --after <crate> [--api <file>]
+```
+
+To run it on every stage of a pipeline, add `[metrics]` to the config (off by default):
 
 ```toml
 [metrics]
@@ -145,12 +156,10 @@ after_each_stage = true
 idiomaticity = "first_last"   # clippy on the first and last crate; or "all", "none"
 ```
 
-After each stage, proctor writes `stages/NN-<id>/metrics.json`: the unsafe score and what
-the stage changed against the previous stage's crate, from `tools/diff_metrics` (files and
-lines changed, and whether the exported C ABI still matches the C headers). At the end it
-writes a run-level `metrics.json` with a summary; a bench run also adds it to each case
-in `bench.json`. A metrics error is recorded and never fails the run.
-`tools/diff_metrics/EXAMPLE_OUTPUT.md` explains the ABI part.
+After each stage, proctor writes `stages/NN-<id>/metrics.json` with the unsafe score and
+the `diff_metrics` report against the previous stage's crate, scoped to the C headers'
+API. At the end it writes a run-level `metrics.json` with a summary; a bench run also adds
+it to each case in `bench.json`. A metrics error is recorded and never fails the run.
 
 To chart the lines a stage kept, removed and added:
 
