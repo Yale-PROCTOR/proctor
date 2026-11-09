@@ -134,6 +134,31 @@ vectors only, but `metrics.sh` can be pointed at *any* run dir to score it. Unsa
 source-only (works even if the crate doesn't build); idiomaticity runs clippy (needs the crate
 to build). Survey: `plan_docs/{unsafe,idiomaticity}_evaluation_plan.md`.
 
+### Measure every stage during a run
+
+To see what each stage did without measuring afterwards, turn on `[metrics]` in the
+pipeline config. It is off by default.
+
+```toml
+[metrics]
+after_each_stage = true
+idiomaticity = "first_last"   # clippy on the first and last crate; or "all", "none"
+```
+
+After each stage, proctor writes `stages/NN-<id>/metrics.json`: the unsafe score and what
+the stage changed against the previous stage's crate, from `tools/diff_metrics` (files and
+lines changed, and whether the exported C ABI still matches the C headers). At the end it
+writes a run-level `metrics.json` with a summary; a bench run also adds it to each case
+in `bench.json`. A metrics error is recorded and never fails the run.
+`tools/diff_metrics/EXAMPLE_OUTPUT.md` explains the ABI part.
+
+To chart the lines a stage kept, removed and added:
+
+```bash
+uv run --with matplotlib python graphs/lines_changed.py out/<bench>/<case>/stages/02-abstraction_recovery -o lines.png
+uv run --with matplotlib python graphs/lines_changed.py --pair <crate-before> <crate-after> --print
+```
+
 ## Docker
 
 ```bash
