@@ -2,7 +2,7 @@
 or per-stage across a run dir.
 
     python -m proctor.testing.metrics <crate-or-run-dir> [--complexity]
-                                      [--idiomaticity all|first-last|none]
+                                      [--idiomaticity all|first_last|none]
                                       [--json out.json]
 
 - Given a Cargo project (a dir with Cargo.toml), report both metrics for it.
@@ -13,7 +13,7 @@ or per-stage across a run dir.
 Unsafe is always measured (DARPA measure_unsafety, source-only), and so is the
 per-stage diff (tools/diff_metrics, source-only). Idiomaticity needs the crate
 to build under clippy (two builds per crate); if it can't, that line is marked
-skipped rather than failing the whole report. ``first-last`` runs clippy only
+skipped rather than failing the whole report. ``first_last`` runs clippy only
 on the first and last stage, the cheap way to see the whole pipeline's effect.
 
 The same measurements are recorded during a run when ``[metrics]
@@ -90,13 +90,15 @@ def _attach_diff(
 
 
 def measure_run(
-    run_dir: Path, *, idiomaticity: str = "first-last", complexity: bool = False
+    run_dir: Path, *, idiomaticity: str = "first_last", complexity: bool = False
 ) -> list[StageMetrics]:
     """Measure every stage that produced a Rust project in ``run_dir``.
-    ``idiomaticity`` is ``all``, ``first-last`` or ``none``; the ABI diff is
+    ``idiomaticity`` is ``all``, ``first_last`` or ``none`` (as in ``[metrics]``;
+    ``first-last`` is also accepted); the ABI diff is
     restricted to the C headers' public API when the run recorded a C input."""
     from proctor.testing.vector_compare import stage_rust_outputs
 
+    idiomaticity = idiomaticity.replace("-", "_")
     outputs = stage_rust_outputs(run_dir)
     c_project = run_dir / "inputs" / "c"
     try:
@@ -107,7 +109,7 @@ def measure_run(
     prev: Path | None = None
     for i, (stage_id, rust) in enumerate(outputs):
         clippy = idiomaticity == "all" or (
-            idiomaticity == "first-last" and i in (0, len(outputs) - 1)
+            idiomaticity == "first_last" and i in (0, len(outputs) - 1)
         )
         m = _measure(rust, do_idiom=clippy, complexity=complexity)
         m.stage = stage_id
@@ -344,9 +346,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--idiomaticity",
-        choices=("all", "first-last", "none"),
+        type=lambda s: s.replace("-", "_"),
+        choices=("all", "first_last", "none"),
         default="all",
-        help="which stages get clippy in a run dir (default all; first-last = the "
+        help="which stages get clippy in a run dir (default all; first_last = the "
         "first and last stage only; none = no build needed)",
     )
     ap.add_argument(

@@ -123,9 +123,24 @@ def test_idiomaticity_first_last(tmp_path: Path, stub, monkeypatch) -> None:
     monkeypatch.setattr(
         metrics, "measure_idiomaticity", lambda c, **kw: clippy_on.append(c) or _i(30)
     )
-    rows = metrics.measure_run(run, idiomaticity="first-last")
+    rows = metrics.measure_run(run, idiomaticity="first_last")
     assert [r.idiom is not None for r in rows] == [True, False, True]
     assert [p.parent.parent.name for p in clippy_on] == [
         "00-c2rust",
         "02-abstraction_recovery",
     ]
+
+
+@pytest.mark.parametrize("spelling", ["first_last", "first-last"])
+def test_cli_accepts_config_spelling(
+    tmp_path: Path, stub, monkeypatch, spelling: str
+) -> None:
+    run = tmp_path / "case"
+    for i, sid in enumerate(["c2rust", "crat", "abstraction_recovery"]):
+        _stage(run, f"0{i}", sid)
+    clippy_on: list[Path] = []
+    monkeypatch.setattr(
+        metrics, "measure_idiomaticity", lambda c, **kw: clippy_on.append(c) or _i(30)
+    )
+    assert metrics.main([str(run), "--idiomaticity", spelling]) == 0
+    assert len(clippy_on) == 2  # first and last only
