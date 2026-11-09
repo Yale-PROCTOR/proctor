@@ -30,6 +30,7 @@ pass several for several bars. Options:
     --before ID      stage to compare against (default: the one right before)
     -o, --out PNG    image to write (default: lines_changed.png)
     --json FILE      also write the per-case counts
+    --print          also print the charted numbers as a table
     --title TEXT     replace the default title
 
 Each bar is the crate's lines before the stage, split into kept and removed,
@@ -436,6 +437,40 @@ def draw(rows: list[Row], title: str, out: Path) -> None:
     plt.close(fig)
 
 
+def table(rows: list[Row]) -> str:
+    """The charted numbers, one line per bar, in the chart's order."""
+    head = (
+        "case",
+        "before",
+        "C API",
+        "untouched",
+        "edited",
+        "removed",
+        "added",
+        "after",
+        "files changed",
+    )
+    body = [
+        (
+            r.case,
+            str(r.lines),
+            str(r.api),
+            str(r.untouched),
+            str(r.edited),
+            str(r.removed),
+            str(r.added),
+            str(r.kept + r.added),
+            f"{r.files_changed}/{r.files}",
+        )
+        for r in sorted(rows, key=lambda r: r.lines, reverse=True)
+    ]
+    widths = [max(len(c) for c in col) for col in zip(head, *body)]
+    fmt = "  ".join(
+        f"{{:<{w}}}" if i == 0 else f"{{:>{w}}}" for i, w in enumerate(widths)
+    )
+    return "\n".join(fmt.format(*line) for line in [head, *body])
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument(
@@ -467,6 +502,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--title", help="chart title (default: lines changed by <stage>)")
     ap.add_argument("--json", type=Path, help="also write the per-case counts as JSON")
+    ap.add_argument(
+        "--print",
+        action="store_true",
+        help="also print the charted numbers as a table",
+    )
     args = ap.parse_args(argv)
 
     if not args.paths and not args.pair:
@@ -483,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{stage} (vs {before})" for stage, before in pairs
     )
     draw(rows, title, args.out)
+    if args.print:
+        print(f"{title}\n{table(rows)}\n")
     if args.json:
         args.json.write_text(json.dumps([vars(r) for r in rows], indent=1) + "\n")
     print(f"{len(rows)} case(s) -> {args.out}")
