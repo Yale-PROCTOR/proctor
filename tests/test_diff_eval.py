@@ -84,6 +84,35 @@ def test_measure_diff_passes_api_file(tmp_path: Path, monkeypatch: Any) -> None:
     ]
 
 
+def _crate(root: Path, kind: str) -> Path:
+    root.mkdir(parents=True)
+    (root / "proctor.toml").write_text(
+        f'target_kind = "{kind}"\ntarget_name = "x"\n', encoding="utf-8"
+    )
+    return root
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [("executable", ""), ("library", "symbol circle_collide\ntype c2Circle\n")],
+)
+def test_a_program_has_no_public_api(
+    tmp_path: Path, monkeypatch: Any, kind: str, expected: str
+) -> None:
+    seen: dict[str, str] = {}
+
+    def fake_run(cmd, **kw):
+        seen["api"] = Path(cmd[cmd.index("--api") + 1]).read_text().strip("\n")
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(_SAMPLE), "")
+
+    monkeypatch.setattr(diff_eval, "ensure_built", lambda: tmp_path / "bin")
+    monkeypatch.setattr(diff_eval.subprocess, "run", fake_run)
+    before = _crate(tmp_path / "before", kind)
+    api = PublicApi(frozenset({"circle_collide"}), frozenset({"c2Circle"}))
+    diff_eval.measure_diff(before, tmp_path / "after", api=api)
+    assert seen["api"] == expected.strip("\n")
+
+
 def test_measure_diff_tool_failure_raises(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setattr(diff_eval, "ensure_built", lambda: tmp_path / "bin")
     monkeypatch.setattr(

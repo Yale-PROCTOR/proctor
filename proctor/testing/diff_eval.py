@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from proctor.contracts.manifest import ManifestError, ProjectManifest
+
 _TOOL_DIR = Path(__file__).resolve().parent.parent.parent / "tools" / "diff_metrics"
 _BIN = _TOOL_DIR / "target" / "release" / "diff_metrics"
 
@@ -146,6 +148,17 @@ def ensure_built(*, timeout_s: int = 900) -> Path:
     return _BIN
 
 
+def is_program(crate: Path) -> bool:
+    """Whether the crate is a program (``proctor.toml`` ``target_kind =
+    "executable"``). CRAT emits a program as a library holding all the code plus
+    a ``[[bin]]`` that calls it, so its exports look like an API, but nothing
+    outside the crate calls them."""
+    try:
+        return ProjectManifest.load(crate).target_kind == "executable"
+    except ManifestError:
+        return False
+
+
 def measure_diff(
     before: Path,
     after: Path,
@@ -155,7 +168,10 @@ def measure_diff(
 ) -> DiffReport:
     """Diff two Cargo projects (e.g. consecutive stages' ``out/rust``). With
     ``api``, the ABI diff covers only those symbols, and layout changes behind
-    a pointer break only for the types the headers define."""
+    a pointer break only for the types the headers define. For a program
+    (:func:`is_program`) the API is empty: no export or type is public."""
+    if is_program(before):
+        api = PublicApi(frozenset())
     binary = ensure_built()
     cmd = [str(binary), "--before", str(before), "--after", str(after)]
     with tempfile.TemporaryDirectory() as td:

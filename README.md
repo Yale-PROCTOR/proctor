@@ -158,7 +158,8 @@ idiomaticity = "first_last"   # clippy on the first and last crate; or "all", "n
 
 After each stage, proctor writes `stages/NN-<id>/metrics.json` with the unsafe score and
 the `diff_metrics` report against the previous stage's crate, scoped to the C headers'
-API. At the end it writes a run-level `metrics.json` with a summary; a bench run also adds
+API. A program has no API (nothing outside it calls its functions), so for a program
+only the files and lines changed count. At the end it writes a run-level `metrics.json` with a summary; a bench run also adds
 it to each case in `bench.json`. A metrics error is recorded and never fails the run.
 
 To chart the lines a stage kept, removed and added:
