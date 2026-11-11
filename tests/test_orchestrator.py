@@ -295,3 +295,89 @@ def test_testing_gate_allows_passing_stage(tmp_path: Path, monkeypatch: Any) -> 
     events = read_events(result.run_dir / "events.jsonl")
     test_events = [e for e in events if e["event"] == "test_result"]
     assert test_events and test_events[0]["ok"] is True
+
+
+def _metrics_config(
+    stages: dict[str, dict[str, Any]], **metrics: Any
+) -> PipelineConfig:
+    return PipelineConfig.from_dict(
+        {
+            "run": {"provides": ["rust_project"]},
+            "pipeline": {"order": list(stages)},
+            "stages": {
+                sid: {"uses": str(FAKE), "config": c} for sid, c in stages.items()
+            },
+            "metrics": {"after_each_stage": True, **metrics},
+        }
+    )
+
+
+def _stub_measurement(monkeypatch: Any) -> list[tuple[Any, Any]]:
+    from proctor.testing import metrics
+    from proctor.testing.diff_eval import DiffReport
+    from proctor.testing.unsafe_eval import UnsafeReport
+
+    diffs: list[tuple[Any, Any]] = []
+    monkeypatch.setattr(
+        metrics,
+        "measure_unsafe",
+        lambda c, **k: UnsafeReport.from_stats({"unsafe_score": 3, "total_lines": 10}),
+    )
+
+    def fake_diff(before: Any, after: Any, **k: Any) -> DiffReport:
+        diffs.append((before, after))
+        return DiffReport.from_json(
+            {"files_changed": 1, "lines_added": 1, "abi": {"ok": True}}
+        )
+
+    monkeypatch.setattr(metrics, "measure_diff", fake_diff)
+    monkeypatch.setattr(
+        metrics, "_clippy", lambda rust, loc: {"idiomaticity": {"total": 2}}
+    )
+    return diffs
+
+
+def test_metrics_written_after_each_stage(tmp_path: Path, monkeypatch: Any) -> None:
+    diffs = _stub_measurement(monkeypatch)
+    config = _metrics_config({"a": {"marker": "A"}, "b": {"marker": "B"}})
+    src = _source_project(tmp_path)
+    result = _start(config, tmp_path, src)
+    assert result.ok
+    stages = result.run_dir / "stages"
+    a = json.loads((stages / "00-a" / "metrics.json").read_text())
+    b = json.loads((stages / "01-b" / "metrics.json").read_text())
+    assert a["stage"] == "a" and b["stage"] == "b"
+    # each stage is diffed against the Rust it was given
+    assert diffs[0][1] == stages / "00-a" / "out" / "rust"
+    assert diffs[1] == (
+        stages / "00-a" / "out" / "rust",
+        stages / "01-b" / "out" / "rust",
+    )
+    run = json.loads((result.run_dir / "metrics.json").read_text())
+    assert [r["stage"] for r in run["stages"]] == ["a", "b"]
+    assert run["summary"]["clippy_first"] == 2
+    events = [e["event"] for e in read_events(result.run_dir / "events.jsonl")]
+    assert events.count("stage_metrics") == 2
+
+
+def test_metrics_off_by_default(tmp_path: Path) -> None:
+    result = _start(
+        _config({"a": {"marker": "A"}}), tmp_path, _source_project(tmp_path)
+    )
+    assert result.ok
+    assert not (result.run_dir / "metrics.json").exists()
+    assert not (result.run_dir / "stages" / "00-a" / "metrics.json").exists()
+
+
+def test_metrics_failure_never_fails_the_run(tmp_path: Path, monkeypatch: Any) -> None:
+    from proctor.testing import metrics
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("measure_unsafety missing")
+
+    monkeypatch.setattr(metrics, "_measure", boom)
+    config = _metrics_config({"a": {"marker": "A"}})
+    result = _start(config, tmp_path, _source_project(tmp_path))
+    assert result.ok
+    row = json.loads((result.run_dir / "stages" / "00-a" / "metrics.json").read_text())
+    assert "measure_unsafety missing" in row["metrics_error"]

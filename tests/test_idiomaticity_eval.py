@@ -109,3 +109,28 @@ def test_measure_idiomaticity_timeout_is_wrapped(
     monkeypatch.setattr(ie.subprocess, "run", fake_run)
     with pytest.raises(IdiomEvalError, match="timed out"):
         ie.measure_idiomaticity(tmp_path / "c", workdir=tmp_path / "wd")
+
+
+def test_clippy_builds_in_workdir_not_the_crate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    crate = tmp_path / "crate"
+    crate.mkdir()
+    seen: dict[str, str] = {}
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+
+    def fake_run(cmd, **kw):
+        seen["target"] = kw["env"]["CARGO_TARGET_DIR"]
+        Path(cmd[cmd.index("--output") + 1]).write_text('{"clippy": {}}', "utf-8")
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return P()
+
+    monkeypatch.setattr(ie.subprocess, "run", fake_run)
+    ie.measure_idiomaticity(crate, workdir=tmp_path / "wd")
+    assert Path(seen["target"]) == (tmp_path / "wd" / "cargo-target").resolve()
+    assert not Path(seen["target"]).is_relative_to(crate)
