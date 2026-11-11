@@ -170,7 +170,7 @@ def measure_diff(
     ``api``, the ABI diff covers only those symbols, and layout changes behind
     a pointer break only for the types the headers define. For a program
     (:func:`is_program`) the API is empty: no export or type is public."""
-    if is_program(before):
+    if is_program(before) or is_program(after):
         api = PublicApi(frozenset())
     binary = ensure_built()
     cmd = [str(binary), "--before", str(before), "--after", str(after)]
