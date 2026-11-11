@@ -178,3 +178,20 @@ def test_unreadable_header_raises(tmp_path: Path) -> None:
     (c / "include" / "broken.h").symlink_to(tmp_path / "missing.h")
     with pytest.raises(OSError):
         public_api(c)
+
+
+def test_a_program_is_recognized_from_either_side(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """c2rust's output has no proctor.toml; CRAT, the next stage, writes it."""
+    seen: dict[str, str] = {}
+
+    def fake_run(cmd, **kw):
+        seen["api"] = Path(cmd[cmd.index("--api") + 1]).read_text()
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(_SAMPLE), "")
+
+    monkeypatch.setattr(diff_eval, "ensure_built", lambda: tmp_path / "bin")
+    monkeypatch.setattr(diff_eval.subprocess, "run", fake_run)
+    after = _crate(tmp_path / "after", "executable")
+    diff_eval.measure_diff(tmp_path / "before", after)
+    assert seen["api"].strip() == ""
