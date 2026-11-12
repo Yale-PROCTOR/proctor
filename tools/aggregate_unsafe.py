@@ -60,10 +60,16 @@ def main() -> None:
     parser.add_argument(
         "--prefix", default="", help="collect runs with this name prefix"
     )
+    parser.add_argument(
+        "--dir",
+        type=Path,
+        default=ROOT / "runs",
+        help="directory containing runs (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     directories = []
-    for run in sorted(ROOT.glob("runs/*")):
+    for run in sorted(args.dir.resolve().glob("*")):
         if not run.is_dir() or not run.name.startswith(args.prefix):
             continue
         stage = max(
