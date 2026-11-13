@@ -104,6 +104,8 @@ class DependencyNormalizationFailure(StageFailure):
 @dataclass
 class Metrics:
     function_count: int = 0
+    initializer_count: int = 0
+    retained_initializers: int = 0
     scc_count: int = 0
     llm_generation_calls: int = 0
     repair_calls: int = 0
@@ -118,6 +120,8 @@ class Metrics:
     def to_dict(self) -> dict[str, int]:
         return {
             "function_count": self.function_count,
+            "initializer_count": self.initializer_count,
+            "retained_initializers": self.retained_initializers,
             "scc_count": self.scc_count,
             "llm_generation_calls": self.llm_generation_calls,
             "repair_calls": self.repair_calls,
@@ -577,11 +581,17 @@ def _validate_boundaries(
         raise StageFailure(
             f"output Rust project destination already exists: {destination}"
         )
+    for name in ("global-initializer-install.json", "initialized-frozen-project.json"):
+        if (workdir / name).is_symlink():
+            raise StageFailure(
+                f"initializer scratch file must not be a symlink: {workdir / name}"
+            )
     for directory in (
         "analysis",
         "current",
         "workers",
         "groups",
+        "initializers",
         "final-rollback",
         "final-project",
         "test-validation",
@@ -592,7 +602,14 @@ def _validate_boundaries(
         if root.is_symlink():
             raise StageFailure(f"scratch directory must not be a symlink: {root}")
         if (
-            directory in {"workers", "groups", "test-validation", "wrapper-bounds"}
+            directory
+            in {
+                "workers",
+                "groups",
+                "initializers",
+                "test-validation",
+                "wrapper-bounds",
+            }
             and root.is_dir()
         ):
             for child in root.iterdir():
@@ -704,6 +721,7 @@ def _validate_boundaries(
         "analysis",
         "workers",
         "groups",
+        "initializers",
         "final-rollback",
         "final-project",
         "test-validation",
@@ -727,6 +745,8 @@ def _validate_boundaries(
         for name in (
             "skeletons.json",
             "frozen-project.json",
+            "initialized-frozen-project.json",
+            "global-initializer-install.json",
             "normalized.rs",
             "initial.rs",
             "assembled.rs",
@@ -2503,6 +2523,174 @@ def _merge_job_state(state: RunState, job: RunState) -> None:
     state.accepted_views.update(job.accepted_views)
 
 
+def _run_initializers(
+    records_by_id: dict[int, ItemRecord],
+    *,
+    stage_input: StageInput,
+    frozen: Path,
+    workdir: Path,
+    tools: Any,
+    usage_path: Path,
+    state: RunState,
+    limiter: RateLimiter,
+    llm_client_factory: Callable[[dict[str, Any], UsageTracker], Any] | None,
+) -> Path:
+    selected = tuple(
+        record
+        for _, record in sorted(records_by_id.items())
+        if record.initializer is not None
+    )
+    if not selected:
+        return frozen
+    state.metrics.initializer_count = len(selected)
+    settings = dict(stage_input.framework.llm)
+    settings["context_overflow"] = "error"
+    tracker: UsageTracker | None = None
+    client: Any = None
+    histories: list[dict[str, Any]] = []
+    for record in selected:
+        initializer = record.initializer
+        assert initializer is not None
+        directory = workdir / "initializers" / f"{record.id:06d}"
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True)
+        context = ""
+        if initializer.needs_transformation:
+            context, _ = dependency_context(
+                (record.id,), records_by_id, limit=CONTEXT_LIMIT
+            )
+        targets = (
+            f"### {record.kind} `{record.path}`\n\n"
+            f"Source:\n```rust\n{initializer.annotated_source}\n```\n\n"
+            f"Target skeleton:\n```rust\n{initializer.skeleton}\n```"
+        )
+        transformations: list[str] = []
+        latest_failed: str | None = None
+        diagnostics: str | None = None
+        patch_failure: tuple[str, str] | None = None
+        accepted = False
+        for generation in range(state.config_used["max_repairs"] + 1):
+            if initializer.needs_transformation:
+                if tracker is None:
+                    tracker = UsageTracker(
+                        usage_path,
+                        run_id=stage_input.run_id,
+                        stage=STAGE_ID,
+                        item=stage_input.item,
+                        pricing=PricingTable.from_config(settings),
+                    )
+                    client = (
+                        llm_client_factory(dict(settings), tracker)
+                        if llm_client_factory is not None
+                        else LlmClient(dict(settings), tracker=tracker, limiter=limiter)
+                    )
+                base = (latest_failed or initializer.skeleton) if generation else None
+                rendered = render_prompt(
+                    PromptRenderInput(
+                        dependency_context=context,
+                        transformation_targets=targets,
+                        repair_base=base,
+                        diagnostics=diagnostics,
+                        patch_failure=patch_failure,
+                        initializer=True,
+                    )
+                )
+                request = llm_request(
+                    rendered, run_id=stage_input.run_id, members=(record.id,)
+                )
+                exchange = None
+                if state.config_used["dump_llm_exchanges"]:
+                    exchange = (
+                        (stage_input.outputs.artifacts_dir or workdir)
+                        / "llm-exchanges"
+                        / f"initializer-{record.id}"
+                        / f"generation-{generation:02d}"
+                    )
+                    exchange.mkdir(parents=True, exist_ok=True)
+                    (exchange / "prompt.md").write_text(rendered.text, encoding="utf-8")
+                state.prompts_used.add(rendered.id)
+                state.metrics.llm_generation_calls += 1
+                if generation:
+                    state.metrics.repair_calls += 1
+                before = tracker.record_count
+                started = time.monotonic()
+                try:
+                    response = client.complete(request)
+                except Exception as exc:
+                    if tracker.record_count == before:
+                        tracker.record(
+                            metadata=request.metadata,
+                            provider=str(settings.get("provider", "unknown")),
+                            model=str(settings.get("model", "")),
+                            usage=None,
+                            latency_s=time.monotonic() - started,
+                            finish_reason="error",
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    raise
+                _record_untracked_response(tracker, before, request, response)
+                if exchange is not None:
+                    (exchange / "response.md").write_text(
+                        response.text, encoding="utf-8"
+                    )
+                extraction = _extract_transformation(
+                    response.text, base, directory, exchange
+                )
+                if extraction.candidate is None:
+                    state.metrics.structural_failures += 1
+                    if base is None:
+                        diagnostics = extraction.diagnostics
+                    else:
+                        patch_failure = (response.text, extraction.diagnostics or "")
+                    continue
+                patch_failure = None
+                transformation = extraction.candidate
+            else:
+                transformation = initializer.skeleton
+            if transformation in transformations:
+                diagnostics = "initializer transformation repeated"
+                break
+            transformations.append(transformation)
+            latest_failed = transformation
+            request_path = directory / "transformation-request.json"
+            response_path = directory / "transformation-response.json"
+            write_json(
+                request_path, {"item_id": record.id, "transformation": transformation}
+            )
+            _, result = tools.transform_initializer(frozen, request_path, response_path)
+            if result.get("status") == "valid" and set(result) == {"status", "source"}:
+                source = result["source"]
+                if not isinstance(source, str) or not source:
+                    raise StageFailure(
+                        "initializer transformation source must be nonempty"
+                    )
+                transformations.append(source)
+                (directory / "accepted.rs").write_text(source, encoding="utf-8")
+                accepted = True
+                break
+            if (
+                result.get("status") != "invalid"
+                or set(result) != {"status", "diagnostics"}
+                or not isinstance(result["diagnostics"], str)
+                or not result["diagnostics"]
+            ):
+                raise StageFailure("invalid initializer transformation response")
+            state.metrics.structural_failures += 1
+            diagnostics = result["diagnostics"]
+            if not initializer.needs_transformation:
+                break
+        if not accepted:
+            state.metrics.retained_initializers += 1
+        (directory / "diagnostics.txt").write_text(diagnostics or "", encoding="utf-8")
+        histories.append({"item_id": record.id, "transformations": transformations})
+    request_path = workdir / "global-initializer-install.json"
+    initialized = workdir / "initialized-frozen-project.json"
+    write_json(request_path, {"items": histories})
+    tools.install_initializers(frozen, request_path, initialized)
+    return initialized
+
+
 def _run_group_workers(
     components: tuple[tuple[int, ...], ...],
     records_by_id: dict[int, ItemRecord],
@@ -2518,6 +2706,7 @@ def _run_group_workers(
     exchange_root: Path | None,
     state: RunState,
     llm_client_factory: Callable[[dict[str, Any], UsageTracker], Any] | None,
+    limiter: RateLimiter | None = None,
 ) -> tuple[tuple[tuple[int, ...], Path], ...]:
     ordered = tuple(item_id for members in components for item_id in members)
     positions = {item_id: index for index, item_id in enumerate(ordered)}
@@ -2544,7 +2733,8 @@ def _run_group_workers(
     settings["context_overflow"] = "error"
     rate = settings.get("rate_limit", {})
     rpm = rate.get("requests_per_minute") if isinstance(rate, dict) else None
-    limiter = RateLimiter(int(rpm) if rpm else None)
+    if limiter is None:
+        limiter = RateLimiter(int(rpm) if rpm else None)
     factory = llm_client_factory or (
         lambda config, tracker: LlmClient(config, tracker=tracker, limiter=limiter)
     )
@@ -2790,6 +2980,20 @@ def run_stage(
         normalized = workdir / "normalized.rs"
         active_tools.normalize(library_source, normalized)
         os.replace(normalized, library_source)
+        rate = stage_input.framework.llm.get("rate_limit", {})
+        rpm = rate.get("requests_per_minute") if isinstance(rate, dict) else None
+        limiter = RateLimiter(int(rpm) if rpm else None)
+        frozen = _run_initializers(
+            records_by_id,
+            stage_input=stage_input,
+            frozen=frozen,
+            workdir=workdir,
+            tools=active_tools,
+            usage_path=usage_path,
+            state=state,
+            limiter=limiter,
+            llm_client_factory=llm_client_factory,
+        )
         current = workdir / "current"
         if current.exists():
             shutil.rmtree(current)
@@ -2836,6 +3040,7 @@ def run_stage(
                 exchange_root=exchange_root,
                 state=state,
                 llm_client_factory=llm_client_factory,
+                limiter=limiter,
             )
         for members, accepted_source in accepted:
             accepted_dir = accepted_source.parent

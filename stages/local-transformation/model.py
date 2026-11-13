@@ -408,6 +408,15 @@ class SkeletonView:
 
 
 @dataclass(frozen=True)
+class InitializerRecord:
+    annotated_source: str
+    skeleton: str
+    needs_transformation: bool
+    block: bool
+    statement_dispositions: tuple[StatementDisposition, ...]
+
+
+@dataclass(frozen=True)
 class ItemRecord:
     id: int
     path: str
@@ -425,6 +434,7 @@ class ItemRecord:
     foreign_function_names: tuple[str, ...] = ()
     foreign_static_names: tuple[str, ...] = ()
     declaration: str | None = None
+    initializer: InitializerRecord | None = None
     source_definition: str | None = None
     target_definition: str | None = None
 
@@ -810,6 +820,43 @@ def _load_skeleton_view(value: Any, record_id: int, view_name: str) -> SkeletonV
     return view
 
 
+def _load_initializer(value: Any, record_id: int) -> InitializerRecord | None:
+    if value is None:
+        return None
+    where = f"record {record_id} initializer"
+    required = {
+        "annotated_source",
+        "skeleton",
+        "needs_transformation",
+        "block",
+        "statement_dispositions",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise SkeletonError(f"{where} must contain exactly {sorted(required)}")
+    source = _nonempty_string(value["annotated_source"], f"{where}.annotated_source")
+    skeleton = _nonempty_string(value["skeleton"], f"{where}.skeleton")
+    needs = value["needs_transformation"]
+    block = value["block"]
+    if not isinstance(needs, bool) or not isinstance(block, bool):
+        raise SkeletonError(f"{where} needs_transformation and block must be Booleans")
+    dispositions = _statement_dispositions(
+        value["statement_dispositions"], record_id, "initializer"
+    )
+    nodes = _walk_dispositions(dispositions)
+    if any(
+        node.disposition not in {"preserve", "preserve_shell", "transform"}
+        for node in nodes
+    ):
+        raise SkeletonError(f"{where} has a rule or mechanical disposition")
+    if not block and dispositions:
+        raise SkeletonError(f"{where} non-block expressions must not have labels")
+    if block and needs != any(node.disposition == "transform" for node in nodes):
+        raise SkeletonError(
+            f"{where}.needs_transformation is inconsistent with its dispositions"
+        )
+    return InitializerRecord(source, skeleton, needs, block, dispositions)
+
+
 def _view_topology(view: SkeletonView) -> tuple[tuple[int, tuple[int, ...]], ...]:
     return tuple(
         (node.label, tuple(child.label for child in node.children))
@@ -1010,6 +1057,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             "path",
             "kind",
             "declaration",
+            "initializer",
             "signature_dependencies",
             "dependencies",
         }
@@ -1027,6 +1075,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             path=path,
             kind=kind,
             declaration=declaration,
+            initializer=_load_initializer(data["initializer"], record_id),
             signature_dependencies=signature_dependencies,
             dependencies=dependencies,
         )
