@@ -42,22 +42,21 @@ RUN apt-get update \
     zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# Claude Code CLI (Node 20), for the abstraction_recovery stage, which shells
-# out to `claude`. Auth is via ANTHROPIC_API_KEY passed at run time
-# (e.g. bench_no_falco.sh forwards it with `docker run -e ANTHROPIC_API_KEY`).
-# Install Opencode v1 as well
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
- && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs \
- && npm install -g @anthropic-ai/claude-code \
- && npm install -g opencode-ai \
- && npm cache clean --force \
- && rm -rf /var/lib/apt/lists/*
-
 RUN useradd -m proctor
 USER proctor
 WORKDIR /home/proctor
-ENV PATH="/home/proctor/local/bin:/home/proctor/.local/bin:/home/proctor/.cargo/bin:${PATH}"
-RUN mkdir -p /home/proctor/local/bin
+ENV PATH="/home/proctor/.local/bin:/home/proctor/.cargo/bin:/home/proctor/.node-bin:${PATH}"
+
+# Install the different harnesses: claude-code, opencode v1, antigravity, codex
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.41.0/install.sh | bash \
+ && . /home/proctor/.nvm/nvm.sh \
+ && nvm install 26 \
+ && npm install -g @anthropic-ai/claude-code \
+ && npm install -g opencode-ai \
+ && npm cache clean --force \
+ && ln -s $(realpath $(dirname $(which node))) /home/proctor/.node-bin \
+ && curl -fsSL https://antigravity.google/cli/install.sh | bash \
+ && curl -fsSL https://chatgpt.com/codex/install.sh | bash
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | sh -s -- -y -q --default-toolchain stable
@@ -93,9 +92,9 @@ RUN uv run proctor warmup -c configs/c2rust_crat_testgen_absrec_disrep_idm.toml
 # With c2rust on PATH the adapter resolves it there (native build — no
 # CPATH needed), and it survives a live repo mount.
 RUN ln -sf /home/proctor/proctor/stages/c2rust/target/release/c2rust-transpile \
-      /home/proctor/local/bin/c2rust-transpile \
+      /home/proctor/.local/bin/c2rust-transpile \
  && ln -sf /home/proctor/proctor/stages/crat/crat \
-      /home/proctor/local/bin/crat
+      /home/proctor/.local/bin/crat
 
 ARG PROCTOR_IMAGE=proctor-framework:dev
 ENV PROCTOR_IMAGE=${PROCTOR_IMAGE}
