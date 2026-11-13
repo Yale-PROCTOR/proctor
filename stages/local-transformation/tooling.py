@@ -336,6 +336,8 @@ class CratTools:
         frozen: Path,
         accepted: tuple[tuple[tuple[int, ...], Path], ...],
         output: Path,
+        *,
+        stubbed_items: tuple[int, ...] = (),
     ) -> None:
         assert self.crat_tool is not None
         request = output.with_suffix(".json")
@@ -348,6 +350,9 @@ class CratTools:
                     {
                         "members": list(members),
                         "source": path.read_text(encoding="utf-8"),
+                        "stubbed_items": [
+                            item for item in members if item in stubbed_items
+                        ],
                     }
                     for members, path in accepted
                 ]
@@ -359,6 +364,24 @@ class CratTools:
             [
                 str(self.crat_tool),
                 "assemble-project",
+                "--frozen",
+                str(frozen),
+                "--request",
+                str(request),
+                "--output",
+                str(output),
+            ],
+            output,
+        )
+
+    def retain_functions(self, frozen: Path, request: Path, output: Path) -> None:
+        assert self.crat_tool is not None
+        self._validate_project_outputs((output,), (), (frozen, request))
+        self._output_operation(
+            "crat-tool retain-functions",
+            [
+                str(self.crat_tool),
+                "retain-functions",
                 "--frozen",
                 str(frozen),
                 "--request",

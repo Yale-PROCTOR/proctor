@@ -18,6 +18,7 @@ workers = { type = "integer", default = 4, doc = "positive number of workers, ea
 max_group_chars = { type = "integer", default = 15000, doc = "positive soft limit on grouped annotated source plus the larger baseline/applied skeleton; oversized functions run alone" }
 max_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number of structured repair calls per group, shared across structural and compilation failures and baseline fallback" }
 max_unstructured_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number of signature-only repair calls per group; rule-free compilation failures skip structured repair" }
+max_compilation_repairs = { type = "integer", default = 3, doc = "maximum compilation repair agent invocations across assembled and postprocessed projects, independent of test repair" }
 crat_dir = { type = "string", default = "../crat", doc = "crat checkout, relative to this stage" }
 dump_llm_exchanges = { type = "bool", default = false, doc = "persist each rendered prompt and LLM response under stage artifacts" }
 testinfra_dir = { type = "string", default = "../test-infrastructure", doc = "test infrastructure checkout, relative to this stage" }

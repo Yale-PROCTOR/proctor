@@ -3441,6 +3441,7 @@ class FakeTools:
         sidecars=None,
         observations=None,
         merged_observations=None,
+        retained=None,
     ):
         self.skeletons = [] if skeletons is None else skeletons
         self.normalized = normalized
@@ -3450,6 +3451,7 @@ class FakeTools:
         self.sidecars = None if sidecars is None else list(sidecars)
         self.observations = None if observations is None else list(observations)
         self.merged_observations = merged_observations
+        self.retained = None if retained is None else list(retained)
         self.events = []
         self.build_modes = []
         self.additions = []
@@ -3461,9 +3463,33 @@ class FakeTools:
         log_path.touch()
         return worker
 
-    def assemble_project(self, frozen, accepted, output):
+    def assemble_project(self, frozen, accepted, output, *, stubbed_items=()):
         self.events.append(("assemble_project", frozen, accepted, output))
+        if stubbed_items:
+            self.events.append(("assembled_stubs", stubbed_items))
         output.write_text(accepted[-1][1].read_text() if accepted else self.normalized)
+
+    def retain_functions(self, frozen, request, output):
+        value = json.loads(request.read_text())
+        self.events.append(("retain_functions", value))
+        result = (
+            self.retained.pop(0)
+            if self.retained is not None
+            else {
+                "source": value["transformations"][-1]
+                if value["transformations"]
+                else self.normalized,
+                "stubbed_items": [] if value["transformations"] else value["members"],
+            }
+        )
+        result = dict(result)
+        result.setdefault(
+            "candidate_sha256", hashlib.sha256(result["source"].encode()).hexdigest()
+        )
+        result.setdefault(
+            "frozen_project_sha256", hashlib.sha256(frozen.read_bytes()).hexdigest()
+        )
+        output.write_text(json.dumps(result))
 
     def make_initial(self, analysis, output, **kwargs):
         self.events.append(("make_initial", analysis, output))
@@ -3832,8 +3858,9 @@ def test_independent_builds_keep_complete_analysis_and_reset_target_by_scc(tmp_p
         leaf,
         both,
         both,
+        both,
     ]
-    assert tools.build_modes == [True, True, True, False]
+    assert tools.build_modes == [True, True, True, False, False]
     assert [event[3] for event in tools.events if event[0] == "add_functions"] == [
         initial,
         initial,
@@ -3858,7 +3885,7 @@ def test_independent_builds_keep_complete_analysis_and_reset_target_by_scc(tmp_p
     assert (value.outputs.rust_project / "lib.rs").read_text() == both
     assert "__proctor_wrapper_" not in both
     assert "wrappers = []" in (value.outputs.rust_project / "proctor.toml").read_text()
-    assert output.metrics["cargo_builds"] == 4
+    assert output.metrics["cargo_builds"] == 5
 
 
 @pytest.mark.parametrize(
@@ -3916,12 +3943,16 @@ def test_final_build_failure_restores_source_and_manifest_together(tmp_path):
     original_manifest = (value.inputs.rust_project / "proctor.toml").read_text()
     tools = FinalizingTools(
         normalized="accepted partial\n",
-        builds=[CommandResult(0), CommandResult(9, "", "final error")],
+        builds=[
+            CommandResult(0),
+            CommandResult(0),
+            CommandResult(9, "", "final error"),
+        ],
     )
     output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
     assert output.status == "failure"
     assert "final cargo build failed (9)" in output.error
-    assert tools.build_modes == [True, False]
+    assert tools.build_modes == [True, False, False]
     assert [event[2] for event in tools.events if event[0] == "cargo_build"][-1] == (
         "pub unsafe fn f(p: &[i32]) -> i32 { p[0] }\n"
     )
@@ -3991,7 +4022,7 @@ def test_postprocessing_publishes_built_split_project_without_extraction(tmp_pat
                 path.write_text(contents)
 
         def cargo_build(self, current, *, library_only=False):
-            if not library_only:
+            if not library_only and current.name == "final-project":
                 assert current == value.framework.workdir / "final-project"
                 assert (current / "lib.rs").read_text() == split_source
                 for relative, contents in split_files.items():
@@ -4057,8 +4088,8 @@ def test_postprocessing_publishes_built_split_project_without_extraction(tmp_pat
         ]
         == []
     )
-    assert tools.build_modes == [True, True, False]
-    assert output.metrics["cargo_builds"] == 3
+    assert tools.build_modes == [True, True, False, False]
+    assert output.metrics["cargo_builds"] == 4
 
 
 @pytest.mark.parametrize("failure", ["postprocess", "build", "build_exception"])
@@ -4079,8 +4110,10 @@ def test_postprocessing_failures_preserve_accepted_work_without_publication(
 
         def cargo_build(self, current, *, library_only=False):
             result = super().cargo_build(current, library_only=library_only)
-            if not library_only:
+            if not library_only and current.name == "final-project":
                 assert (current / "partial.rs").is_file()
+                if failure == "postprocess":
+                    return CommandResult(0)
                 if failure == "build_exception":
                     raise OSError("postprocessed cargo invocation failed")
                 return CommandResult(7, "", "postprocessed project failed to build")
@@ -4113,7 +4146,7 @@ def test_postprocessing_failures_preserve_accepted_work_without_publication(
         for name in ("statement-pairs.md", "observations.json", "statistics.json")
     )
     assert not any(event[0] == "merge_observations" for event in tools.events)
-    assert output.metrics["cargo_builds"] == (2 if failure == "postprocess" else 3)
+    assert output.metrics["cargo_builds"] == 4
     assert output.metrics["compilation_failures"] == int(failure == "build")
     assert output.metrics["repair_calls"] == 0
 
@@ -4397,6 +4430,7 @@ def test_preparation_and_initialization_event_order_is_exact(
             value.framework.workdir / "current",
             value.framework.workdir / "current/proctor.toml",
         ),
+        ("cargo_build", value.framework.workdir / "current", "pub struct S;\n"),
         ("postprocess", value.framework.workdir / "final-project"),
         ("cargo_build", value.framework.workdir / "final-project", "pub struct S;\n"),
         (
@@ -4408,13 +4442,15 @@ def test_preparation_and_initialization_event_order_is_exact(
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 0,
         "scc_count": 0,
         "llm_generation_calls": 0,
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 2,
+        "cargo_builds": 3,
     }
     assert output.usage is None
     assert output.models == ()
@@ -4915,22 +4951,27 @@ def test_non_string_canonical_package_field_preserves_stage_failure_diagnostic(
     assert source_manifest.read_text(encoding="utf-8") == manifest
 
 
-def test_normalized_initial_build_failure_aborts_without_llm(tmp_path):
+def test_normalized_initial_build_failure_defers_compilation_until_assembly(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
         normalized="use crate::missing::foo;\nfn target() {}\n",
+        validators=[VALID],
+        candidates=["rewritten source\n"],
         builds=[
             CommandResult(
                 101, "", "error[E0432]: unresolved import crate::missing::foo"
             )
         ],
     )
-    client = FakeClient([])
+    client = FakeClient([response()])
     value, output = run_fake(tmp_path, tools, client)
-    assert output.status == "failure" and not client.requests
-    assert [event[0] for event in tools.events].count("cargo_build") == 1
-    assert not [event for event in tools.events if event[0] == "add_functions"]
-    assert not value.outputs.rust_project.exists()
+    assert output.status == "success", output.error
+    assert len(client.requests) == 1
+    assert output.metrics["retained_functions"] == 1
+    assert [event[0] for event in tools.events].count("cargo_build") == 3
+    assert len([event for event in tools.events if event[0] == "add_functions"]) == 1
+    assert value.outputs.rust_project.exists()
+    assert tools.build_modes == [True, False, False]
 
 
 def test_valid_initial_generation_validates_replaces_and_builds_once(tmp_path):
@@ -4943,7 +4984,7 @@ def test_valid_initial_generation_validates_replaces_and_builds_once(tmp_path):
     value, output = run_fake(tmp_path, tools, FakeClient([response()]))
     assert output.status == "success"
     assert (value.outputs.rust_project / "lib.rs").read_text() == "candidate-one\n"
-    assert output.metrics["cargo_builds"] == 3
+    assert output.metrics["cargo_builds"] == 4
 
 
 def test_optional_rule_set_is_forwarded_only_to_skeleton_generation(tmp_path):
@@ -5130,13 +5171,15 @@ def test_rule_complete_scc_is_mechanical_and_skips_observation_extraction(tmp_pa
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 0,
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 3,
+        "cargo_builds": 4,
     }
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
@@ -5390,13 +5433,15 @@ def test_mixed_applied_scc_build_failure_switches_every_member_to_baseline(tmp_p
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 2,
         "scc_count": 1,
         "llm_generation_calls": 2,
         "repair_calls": 1,
         "structural_failures": 0,
         "compilation_failures": 1,
-        "cargo_builds": 4,
+        "cargo_builds": 5,
     }
 
 
@@ -5572,6 +5617,7 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
         applied_candidate,
         "accepted baseline candidate\n",
         "accepted baseline candidate\n",
+        "accepted baseline candidate\n",
     ]
     assert [event[0] for event in tools.events] == [
         "build_tools",
@@ -5587,6 +5633,7 @@ def test_rule_applied_printf_array_reaches_build_then_falls_back(tmp_path):
         "cargo_build",
         "assemble_project",
         "finalize_project",
+        "cargo_build",
         "postprocess",
         "cargo_build",
         "merge_observations",
@@ -5636,13 +5683,15 @@ def test_repairs_before_applied_build_failure_are_not_reset_on_fallback(tmp_path
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 4,
         "repair_calls": 3,
         "structural_failures": 2,
         "compilation_failures": 1,
-        "cargo_builds": 4,
+        "cargo_builds": 5,
     }
 
 
@@ -5695,19 +5744,21 @@ def test_applied_fallback_and_baseline_repairs_share_configured_repair_limit(
         client,
         config={"max_repairs": max_repairs, "max_unstructured_repairs": 0},
     )
-    assert output.status == "failure"
-    assert f"exhausted {max_repairs} repair calls" in output.error
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == 1
     assert len(client.requests) == response_count
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 1,
+        "compilation_repair_calls": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": response_count,
         "repair_calls": max_repairs,
         "structural_failures": 0,
         "compilation_failures": max_repairs + 1,
-        "cargo_builds": max_repairs + 2,
+        "cargo_builds": max_repairs + 4,
     }
     replacements = [event for event in tools.events if event[0] == "add_functions"]
     assert replacements[0][2]["items"][0]["view"] == record["applied"]
@@ -5762,7 +5813,7 @@ def test_all_preserved_singleton_skips_llm_and_validator(tmp_path):
     assert replacement[2]["transformation"].endswith("#[proctor(0)]\n    ()\n}")
     assert (value.outputs.rust_project / "lib.rs").read_text() == "mechanical\n"
     assert output.metrics["llm_generation_calls"] == 0
-    assert output.metrics["cargo_builds"] == 3
+    assert output.metrics["cargo_builds"] == 4
 
 
 def test_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
@@ -5782,13 +5833,15 @@ def test_entirely_mechanical_run_has_zero_llm_calls(tmp_path):
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 2,
         "scc_count": 2,
         "llm_generation_calls": 0,
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 4,
+        "cargo_builds": 5,
     }
 
 
@@ -5953,7 +6006,7 @@ def test_mechanical_and_llm_sccs_share_deterministic_schedule(tmp_path):
     assert len(client.requests) == 2
     assert "pointer_leaf" in client.requests[0].messages[0].content
     assert "root" in client.requests[1].messages[0].content
-    assert output.metrics["cargo_builds"] == 5
+    assert output.metrics["cargo_builds"] == 6
 
 
 def test_mechanical_signature_change_adds_implementation_without_wrapper(tmp_path):
@@ -5986,10 +6039,12 @@ def test_mechanical_signature_change_adds_implementation_without_wrapper(tmp_pat
     assert "&mut i32" in replacement[2]["items"][0]["view"]["skeleton"]
     assert client.requests == []
     assert (tmp_path / "output/lib.rs").read_text() == "implementation\n"
-    assert output.metrics["cargo_builds"] == 3
+    assert output.metrics["cargo_builds"] == 4
 
 
-def test_mechanical_build_failure_stops_when_unstructured_repair_is_disabled(tmp_path):
+def test_mechanical_build_failure_is_retained_when_unstructured_repair_is_disabled(
+    tmp_path,
+):
     tools = FakeTools(
         skeletons=[printf_record(0, "target", "target", [], argument_count=0)],
         builds=[CommandResult(0), CommandResult(101, "out", "bad")],
@@ -5999,16 +6054,23 @@ def test_mechanical_build_failure_stops_when_unstructured_repair_is_disabled(tmp
     value, output = run_fake(
         tmp_path, tools, client, config={"max_unstructured_repairs": 0}
     )
-    assert output.status == "failure"
-    assert "exhausted 0 unstructured repair calls" in output.error
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == 1
     assert client.requests == []
     assert output.metrics["repair_calls"] == 0
     assert output.metrics["compilation_failures"] == 1
-    assert (value.framework.workdir / "current/lib.rs").read_text() == "normalized\n"
-    assert not value.outputs.rust_project.exists()
-    assert not (value.outputs.artifacts_dir / "statement-pairs.md").exists()
-    assert not (value.outputs.artifacts_dir / "observations.json").exists()
-    assert not (value.outputs.artifacts_dir / "statistics.json").exists()
+    assert (value.framework.workdir / "current/lib.rs").read_text() == (
+        value.framework.workdir / "groups/000001/accepted.rs"
+    ).read_text()
+    assert value.outputs.rust_project.exists()
+    assert (value.outputs.artifacts_dir / "statement-pairs.md").exists()
+    assert (
+        json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
+            "observations"
+        ]
+        == []
+    )
+    assert (value.outputs.artifacts_dir / "statistics.json").exists()
     assert not [event for event in tools.events if event[0] == "validate"]
     assert not [event for event in tools.events if event[0] == "extract_observations"]
     assert len([event for event in tools.events if event[0] == "add_functions"]) == 1
@@ -6507,6 +6569,7 @@ def test_failed_candidate_build_restores_then_repairs(tmp_path):
         invalid,
         accepted,
         accepted,
+        accepted,
     ]
     assert (value.outputs.rust_project / "lib.rs").read_text() == accepted
     assert (
@@ -6530,7 +6593,7 @@ def test_repair_limit_allows_initial_generation_and_configured_repairs(
             [response(statement=f"{index};") for index in range(expected_repairs + 2)]
         )
     )
-    _, output = run_fake(
+    value, output = run_fake(
         tmp_path,
         tools,
         client,
@@ -6539,8 +6602,14 @@ def test_repair_limit_allows_initial_generation_and_configured_repairs(
             **({} if max_repairs is None else {"max_repairs": max_repairs}),
         },
     )
-    assert output.status == "failure"
-    assert f"exhausted {expected_repairs} repair calls" in output.error
+    assert output.status == "success", output.error
+    assert (
+        f"exhausted {expected_repairs} repair calls"
+        in (
+            value.framework.workdir / "groups/000000/retained-diagnostics.txt"
+        ).read_text()
+    )
+    assert output.metrics["retained_functions"] == 1
     assert output.config_used["max_repairs"] == expected_repairs
     assert len(client.requests) == expected_repairs + 1
     assert (
@@ -6571,7 +6640,7 @@ def test_last_allowed_generation_can_succeed(tmp_path, max_repairs):
 
 @pytest.mark.parametrize("failure_kind", ["structural", "compilation"])
 @pytest.mark.parametrize("nonconsecutive", [False, True])
-def test_repeated_transformations_fail_scc_before_revalidation(
+def test_repeated_transformations_are_retained_before_revalidation(
     tmp_path, failure_kind, nonconsecutive
 ):
     responses = [response()]
@@ -6583,17 +6652,22 @@ def test_repeated_transformations_fail_scc_before_revalidation(
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
         validators=[VALID if compilation else INVALID] * failed_count,
-        builds=[CommandResult(0)] + [CommandResult(101)] * failed_count,
+        builds=[CommandResult(0)]
+        + ([CommandResult(101)] * failed_count if compilation else []),
         candidates=[f"failed candidate {index}\n" for index in range(failed_count)],
     )
     client = FakeClient(patch_responses(responses))
     value, output = run_fake(
         tmp_path, tools, client, config={"max_unstructured_repairs": 0}
     )
-    assert output.status == "failure"
-    assert output.error.endswith(
-        f"group 0 repeated transformation at generation {failed_count} "
-        "(first seen at generation 0)"
+    assert output.status == "success", output.error
+    assert (
+        (value.framework.workdir / "groups/000000/retained-diagnostics.txt")
+        .read_text()
+        .endswith(
+            f"group 0 repeated transformation at generation {failed_count} "
+            "(first seen at generation 0)"
+        )
     )
     assert len(client.requests) == output.usage.calls == failed_count + 1
     assert output.metrics["repair_calls"] == failed_count
@@ -6601,7 +6675,7 @@ def test_repeated_transformations_fail_scc_before_revalidation(
     assert output.metrics["compilation_failures"] == (
         failed_count if compilation else 0
     )
-    assert output.metrics["cargo_builds"] == 1 + (failed_count if compilation else 0)
+    assert output.metrics["cargo_builds"] == 3 + (failed_count if compilation else 0)
     assert (
         len([event for event in tools.events if event[0] == "validate"]) == failed_count
     )
@@ -6610,16 +6684,14 @@ def test_repeated_transformations_fail_scc_before_revalidation(
         jobdir / "last-failed-transformation.txt"
     ).read_text() == extract_code_block(responses[0]).candidate
     assert not (jobdir / "candidate.rs").exists()
-    assert not (jobdir / "accepted.rs").exists()
+    assert (jobdir / "accepted.rs").exists()
+    assert output.metrics["retained_functions"] == 1
     assert (value.framework.workdir / "workers/00/project/lib.rs").read_text() == (
         "normalized\n"
     )
-    assert not value.outputs.rust_project.exists()
-    assert output.outputs.rust_project is None
-    assert not any(
-        event[0] in {"extract_observations", "assemble_project", "finalize_project"}
-        for event in tools.events
-    )
+    assert value.outputs.rust_project.exists()
+    assert output.outputs.rust_project == value.outputs.rust_project
+    assert not any(event[0] == "extract_observations" for event in tools.events)
 
 
 def test_repeated_invalid_patch_exhausts_budget_without_validator(tmp_path):
@@ -6630,8 +6702,8 @@ def test_repeated_invalid_patch_exhausts_budget_without_validator(tmp_path):
         FakeClient(["no fence", "still no fence", "no fence"]),
         config={"max_repairs": 2, "max_unstructured_repairs": 0},
     )
-    assert output.status == "failure"
-    assert "exhausted 2 repair calls" in (output.error)
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == 1
     assert output.usage.calls == output.metrics["llm_generation_calls"] == 3
     assert output.metrics["repair_calls"] == 2
     assert output.metrics["structural_failures"] == 3
@@ -6694,7 +6766,7 @@ def test_repeat_history_is_private_to_each_scc(tmp_path):
     assert output.metrics["repair_calls"] == 0
 
 
-def test_fallback_resets_history_and_subsequent_baseline_repeats_fail(tmp_path):
+def test_fallback_resets_history_and_subsequent_baseline_repeats_are_retained(tmp_path):
     record = apply_rules(
         fn_record(0, "target", "target", [], transformation_labels=[0, 1]),
         rule_labels=[0],
@@ -6706,15 +6778,15 @@ def test_fallback_resets_history_and_subsequent_baseline_repeats_fail(tmp_path):
         builds=[CommandResult(0), CommandResult(101), CommandResult(101)],
         candidates=["failed applied\n", "failed baseline\n"],
     )
-    _, output = run_fake(
+    value, output = run_fake(
         tmp_path,
         tools,
         FakeClient(patch_responses([response()] * 3)),
         config={"max_unstructured_repairs": 0},
     )
-    assert output.status == "failure"
+    assert output.status == "success", output.error
     assert "repeated transformation at generation 2 (first seen at generation 1)" in (
-        output.error
+        (value.framework.workdir / "groups/000000/retained-diagnostics.txt").read_text()
     )
     assert output.metrics["repair_calls"] == output.metrics["compilation_failures"] == 2
     assert output.usage.calls == 3
@@ -6985,6 +7057,7 @@ def test_failure_creates_no_claimed_output(tmp_path):
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
         validators=[INVALID] * 6,
+        builds=[CommandResult(0), CommandResult(101)],
     )
     value, output = run_fake(
         tmp_path,
@@ -7041,6 +7114,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
         "max_group_chars",
         "max_repairs",
         "max_unstructured_repairs",
+        "max_compilation_repairs",
         "crat_dir",
         "dump_llm_exchanges",
         "testinfra_dir",
@@ -7054,6 +7128,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
     assert manifest["config"]["max_group_chars"]["default"] == 15_000
     assert manifest["config"]["max_repairs"]["default"] == 5
     assert manifest["config"]["max_unstructured_repairs"]["default"] == 5
+    assert manifest["config"]["max_compilation_repairs"]["default"] == 3
     assert manifest["config"]["crat_dir"]["default"] == "../crat"
     assert manifest["config"]["dump_llm_exchanges"]["default"] is False
     assert not (
@@ -7126,6 +7201,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
         "max_group_chars": 15_000,
         "max_repairs": 5,
         "max_unstructured_repairs": 5,
+        "max_compilation_repairs": 3,
         "crat_dir": str((STAGE_DIR / "../crat").resolve()),
         "dump_llm_exchanges": False,
         "testinfra_dir": str((STAGE_DIR / "../test-infrastructure").resolve()),
@@ -7138,13 +7214,15 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 1,
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 3,
+        "cargo_builds": 4,
     }
     assert output.error is None
     if artifacts:
@@ -8217,7 +8295,7 @@ def test_extraction_runs_only_after_successful_build(tmp_path):
     assert report.count("### Statement 0") == 1
     assert output.metrics["compilation_failures"] == 1
     assert output.metrics["repair_calls"] == 1
-    assert output.metrics["cargo_builds"] == 4
+    assert output.metrics["cargo_builds"] == 5
     operations = [event[0] for event in tools.events]
     assert operations.count("extract_observations") == 0
     build_indices = [
@@ -8283,7 +8361,7 @@ def test_accepted_transform_print_builds_and_publishes_without_extraction(
     operations = [event[0] for event in tools.events]
     assert operations.count("validate") == 3
     assert operations.count("add_functions") == 2
-    assert operations.count("cargo_build") == 4
+    assert operations.count("cargo_build") == 5
     assert operations.count("extract_observations") == 0
     build_indices = [
         index
@@ -8396,7 +8474,7 @@ def test_final_accepted_repair_publishes_pairs_without_observations(tmp_path):
     operations = [event[0] for event in tools.events]
     assert operations.count("validate") == 3
     assert operations.count("add_functions") == 2
-    assert operations.count("cargo_build") == 4
+    assert operations.count("cargo_build") == 5
     assert operations.count("extract_observations") == 0
     build_indices = [
         index
@@ -8420,13 +8498,15 @@ def test_final_accepted_repair_publishes_pairs_without_observations(tmp_path):
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 3,
         "repair_calls": 2,
         "structural_failures": 1,
         "compilation_failures": 1,
-        "cargo_builds": 4,
+        "cargo_builds": 5,
     }
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
@@ -8597,13 +8677,15 @@ def test_multiple_groups_merge_no_observation_documents(tmp_path):
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 2,
         "scc_count": 2,
         "llm_generation_calls": 2,
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 4,
+        "cargo_builds": 5,
     }
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
@@ -8983,6 +9065,7 @@ def test_empty_input_merge_output_remains_opaque(tmp_path):
         "cargo_build",
         "assemble_project",
         "finalize_project",
+        "cargo_build",
         "postprocess",
         "cargo_build",
         "merge_observations",
@@ -8990,13 +9073,15 @@ def test_empty_input_merge_output_remains_opaque(tmp_path):
     assert output.metrics == {
         "unstructured_repair_calls": 0,
         "unstructured_group_count": 0,
+        "retained_functions": 0,
+        "compilation_repair_calls": 0,
         "function_count": 1,
         "scc_count": 1,
         "llm_generation_calls": 1,
         "repair_calls": 0,
         "structural_failures": 0,
         "compilation_failures": 0,
-        "cargo_builds": 3,
+        "cargo_builds": 4,
     }
     assert json.loads(
         (value.outputs.artifacts_dir / "statistics.json").read_text()
@@ -9125,7 +9210,7 @@ def test_empty_document_is_always_published_beside_statement_pairs(tmp_path):
         output = run_stage(
             value,
             stage_dir=STAGE_DIR,
-            tools=FakeTools(builds=[CommandResult(101)]),
+            tools=FakeTools(builds=[CommandResult(101), CommandResult(101)]),
             llm_client_factory=lambda settings, tracker: FakeClient([]),
         )
         assert output.status == "failure" and not report.exists()
@@ -9574,7 +9659,7 @@ def test_project_markdown_json_publish_as_one_cleanup_transaction(
     exhausted_case.mkdir()
     tools = FakeTools(
         skeletons=[fn_record(0, "target", "target", [])],
-        builds=[CommandResult(0)],
+        builds=[CommandResult(0), CommandResult(101)],
         validators=[INVALID] * 6,
     )
     value, output = run_fake(
@@ -9799,11 +9884,12 @@ def test_concurrent_workers_reuse_private_projects_and_preserve_all_usage(tmp_pa
     assert operations[assembly:] == [
         "assemble_project",
         "finalize_project",
+        "cargo_build",
         "postprocess",
         "cargo_build",
         "merge_observations",
     ]
-    assert output.metrics["cargo_builds"] == count + 2
+    assert output.metrics["cargo_builds"] == count + 3
 
 
 def test_single_worker_reuses_one_project_and_serializes_sccs(tmp_path):
@@ -9968,7 +10054,8 @@ def test_exhausted_structural_repairs_retain_latest_failure_without_exchange_dum
     value, output = run_fake(
         tmp_path, tools, FakeClient(responses), config={"max_unstructured_repairs": 0}
     )
-    assert output.status == "failure"
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == 1
     jobdir = value.framework.workdir / "groups/000000"
     assert (jobdir / "last-failed-patch.txt").read_text() == responses[-1]
     assert (jobdir / "repair-base.rs").read_text() == tools.skeletons[0]["applied"][
@@ -9986,7 +10073,7 @@ def test_exhausted_structural_repairs_retain_latest_failure_without_exchange_dum
 def test_final_build_failure_retains_all_successful_scc_results(tmp_path):
     class IntegrationFailureTools(ConcurrentTools):
         def cargo_build(self, current, *, library_only=False):
-            if not library_only:
+            if not library_only and current.name == "final-project":
                 return CommandResult(8, "", "integration failed")
             return super().cargo_build(current, library_only=True)
 
@@ -10352,9 +10439,14 @@ def test_unfilled_transformation_hole_uses_local_repair_before_build_or_observat
     assert output.metrics["llm_generation_calls"] == 2
     assert output.metrics["repair_calls"] == output.metrics["structural_failures"] == 1
     assert output.metrics["compilation_failures"] == 0
-    assert output.metrics["cargo_builds"] == 3
+    assert output.metrics["cargo_builds"] == 4
     builds = [event[2] for event in tools.events if event[0] == "cargo_build"]
-    assert builds == ["normalized\n", "repaired candidate\n", "repaired candidate\n"]
+    assert builds == [
+        "normalized\n",
+        "repaired candidate\n",
+        "repaired candidate\n",
+        "repaired candidate\n",
+    ]
     operations = [event[0] for event in tools.events]
     assert operations.count("extract_observations") == 0
     repair_prompt = client.requests[1].messages[0].content
@@ -10373,7 +10465,7 @@ def test_unfilled_transformation_hole_uses_local_repair_before_build_or_observat
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_unfilled_whole_function_stub_exhausts_shared_repair_budget_without_observations(
+def test_unfilled_whole_function_stub_is_retained_after_shared_repair_budget(
     tmp_path, mixed
 ):
     item_id = 1 if mixed else 0
@@ -10382,6 +10474,7 @@ def test_unfilled_whole_function_stub_exhausts_shared_repair_budget_without_obse
         skeletons=stub_repair_records(mixed),
         validators=[VALID] * 6,
         candidates=["unfilled candidate\n"] * 6,
+        retained=[{"source": "retained typed stub\n", "stubbed_items": [item_id]}],
     )
     value, output = run_fake(
         tmp_path,
@@ -10398,19 +10491,22 @@ def test_unfilled_whole_function_stub_exhausts_shared_repair_budget_without_obse
         ),
         config={"max_unstructured_repairs": 0},
     )
-    assert output.status == "failure"
-    assert "exhausted 5 repair calls" in output.error
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == (2 if mixed else 1)
+    assert ("assembled_stubs", (item_id,)) in tools.events
     assert output.metrics["llm_generation_calls"] == output.usage.calls == 6
     assert output.metrics["repair_calls"] == 5
     assert output.metrics["structural_failures"] == 6
-    assert output.metrics["cargo_builds"] == 1
-    assert not any(
-        event[0] in {"extract_observations", "assemble_project", "finalize_project"}
-        for event in tools.events
+    assert output.metrics["cargo_builds"] == 3
+    assert not any(event[0] == "extract_observations" for event in tools.events)
+    assert list((value.framework.workdir / "groups").glob("*/accepted.rs"))
+    assert value.outputs.rust_project.exists()
+    assert (
+        json.loads((value.outputs.artifacts_dir / "observations.json").read_text())[
+            "observations"
+        ]
+        == []
     )
-    assert not list((value.framework.workdir / "groups").glob("*/accepted.rs"))
-    assert not value.outputs.rust_project.exists()
-    assert not (value.outputs.artifacts_dir / "observations.json").exists()
 
 
 @pytest.mark.parametrize("mixed", [False, True])
@@ -10423,6 +10519,7 @@ def test_repeated_unfilled_whole_function_stub_stops_before_replacement(
         skeletons=stub_repair_records(mixed),
         validators=[VALID],
         candidates=["unfilled candidate\n"],
+        retained=[{"source": "retained typed stub\n", "stubbed_items": [item_id]}],
     )
     _, output = run_fake(
         tmp_path,
@@ -10430,32 +10527,28 @@ def test_repeated_unfilled_whole_function_stub_stops_before_replacement(
         FakeClient(patch_responses([stub_repair_response(mixed, item_id)] * 2)),
         config={"max_unstructured_repairs": 0},
     )
-    assert output.status == "failure"
-    assert "repeated transformation at generation 1 (first seen at generation 0)" in (
-        output.error
-    )
+    assert output.status == "success", output.error
+    assert ("assembled_stubs", (item_id,)) in tools.events
     assert output.metrics["repair_calls"] == output.metrics["structural_failures"] == 1
-    assert output.metrics["cargo_builds"] == 1
+    assert output.metrics["cargo_builds"] == 3
     assert output.usage.calls == 2
     assert len([event for event in tools.events if event[0] == "add_functions"]) == 1
 
 
-def test_mechanical_whole_function_stub_remains_fatal_without_llm_repair(tmp_path):
+def test_mechanical_whole_function_stub_is_retained_without_local_llm_repair(tmp_path):
     tools = UnfilledStubTools(
         [[0]],
         skeletons=[fn_record(0, "first", "first", [], needs_transformation=False)],
         candidates=["unfilled candidate\n"],
+        retained=[{"source": "typed first stub\n", "stubbed_items": [0]}],
     )
     client = FakeClient([])
     value, output = run_fake(tmp_path, tools, client)
-    assert output.status == "failure"
-    assert (
-        "mechanical group candidate contains unfilled transformation holes"
-        in output.error
-    )
+    assert output.status == "success", output.error
+    assert ("assembled_stubs", (0,)) in tools.events
     assert not client.requests
-    assert output.metrics["cargo_builds"] == 1
-    assert not value.outputs.rust_project.exists()
+    assert output.metrics["cargo_builds"] == 3
+    assert value.outputs.rust_project.exists()
 
 
 def test_build_rewriting_candidate_source_fails_before_acceptance_or_observation(
