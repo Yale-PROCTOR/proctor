@@ -38,6 +38,7 @@ class PromptRenderInput:
     proctor_libc_call_guidance: str = ""
     foreign_static_guidance: str = ""
     unstructured: bool = False
+    initializer: bool = False
     patch_failure: tuple[str, str] | None = None
 
 
@@ -171,7 +172,7 @@ def repair_context(
     text = (
         "## Repair Base: `transformation.rs`\n\n"
         "Apply your patch only to this exact virtual file. The requirements above "
-        "apply to the reconstructed code; unchanged functions are retained.\n\n"
+        "apply to the reconstructed code; unchanged code is retained.\n\n"
         f"```rust\n{base}\n```"
     )
     if diagnostics is not None:
@@ -192,7 +193,11 @@ def render_prompt(
 ) -> RenderedPrompt:
     directory = prompt_dir or Path(__file__).parent / "prompts"
     template = PromptLibrary(directory).get(
-        "unstructured_repair" if value.unstructured else "local_transformation",
+        "global_initializer"
+        if value.initializer
+        else "unstructured_repair"
+        if value.unstructured
+        else "local_transformation",
         version=PROMPT_VERSION,
     )
     repair = (

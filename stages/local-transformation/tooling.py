@@ -392,6 +392,54 @@ class CratTools:
             output,
         )
 
+    def transform_initializer(
+        self, frozen: Path, request: Path, output: Path
+    ) -> tuple[str, dict[str, Any]]:
+        assert self.crat_tool is not None
+        self._validate_project_outputs((output,), (), (frozen, request))
+        self._output_operation(
+            "crat-tool transform-initializer",
+            [
+                str(self.crat_tool),
+                "transform-initializer",
+                "--frozen",
+                str(frozen),
+                "--request",
+                str(request),
+                "--output",
+                str(output),
+            ],
+            output,
+        )
+        text = output.read_text(encoding="utf-8")
+        try:
+            value = json.loads(text)
+        except ValueError as exc:
+            raise StageFailure(
+                "invalid initializer transformation response JSON"
+            ) from exc
+        if not isinstance(value, dict):
+            raise StageFailure("initializer transformation response must be an object")
+        return text, value
+
+    def install_initializers(self, frozen: Path, request: Path, output: Path) -> None:
+        assert self.crat_tool is not None
+        self._validate_project_outputs((output,), (), (frozen, request))
+        self._output_operation(
+            "crat-tool install-initializers",
+            [
+                str(self.crat_tool),
+                "install-initializers",
+                "--frozen",
+                str(frozen),
+                "--request",
+                str(request),
+                "--output",
+                str(output),
+            ],
+            output,
+        )
+
     def prepare_unstructured(self, frozen: Path, request: Path, output: Path) -> None:
         assert self.crat_tool is not None
         self._validate_project_outputs((output,), (), (frozen, request))
