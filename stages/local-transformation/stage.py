@@ -19,6 +19,7 @@ from typing import Any, Literal, cast
 import tomli_w
 
 from final_validation import validate_project
+from compilation_repair import CompilationRepair
 from wrapper_bounds import infer_wrapper_bounds
 from libc_guidance import render_libc_guidance
 from printf_guidance import render_printf_guidance
@@ -111,6 +112,8 @@ class Metrics:
     cargo_builds: int = 0
     unstructured_repair_calls: int = 0
     unstructured_group_count: int = 0
+    retained_functions: int = 0
+    compilation_repair_calls: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -123,6 +126,8 @@ class Metrics:
             "cargo_builds": self.cargo_builds,
             "unstructured_repair_calls": self.unstructured_repair_calls,
             "unstructured_group_count": self.unstructured_group_count,
+            "retained_functions": self.retained_functions,
+            "compilation_repair_calls": self.compilation_repair_calls,
         }
 
 
@@ -140,6 +145,10 @@ class RunState:
     accepted_observation_documents: list[Path] = field(default_factory=list)
     accepted_views: dict[int, SkeletonView] = field(default_factory=dict)
     unstructured_groups: set[tuple[int, ...]] = field(default_factory=set)
+    retained_groups: set[tuple[int, ...]] = field(default_factory=set)
+    stubbed_items: set[int] = field(default_factory=set)
+    skip_compilation: bool = False
+    compilation_report: dict[str, Any] | None = None
     validation_report: dict[str, Any] | None = None
 
 
@@ -271,6 +280,7 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
             "max_group_chars",
             "max_repairs",
             "max_unstructured_repairs",
+            "max_compilation_repairs",
             "max_validation_repairs",
             "testinfra_dir",
             "validation_timeout_s",
@@ -318,6 +328,11 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
         raise StageFailure(
             "config.max_validation_repairs must be a nonnegative integer"
         )
+    max_compilation_repairs = config.get("max_compilation_repairs", 3)
+    if type(max_compilation_repairs) is not int or max_compilation_repairs < 0:
+        raise StageFailure(
+            "config.max_compilation_repairs must be a nonnegative integer"
+        )
     testinfra_dir = config.get("testinfra_dir", "../test-infrastructure")
     if not isinstance(testinfra_dir, str) or not testinfra_dir:
         raise StageFailure("config.testinfra_dir must be a nonempty string")
@@ -342,6 +357,7 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
         "max_group_chars": max_group_chars,
         "max_repairs": max_repairs,
         "max_unstructured_repairs": max_unstructured_repairs,
+        "max_compilation_repairs": max_compilation_repairs,
         "crat_dir": str((stage_dir / crat_dir).resolve()),
         "dump_llm_exchanges": dump_llm_exchanges,
         "max_validation_repairs": max_validation_repairs,
@@ -569,6 +585,7 @@ def _validate_boundaries(
         "final-rollback",
         "final-project",
         "test-validation",
+        "compilation-repair",
         "wrapper-bounds",
     ):
         root = workdir / directory
@@ -736,6 +753,21 @@ def _validate_boundaries(
             (log_root / "local-transformation.log").resolve(),
         )
     )
+    for name in (
+        "compilation-repair.json",
+        "compilation-repair-logs",
+        "compilation-repair-project",
+    ):
+        path = log_root / name
+        if path.is_symlink():
+            raise StageFailure(
+                f"compilation repair artifact must not be a symlink: {path}"
+            )
+        if _paths_overlap(path.resolve(), destination_resolved):
+            raise StageFailure(
+                "compilation repair artifact overlaps output Rust project"
+            )
+        reserved.append(path.resolve())
     reserved.extend(path.resolve() for path in log_root.glob("worker-*.log"))
     worker_log = re.fullmatch(r"worker-(\d{2,})\.log", usage_resolved.name)
     if any(_paths_overlap(usage_resolved, path) for path in reserved) or (
@@ -873,16 +905,13 @@ def _output(
     if state.usage_path is not None:
         records = read_usage(state.usage_path)[state.usage_start :]
     models = _models(records)
-    if (
-        state.validation_report is not None
-        and state.validation_report["repair_attempts"]
-    ):
-        models += (
-            ModelInfo(
-                provider=state.validation_report["repair_agent"],
-                model=state.validation_report["repair_model"],
-            ),
-        )
+    for report in (state.compilation_report, state.validation_report):
+        if report is not None and report["repair_attempts"]:
+            model = ModelInfo(
+                provider=report["repair_agent"], model=report["repair_model"]
+            )
+            if model not in models:
+                models += (model,)
     return StageOutput(
         status=status,
         stage_id=STAGE_ID,
@@ -899,6 +928,11 @@ def _output(
         ),
         metrics=state.metrics.to_dict(),
         logs=state.logs,
+        metadata=(
+            {"compilation_repair": state.compilation_report}
+            if state.compilation_report is not None
+            else {}
+        ),
         error=error,
     )
 
@@ -1738,6 +1772,60 @@ def _extract_transformation(
     return extraction
 
 
+def _load_retained_functions(
+    path: Path, members: tuple[int, ...], frozen: Path
+) -> tuple[str, tuple[int, ...]]:
+    result = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict) or set(result) != {
+        "source",
+        "stubbed_items",
+        "candidate_sha256",
+        "frozen_project_sha256",
+    }:
+        raise StageFailure("invalid retained functions response")
+    source = result["source"]
+    stubs = result["stubbed_items"]
+    if not isinstance(source, str) or not source:
+        raise StageFailure("retained functions source must be a nonempty string")
+    if (
+        not isinstance(stubs, list)
+        or any(type(item) is not int for item in stubs)
+        or stubs != sorted(set(stubs))
+        or not set(stubs).issubset(members)
+    ):
+        raise StageFailure("invalid retained function stub identities")
+    if result["candidate_sha256"] != hashlib.sha256(source.encode()).hexdigest():
+        raise StageFailure("retained candidate source digest mismatch")
+    if (
+        result["frozen_project_sha256"]
+        != hashlib.sha256(frozen.read_bytes()).hexdigest()
+    ):
+        raise StageFailure("retained frozen project digest mismatch")
+    return source, tuple(stubs)
+
+
+def _retain_group(
+    members: tuple[int, ...],
+    transformations: list[str],
+    diagnostics: str,
+    *,
+    workdir: Path,
+    frozen: Path,
+    tools: Any,
+    state: RunState,
+) -> None:
+    request = workdir / "retained-request.json"
+    output = workdir / "retained-functions.json"
+    write_json(request, {"members": list(members), "transformations": transformations})
+    tools.retain_functions(frozen, request, output)
+    source, stubs = _load_retained_functions(output, members, frozen)
+    (workdir / "accepted.rs").write_text(source, encoding="utf-8")
+    (workdir / "retained-diagnostics.txt").write_text(diagnostics, encoding="utf-8")
+    state.retained_groups.add(members)
+    state.stubbed_items.update(stubs)
+    state.metrics.retained_functions += len(members)
+
+
 def _process_unstructured_group(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
@@ -1758,9 +1846,16 @@ def _process_unstructured_group(
     initial_diagnostics: str | None = None,
 ) -> None:
     if initial_diagnostics is not None and max_repairs == 0:
-        raise StageFailure(
-            f"group {','.join(map(str, members))} exhausted 0 unstructured repair calls"
+        _retain_group(
+            members,
+            transformations,
+            initial_diagnostics,
+            workdir=workdir,
+            frozen=frozen,
+            tools=tools,
+            state=state,
         )
+        return
     preparation_request = workdir / "unstructured-preparation-request.json"
     preparation_output = workdir / "unstructured-preparation.json"
     write_json(
@@ -1827,9 +1922,16 @@ def _process_unstructured_group(
     while True:
         if transformation is None:
             if calls == max_repairs:
-                raise StageFailure(
-                    f"group {','.join(map(str, members))} exhausted {max_repairs} unstructured repair calls"
+                _retain_group(
+                    members,
+                    transformations,
+                    diagnostics or "unstructured repair limit reached",
+                    workdir=workdir,
+                    frozen=frozen,
+                    tools=tools,
+                    state=state,
                 )
+                return
             calls += 1
             base = latest_failed or stub_base
             rendered = render_prompt(
@@ -1902,13 +2004,20 @@ def _process_unstructured_group(
                 (workdir / "last-failed-transformation.txt").write_text(
                     transformation, encoding="utf-8"
                 )
-                raise StageFailure(
-                    f"group {','.join(map(str, members))} repeated unstructured transformation "
-                    f"at attempt {calls} (first seen at attempt {seen_results[transformation]})"
+                _retain_group(
+                    members,
+                    transformations,
+                    diagnostics or "unstructured transformation repeated",
+                    workdir=workdir,
+                    frozen=frozen,
+                    tools=tools,
+                    state=state,
                 )
+                return
             seen_results[transformation] = calls
         else:
             seen_results[transformation] = 0
+        transformations.append(transformation)
         request_path = workdir / "unstructured-request.json"
         write_json(
             request_path, {"members": list(members), "transformation": transformation}
@@ -1928,6 +2037,17 @@ def _process_unstructured_group(
             )
             diagnostics = result.diagnostics
         else:
+            if state.skip_compilation:
+                _retain_group(
+                    members,
+                    transformations,
+                    "initial template compilation deferred",
+                    workdir=workdir,
+                    frozen=frozen,
+                    tools=tools,
+                    state=state,
+                )
+                return
             candidate = workdir / "unstructured-candidate.rs"
             with _replacement_attempt_outputs((candidate,)):
                 candidate.write_text(result.source, encoding="utf-8")
@@ -2237,9 +2357,16 @@ def _process_group(
                     )
                 )
                 if mechanical:
-                    raise StageFailure(
-                        f"mechanical group candidate contains unfilled transformation holes: {diagnostics}"
+                    _retain_group(
+                        members,
+                        transformations,
+                        diagnostics,
+                        workdir=workdir,
+                        frozen=frozen,
+                        tools=tools,
+                        state=state,
                     )
+                    return
                 state.metrics.structural_failures += 1
                 latest_failed = transformation
                 latest_diagnostics = diagnostics
@@ -2251,6 +2378,17 @@ def _process_group(
                 )
                 generation += 1
                 continue
+            if state.skip_compilation:
+                _retain_group(
+                    members,
+                    transformations,
+                    "initial template compilation deferred",
+                    workdir=workdir,
+                    frozen=frozen,
+                    tools=tools,
+                    state=state,
+                )
+                return
             state.metrics.cargo_builds += 1
             build = install_candidate_transaction(
                 library_source,
@@ -2338,7 +2476,15 @@ def _process_group(
             else None,
         )
         return
-    raise StageFailure(stopping_reason)
+    _retain_group(
+        members,
+        transformations,
+        stopping_reason,
+        workdir=workdir,
+        frozen=frozen,
+        tools=tools,
+        state=state,
+    )
 
 
 def _merge_job_state(state: RunState, job: RunState) -> None:
@@ -2350,6 +2496,8 @@ def _merge_job_state(state: RunState, job: RunState) -> None:
         )
     state.prompts_used.update(job.prompts_used)
     state.unstructured_groups.update(job.unstructured_groups)
+    state.retained_groups.update(job.retained_groups)
+    state.stubbed_items.update(job.stubbed_items)
     state.statement_pairs.update(job.statement_pairs)
     state.accepted_observation_documents.extend(job.accepted_observation_documents)
     state.accepted_views.update(job.accepted_views)
@@ -2456,7 +2604,7 @@ def _run_group_workers(
                 # Only the private project's source is reset; Cargo's private
                 # dependency and incremental cache survives successive jobs.
                 shutil.copyfile(template / library_relative, current / library_relative)
-                job = RunState()
+                job = RunState(skip_compilation=state.skip_compilation)
                 jobs[job_index] = job
                 compilation_failure = _process_group(
                     members,
@@ -2579,6 +2727,10 @@ def run_stage(
         _clear_stale_artifact(
             report_path.with_name("test-validation.json"), "test validation report"
         )
+        _clear_stale_artifact(
+            report_path.with_name("compilation-repair.json"),
+            "compilation repair report",
+        )
         state.config_used = config
         artifacts = stage_input.outputs.artifacts_dir
         log_path = (
@@ -2652,10 +2804,10 @@ def run_stage(
         )
         if initial_build.returncode != 0:
             state.metrics.compilation_failures += 1
-            raise StageFailure(
-                "initial cargo build --lib failed "
-                f"({initial_build.returncode})\nstdout:\n{initial_build.stdout}"
-                f"\nstderr:\n{initial_build.stderr}"
+            state.skip_compilation = True
+            (workdir / "initial-build-diagnostics.txt").write_text(
+                f"stdout:\n{initial_build.stdout}\nstderr:\n{initial_build.stderr}",
+                encoding="utf-8",
             )
 
         graph = function_graph(records)
@@ -2687,6 +2839,13 @@ def run_stage(
             )
         for members, accepted_source in accepted:
             accepted_dir = accepted_source.parent
+            if members in state.retained_groups:
+                retained_source, _ = _load_retained_functions(
+                    accepted_dir / "retained-functions.json", members, frozen
+                )
+                if accepted_source.read_bytes() != retained_source.encode():
+                    raise StageFailure("retained source changed before assembly")
+                continue
             if members in state.unstructured_groups:
                 result = _load_unstructured_candidate(
                     accepted_dir / "accepted-unstructured.json",
@@ -2712,8 +2871,54 @@ def run_stage(
                 frozen,
             )
         assembled = workdir / "assembled.rs"
-        active_tools.assemble_project(frozen, accepted, assembled)
+        if state.stubbed_items:
+            active_tools.assemble_project(
+                frozen,
+                accepted,
+                assembled,
+                stubbed_items=tuple(sorted(state.stubbed_items)),
+            )
+        else:
+            active_tools.assemble_project(frozen, accepted, assembled)
         os.replace(assembled, library_source)
+
+        def build_repair(project: Path) -> CommandResult:
+            state.metrics.cargo_builds += 1
+            result = active_tools.cargo_build(project)
+            if result.returncode != 0:
+                state.metrics.compilation_failures += 1
+            return result
+
+        compilation = CompilationRepair(
+            workdir=workdir,
+            artifacts=stage_input.outputs.artifacts_dir or workdir,
+            config=config,
+            build=build_repair,
+            analysis_project=analysis,
+            c_project=stage_input.inputs.c_project,
+            runner=validation_runner,
+        )
+        state.compilation_report = compilation.report
+        compilation.report["retained_functions"] = [
+            {
+                "id": item,
+                "path": records_by_id[item].path,
+                "stubbed": item in state.stubbed_items,
+            }
+            for item in sorted(
+                {item for group in state.retained_groups for item in group}
+            )
+        ]
+
+        def ensure_compilation(
+            project: Path, initial_result: CommandResult | None = None
+        ) -> bool:
+            succeeded = compilation.ensure(project, initial_result)
+            state.metrics.compilation_repair_calls = compilation.report[
+                "repair_attempts"
+            ]
+            return succeeded
+
         finalized_source = workdir / "final.rs"
         finalized_manifest = workdir / "final-proctor.toml"
         with _replacement_attempt_outputs((finalized_source, finalized_manifest)):
@@ -2737,18 +2942,44 @@ def run_stage(
             final_project = workdir / "final-project"
 
             def postprocess_and_build() -> CommandResult:
+                if not ensure_compilation(current):
+                    return CommandResult(
+                        1,
+                        stderr=f"compilation repair failed: {compilation.report['reason']}",
+                    )
                 if final_project.exists():
                     shutil.rmtree(final_project)
                 shutil.copytree(current, final_project)
-                active_tools.postprocess(final_project)
-                if (current / "testinfra.toml").is_file():
-                    for name in ("tests", "runner"):
-                        if (current / name).is_dir():
-                            shutil.copytree(
-                                current / name, final_project / name, dirs_exist_ok=True
-                            )
-                state.metrics.cargo_builds += 1
-                return active_tools.cargo_build(final_project)
+                while True:
+                    try:
+                        with tempfile.TemporaryDirectory(
+                            prefix="postprocess-harness-", dir=workdir
+                        ) as snapshot:
+                            saved = Path(snapshot)
+                            for name in ("tests", "runner"):
+                                if (final_project / name).is_dir():
+                                    shutil.copytree(final_project / name, saved / name)
+                            try:
+                                active_tools.postprocess(final_project)
+                            finally:
+                                for name in ("tests", "runner"):
+                                    if (saved / name).is_dir():
+                                        shutil.copytree(
+                                            saved / name,
+                                            final_project / name,
+                                            dirs_exist_ok=True,
+                                        )
+                        break
+                    except StageFailure:
+                        result = build_repair(final_project)
+                        if result.returncode == 0:
+                            raise
+                        if not ensure_compilation(final_project, result):
+                            return result
+                result = build_repair(final_project)
+                if result.returncode != 0 and ensure_compilation(final_project, result):
+                    return CommandResult(0)
+                return result
 
             final_build = install_final_transaction(
                 library_source,
@@ -2759,7 +2990,6 @@ def run_stage(
                 postprocess_and_build,
             )
             if final_build.returncode != 0:
-                state.metrics.compilation_failures += 1
                 raise StageFailure(
                     "final cargo build failed "
                     f"({final_build.returncode})\nstdout:\n{final_build.stdout}"
@@ -2770,13 +3000,6 @@ def run_stage(
         active_tools.merge_observations(
             tuple(state.accepted_observation_documents), merged_observations
         )
-
-        def build_repair(project: Path) -> CommandResult:
-            state.metrics.cargo_builds += 1
-            result = active_tools.cargo_build(project)
-            if result.returncode != 0:
-                state.metrics.compilation_failures += 1
-            return result
 
         bound_client = None
         bound_tracker = UsageTracker(

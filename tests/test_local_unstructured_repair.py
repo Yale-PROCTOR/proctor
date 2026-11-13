@@ -273,12 +273,12 @@ def test_unstructured_budget_counts_all_additional_calls_and_zero_disables(
     if limit is not None:
         config["max_unstructured_repairs"] = limit
     _, output = run_fake(tmp_path, tools, client, config=config)
-    assert output.status == "failure"
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == 1
     assert output.metrics["unstructured_repair_calls"] == expected
     assert output.metrics["repair_calls"] == expected
     assert output.usage.calls == len(client.requests) == expected + 1
     assert output.metrics["unstructured_group_count"] == 0
-    assert ("unstructured repair calls" in output.error) == bool(expected)
     assert len(
         [event for event in tools.events if event[0] == "prepare_unstructured"]
     ) == bool(expected)
@@ -334,14 +334,14 @@ def test_unstructured_repeats_stop_before_replacement_or_build(
         ]
     )
     value, output = run_fake(tmp_path, tools, client, config={"max_repairs": 0})
-    assert output.status == "failure"
-    assert "repeated unstructured transformation" in output.error
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == 1
     assert output.metrics["unstructured_repair_calls"] == len(candidates) + 1
     assert output.usage.calls == len(candidates) + 2
     assert len(
         [event for event in tools.events if event[0] == "replace_unstructured"]
     ) == len(candidates)
-    assert not value.outputs.rust_project.exists()
+    assert value.outputs.rust_project.exists()
     assert (
         value.framework.workdir / "workers/00/project/lib.rs"
     ).read_text() == "normalized\n"
@@ -357,8 +357,8 @@ def test_unstructured_seed_is_part_of_fresh_repeat_history_after_it_fails(tmp_pa
     )
     client = FakeClient([response(), patch_response(SEED, SEED)])
     _, output = run_fake(tmp_path, tools, client, config={"max_repairs": 0})
-    assert output.status == "failure"
-    assert "first seen at attempt 0" in output.error
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == 1
     assert output.metrics["unstructured_repair_calls"] == 1
     assert (
         len([event for event in tools.events if event[0] == "replace_unstructured"])
@@ -396,7 +396,7 @@ def test_terminal_provider_error_during_unstructured_repair_is_recorded_and_fata
     assert usage[-1]["error"] == "AuthError: denied"
 
 
-def test_mixed_strategies_retain_only_structured_scc_observations_and_pairs(tmp_path):
+def test_mixed_strategies_retain_only_structured_pairs_without_observations(tmp_path):
     observation = {"producer": "first", "sentinel": True}
     tools = UnstructuredTools(
         seed="unsafe fn second() {}",
@@ -425,10 +425,10 @@ def test_mixed_strategies_retain_only_structured_scc_observations_and_pairs(tmp_
     document = json.loads(
         (value.outputs.artifacts_dir / "observations.json").read_text()
     )
-    assert document["observations"] == [observation]
+    assert document["observations"] == []
     assert (
         len([event for event in tools.events if event[0] == "extract_observations"])
-        == 1
+        == 0
     )
     report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
     assert "first" in report and "second" not in report
@@ -469,9 +469,10 @@ def test_unstructured_build_must_preserve_candidate_source_bytes(tmp_path):
 
 def test_accepted_unstructured_source_is_rechecked_before_assembly(tmp_path):
     class RetainedMutationTools(UnstructuredTools):
-        def extract_observations(self, observation_source, metadata, output):
-            super().extract_observations(observation_source, metadata, output)
-            retained = output.parent.parent / "000000/accepted.rs"
+        def add_functions(self, *args, **kwargs):
+            super().add_functions(*args, **kwargs)
+            candidate = args[3]
+            retained = candidate.parent.parent / "000000/accepted.rs"
             retained.write_text("tampered accepted source\n")
 
     tools = RetainedMutationTools(

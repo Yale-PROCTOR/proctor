@@ -271,7 +271,7 @@ def test_probe_failures_group_by_repair_route_and_keep_successes_once(tmp_path):
     assert output.metrics["repair_calls"] == 2
     assert output.metrics["unstructured_repair_calls"] == 1
     assert output.metrics["unstructured_group_count"] == 1
-    assert output.metrics["cargo_builds"] == 11
+    assert output.metrics["cargo_builds"] == 12
     assert [
         event[1]["members"]
         for event in tools.events
@@ -299,13 +299,15 @@ def test_rule_free_failures_use_only_the_unstructured_allowance(
             "max_unstructured_repairs": unstructured_limit,
         },
     )
-    assert output.status == "failure"
-    assert f"exhausted {unstructured_limit} unstructured repair calls" in output.error
+    assert output.status == "success", output.error
+    assert output.metrics["retained_functions"] == 1
+    assert output.metrics["compilation_repair_calls"] == 0
+    assert len([event for event in tools.events if event[0] == "retain_functions"]) == 1
     assert len(client.requests) == unstructured_limit
     assert output.metrics["repair_calls"] == unstructured_limit
     assert output.metrics["unstructured_repair_calls"] == unstructured_limit
     assert output.metrics["compilation_failures"] == 1 + unstructured_limit
-    assert output.metrics["cargo_builds"] == 2 + unstructured_limit
+    assert output.metrics["cargo_builds"] == 4 + unstructured_limit
     assert not [event for event in tools.events if event[0] == "validate"]
     assert all(
         request.metadata.prompt_id == "unstructured_repair"
