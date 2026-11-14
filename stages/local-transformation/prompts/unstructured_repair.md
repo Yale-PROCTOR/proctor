@@ -22,12 +22,13 @@ Requirements:
    lifetime declarations, bounds, where clauses, parameter names and types, return
    type, and unsafe qualifier. Call transformed
    dependencies using their target signatures.
-3. Emit every requested function exactly once. Emit no additional top-level or
-   function-local items, including imports, helper functions, types, constants,
-   statics, or modules. Use fully qualified paths for helpers.
-4. Complete every function body. Do not return a whole-function todo stub. Do not
-   introduce explicit unsafe blocks, proctor labels, or statement/expression
-   attributes.
+3. Emit every requested outer function exactly once and no additional top-level
+   items. Inside each body, you may add, remove, modify, or move local items,
+   including imports, helper functions, types, constants, statics, and modules.
+   Explicit unsafe blocks and valid Rust attributes are allowed inside bodies.
+   The original outer function metadata is retained by the pipeline.
+4. Complete every outer function body. Do not return the generated whole-function
+   todo stub. No proctor labels or special local-variable naming scheme are required.
 5. Prefer behavior-equivalent safe Rust functions or methods for foreign calls
    where available; otherwise preserve the foreign call.{% if use_xj_scanf_guidance %}
 
