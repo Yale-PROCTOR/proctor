@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run local transformation from successful non_local_* test-generation outputs."""
+"""Run downstream stages from saved test_gen_* test-generation outputs."""
 
 from __future__ import annotations
 
@@ -15,15 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _succeeded(run: Path) -> bool:
-    last_event = {}
-    for line in (run / "events.jsonl").read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            last_event = json.loads(line)
-    return last_event.get("event") == "run_finished" and last_event.get("ok") is True
-
-
-def _command(run: Path, name: str) -> list[str]:
+def _command(run: Path, name: str, *, non_local: bool) -> list[str]:
     record = json.loads((run / "run.json").read_text(encoding="utf-8"))
     output_path = run / "stages" / "02-test_generation" / "stage_output.json"
     output = json.loads(output_path.read_text(encoding="utf-8"))
@@ -40,15 +32,21 @@ def _command(run: Path, name: str) -> list[str]:
     if not rule_set.is_file():
         raise ValueError(f"rule set missing: {rule_set}")
 
+    config = "configs/c2rust_crat_local.toml"
+    order = ["local_transformation"]
+    if non_local:
+        config = "configs/c2rust_crat_testgen_absrec_disrep_local.toml"
+        order = ["abstraction_recovery", "discipline_repair", "local_transformation"]
+
     command = [
         "uv",
         "run",
         "proctor",
         "run",
         "-c",
-        "configs/c2rust_crat_testgen_local.toml",
+        config,
         "--set",
-        'pipeline.order=["local_transformation"]',
+        f"pipeline.order={json.dumps(order)}",
         "--set",
         'run.provides=["c_project","rust_project","rule_set"]',
         "--input-rust",
@@ -68,17 +66,29 @@ def _command(run: Path, name: str) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Create fresh local_* runs from the saved test-generation outputs "
-            "of successful runs/non_local_* runs. Only local transformation executes."
+            "Create fresh local_* or non_local_* runs from the saved "
+            "test-generation outputs of runs/test_gen_* runs."
         )
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--local", action="store_true", help="run local transformation only"
+    )
+    mode.add_argument(
+        "--non-local",
+        action="store_true",
+        help="run abstraction recovery, discipline repair, and local transformation",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="print commands without executing them"
     )
     parser.add_argument(
-        "--prefix", default="", help="filter source runs by name prefix"
+        "--prefix",
+        default="",
+        help="filter source runs by name prefix (test_gen_ is optional)",
     )
     args = parser.parse_args(argv)
+    prefix = "test_gen_" + args.prefix.removeprefix("test_gen_")
 
     runs_directory = ROOT / "runs"
     existing_runs = (
@@ -90,18 +100,16 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[tuple[Path, str]] = []
     failures: list[tuple[list[str], str, str]] = []
     pending: list[tuple[Path, list[str]]] = []
-    for run in sorted(runs_directory.glob("non_local_*")):
-        if not run.is_dir() or not run.name.startswith(args.prefix):
+    for run in sorted(runs_directory.glob("test_gen_*")):
+        if not run.is_dir() or not run.name.startswith(prefix):
             continue
-        name = run.name.removeprefix("non_").rsplit("-", 2)[0]
+        case_name = run.name.removeprefix("test_gen_").rsplit("-", 2)[0]
+        name = f"{'non_local' if args.non_local else 'local'}_{case_name}"
         if any(run == name or run.startswith(f"{name}-") for run in existing_runs):
             skipped += 1
             continue
         try:
-            if not _succeeded(run):
-                skipped += 1
-                continue
-            command = _command(run, name)
+            command = _command(run, name, non_local=args.non_local)
         except (OSError, ValueError, KeyError) as exc:
             errors.append((run, str(exc)))
             continue

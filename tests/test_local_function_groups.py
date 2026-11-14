@@ -6,7 +6,12 @@ from dataclasses import replace
 
 import pytest
 
-from model import group_functions, strongly_connected_components, function_graph
+from model import (
+    SkeletonError,
+    group_functions,
+    strongly_connected_components,
+    function_graph,
+)
 from stage import run_stage
 from tooling import CommandResult
 from tests.test_local_transformation import (
@@ -146,7 +151,11 @@ class GroupTools(UnstructuredTools):
 
     def prepare_unstructured(self, frozen, request, output):
         value = json.loads(request.read_text())
-        self.seed = re.sub(r"#\[proctor\(\d+\)\]\s*", "", value["transformations"][-1])
+        self.seed = (
+            re.sub(r"#\[proctor\(\d+\)\]\s*", "", value["transformations"][-1])
+            if value["transformations"]
+            else None
+        )
         super().prepare_unstructured(frozen, request, output)
 
     def replace_unstructured(self, analysis, current, frozen, request, output):
@@ -172,6 +181,9 @@ class GroupClient(FakeClient):
     def __init__(self, records):
         super().__init__([])
         self.names = {record["id"]: record["name"] for record in records}
+        self.signatures = {
+            record["id"]: record["target_signature"] for record in records
+        }
 
     def complete(self, request):
         text = request.messages[0].content
@@ -179,7 +191,7 @@ class GroupClient(FakeClient):
         prefix = "// signature-only repair\n" if unstructured else ""
         label = "" if unstructured else "#[proctor(0)] "
         code = prefix + "\n\n".join(
-            f"unsafe fn {self.names[int(item)]}() {{ {label}{len(self.requests)} }}"
+            f"{self.signatures[int(item)]} {{ {label}{len(self.requests)} }}"
             for item in request.metadata.item.split(",")
         )
         marker = "## Repair Base: `transformation.rs`"
@@ -204,6 +216,120 @@ def run_groups(tmp_path, records, *, config=None, **tool_options):
         llm_client_factory=lambda settings, tracker: client,
     )
     return value, output, tools, client
+
+
+def generic_record(item_id, name, dependencies):
+    record = fn_record(item_id, name, name, dependencies, needs_transformation=False)
+    signature = f"unsafe fn {name}<T>(value: T)"
+    record.update(
+        unstructured=True,
+        annotated_source=f"{signature} {{ let inferred = value; drop(inferred); }}",
+        source_signature=signature,
+        target_signature=signature,
+        baseline={
+            "skeleton": f"{signature} {{ todo!() }}",
+            "needs_transformation": False,
+            "statement_dispositions": [],
+            "statement_pair_metadata": [],
+        },
+    )
+    record["applied"] = record["baseline"]
+    return record
+
+
+def test_generic_functions_form_separate_direct_groups_across_recursive_components(
+    tmp_path,
+):
+    records = [
+        generic_record(0, "generic_a", [1]),
+        fn_record(1, "ordinary_a", "ordinary_a", [0]),
+        generic_record(2, "generic_b", [3]),
+        fn_record(3, "ordinary_b", "ordinary_b", [2]),
+    ]
+    value, output, tools, client = run_groups(
+        tmp_path, records, config={"workers": 1, "max_unstructured_repairs": 0}
+    )
+    assert output.status == "success", output.error
+    assert output.metrics["scc_count"] == 2
+    assert [request.metadata.item for request in client.requests] == ["0,2", "1,3"]
+    assert [request.metadata.prompt_id for request in client.requests] == [
+        "unstructured_repair",
+        "local_transformation",
+    ]
+    prompt = client.requests[0].messages[0].content
+    assert "let inferred = value" in prompt
+    assert "unsafe fn ordinary_a()" in prompt
+    assert "Target skeleton:" not in prompt and "#[proctor(" not in prompt
+    additions = [event[2] for event in tools.events if event[0] == "add_functions"]
+    assert [[item["id"] for item in addition["items"]] for addition in additions] == [
+        [1, 3]
+    ]
+    replacements = [
+        event[1] for event in tools.events if event[0] == "replace_unstructured"
+    ]
+    assert [request["members"] for request in replacements] == [[0, 2]]
+    assert output.metrics["llm_generation_calls"] == 2
+    assert (
+        output.metrics["repair_calls"]
+        == output.metrics["unstructured_repair_calls"]
+        == 0
+    )
+    assert output.metrics["unstructured_group_count"] == 1
+    assert not list(
+        (value.framework.workdir / "groups/000000").glob("accepted-*observation*")
+    )
+    report = (value.outputs.artifacts_dir / "statement-pairs.md").read_text()
+    assert "generic_a" not in report and "generic_b" not in report
+
+
+@pytest.mark.parametrize("limit", [0, 1, 3])
+def test_generic_generation_has_an_initial_attempt_then_unstructured_repair_budget(
+    tmp_path, limit
+):
+    _, output, tools, client = run_groups(
+        tmp_path,
+        [generic_record(0, "generic", [])],
+        config={"max_repairs": 0, "max_unstructured_repairs": limit},
+        unstructured_failure=True,
+    )
+    assert output.status == "success", output.error
+    assert len(client.requests) == limit + 1
+    assert output.metrics["llm_generation_calls"] == limit + 1
+    assert (
+        output.metrics["repair_calls"]
+        == output.metrics["unstructured_repair_calls"]
+        == limit
+    )
+    assert output.metrics["retained_functions"] == 1
+    assert not [
+        event
+        for event in tools.events
+        if event[0] in {"validate", "add_functions", "extract_observations"}
+    ]
+
+
+def test_generic_group_size_uses_original_body_and_frozen_signature():
+    records = loaded([generic_record(0, "first", []), generic_record(1, "second", [])])
+    by_id = {record.id: record for record in records}
+    limit = sum(
+        len(record.annotated_source) + len(record.target_signature)
+        for record in records
+    )
+    assert group_functions((0, 1), by_id, limit) == ((0, 1),)
+    assert group_functions((0, 1), by_id, limit - 1) == ((0,), (1,))
+
+
+@pytest.mark.parametrize("change", ["flag", "signature", "metadata"])
+def test_generic_records_reject_inconsistent_unstructured_metadata(change):
+    record = generic_record(0, "generic", [])
+    if change == "flag":
+        record["unstructured"] = "true"
+    elif change == "signature":
+        record["target_signature"] += " where T: Copy"
+    else:
+        record["baseline"]["needs_transformation"] = True
+    with pytest.raises(SkeletonError):
+        loaded([record])
 
 
 def test_initial_groups_split_a_recursive_scc_and_merge_adjacent_sccs(tmp_path):

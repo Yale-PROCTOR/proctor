@@ -429,6 +429,7 @@ class ItemRecord:
     applied: SkeletonView | None = None
     source_signature: str | None = None
     target_signature: str | None = None
+    unstructured: bool = False
     printf_format_specifiers: tuple[str, ...] = ()
     proctor_libc_function_paths: tuple[str, ...] = ()
     foreign_function_names: tuple[str, ...] = ()
@@ -999,6 +1000,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             "path",
             "kind",
             "name",
+            "unstructured",
             "annotated_source",
             "baseline",
             "applied",
@@ -1026,6 +1028,20 @@ def _load_record(data: Any, index: int) -> ItemRecord:
         baseline = _load_skeleton_view(data["baseline"], record_id, "baseline")
         applied = _load_skeleton_view(data["applied"], record_id, "applied")
         _validate_cross_view_invariants(record_id, baseline, applied)
+        unstructured = data["unstructured"]
+        if not isinstance(unstructured, bool):
+            raise SkeletonError(f"record {record_id} unstructured must be a Boolean")
+        if unstructured and (
+            baseline != applied
+            or baseline.needs_transformation
+            or baseline.statement_dispositions
+            or baseline.statement_pair_metadata
+            or data["source_signature"] != data["target_signature"]
+        ):
+            raise SkeletonError(
+                f"record {record_id} unstructured functions require an unchanged "
+                "signature and empty views"
+            )
         return ItemRecord(
             id=record_id,
             path=path,
@@ -1036,6 +1052,7 @@ def _load_record(data: Any, index: int) -> ItemRecord:
             applied=applied,
             source_signature=_string(data, "source_signature", record_id),
             target_signature=_string(data, "target_signature", record_id),
+            unstructured=unstructured,
             printf_format_specifiers=_foreign_names(
                 data, "printf_format_specifiers", record_id
             ),
@@ -1227,8 +1244,10 @@ def group_functions(
         record = records_by_id[item_id]
         assert record.annotated_source is not None
         assert record.baseline is not None and record.applied is not None
-        weight = len(record.annotated_source) + max(
-            len(record.baseline.skeleton), len(record.applied.skeleton)
+        weight = len(record.annotated_source) + (
+            len(record.target_signature or "")
+            if record.unstructured
+            else max(len(record.baseline.skeleton), len(record.applied.skeleton))
         )
         if members and (size + weight > limit or record.name in names):
             groups.append(tuple(sorted(members)))
