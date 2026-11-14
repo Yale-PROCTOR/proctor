@@ -1864,6 +1864,7 @@ def _process_unstructured_group(
     max_repairs: int,
     state: RunState,
     initial_diagnostics: str | None = None,
+    direct: bool = False,
 ) -> None:
     if initial_diagnostics is not None and max_repairs == 0:
         _retain_group(
@@ -1938,10 +1939,11 @@ def _process_unstructured_group(
     patch_failure: tuple[str, str] | None = None
     seen_results: dict[str, int] = {}
     calls = 0
+    call_limit = max_repairs + int(direct)
     response_path = workdir / "unstructured-response.json"
     while True:
         if transformation is None:
-            if calls == max_repairs:
+            if calls == call_limit:
                 _retain_group(
                     members,
                     transformations,
@@ -1986,8 +1988,9 @@ def _process_unstructured_group(
                 (exchange_dir / "prompt.md").write_text(rendered.text, encoding="utf-8")
             state.prompts_used.add(rendered.id)
             state.metrics.llm_generation_calls += 1
-            state.metrics.repair_calls += 1
-            state.metrics.unstructured_repair_calls += 1
+            if not direct or calls > 1:
+                state.metrics.repair_calls += 1
+                state.metrics.unstructured_repair_calls += 1
             before = tracker.record_count
             started = time.monotonic()
             try:
@@ -2125,6 +2128,26 @@ def _process_group(
     state: RunState,
     failures: tuple[CompilationFailure, ...] = (),
 ) -> CompilationFailure | None:
+    if records_by_id[members[0]].unstructured:
+        _process_unstructured_group(
+            members,
+            records_by_id,
+            transformations=[],
+            stage_input=stage_input,
+            current=current,
+            analysis=analysis,
+            frozen=frozen,
+            library_source=library_source,
+            workdir=workdir,
+            tools=tools,
+            client=client,
+            tracker=tracker,
+            exchange_root=exchange_root,
+            max_repairs=max_unstructured_repairs,
+            state=state,
+            direct=True,
+        )
+        return None
     duplicate_names: dict[str, list[ItemRecord]] = {}
     for item_id in members:
         record = records_by_id[item_id]
@@ -2714,16 +2737,28 @@ def _run_group_workers(
     transforming = tuple(
         item_id
         for item_id in ordered
-        if cast(SkeletonView, records_by_id[item_id].applied).needs_transformation
+        if not records_by_id[item_id].unstructured
+        and cast(SkeletonView, records_by_id[item_id].applied).needs_transformation
     )
     schedule = [
         TransformationGroup(members)
         for members in group_functions(transforming, records_by_id, limit)
     ]
     schedule.extend(
+        TransformationGroup(members)
+        for members in group_functions(
+            tuple(
+                item_id for item_id in ordered if records_by_id[item_id].unstructured
+            ),
+            records_by_id,
+            limit,
+        )
+    )
+    schedule.extend(
         TransformationGroup((item_id,))
         for item_id in ordered
-        if not cast(SkeletonView, records_by_id[item_id].applied).needs_transformation
+        if not records_by_id[item_id].unstructured
+        and not cast(SkeletonView, records_by_id[item_id].applied).needs_transformation
     )
     schedule.sort(
         key=lambda group: min(positions[item_id] for item_id in group.members)

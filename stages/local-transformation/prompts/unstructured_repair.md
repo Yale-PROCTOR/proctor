@@ -1,11 +1,10 @@
 +++
 id = "unstructured_repair"
 version = 1
-description = "Repair a complete Rust function group using fixed target signatures and freely rewritten bodies."
+description = "Rewrite a complete Rust function group using fixed target signatures and freely rewritten bodies."
 variables = ["dependency_context", "transformation_targets", "repair_context", "repair_base", "use_xj_scanf_guidance", "libc_guidance", "printf_guidance", "proctor_libc_call_guidance", "foreign_static_guidance"]
 +++
-You are repairing Rust functions generated from C after constrained transformation
-could not produce an accepted result. Rewrite every requested function body using
+You are rewriting Rust functions generated from C. Rewrite every requested function body using
 the original source behavior and the required target signature.
 
 The original implementation is the behavioral reference. The Repair Base is
@@ -19,8 +18,9 @@ Requirements:
    apparent bugs and preconditions. Do not add validation, fallback behavior, or
    error handling absent from the original source. If a source dereference assumes
    a nonnull pointer, unwrap the corresponding Option directly.
-2. Copy each required target signature exactly, including its lifetime declaration,
-   parameter names and types, return type, and unsafe qualifier. Call transformed
+2. Copy each required target signature exactly, including all generic parameters,
+   lifetime declarations, bounds, where clauses, parameter names and types, return
+   type, and unsafe qualifier. Call transformed
    dependencies using their target signatures.
 3. Emit every requested function exactly once. Emit no additional top-level or
    function-local items, including imports, helper functions, types, constants,
