@@ -25,6 +25,14 @@ outer bindings. Direct control statements, initializers, return/break values,
 and match-arm results retain their existing labeled structure. A return,
 break, or continue must not escape an opaque value block or conditional.
 
+Directly labeled local static and const declarations have a fixed declaration header.
+Their initializers are opaque: rewrite the initializer freely without adding inner
+labels or following target local-variable types. Preserve the item kind, name,
+type, static mutability, and attributes. Existing local imports and foreign
+declarations remain unchanged in their original scopes.
+Local statics, consts, imports, and foreign declarations inside opaque closures or
+value expressions have no independent labels or frozen headers.
+
 Requirements:
 
 1. Exactly preserve source behavior wherever it is defined, including apparent
@@ -43,8 +51,10 @@ Requirements:
    the consecutive statements carrying the same `#[proctor(N)]` label that
    encloses its declaration, including unlabeled code nested within those
    statements.
-6. Do not define a function, type, static, constant, module, or other item
-   inside a transformation target.
+6. Outside opaque regions, preserve existing local declarations and do not
+   introduce additional local items. Opaque closures and value expressions may
+   contain local statics, consts, imports, and foreign declarations. Opaque static
+   and const initializers may contain any local item kind.
 7. At each labeled statement-list level, preserve every source
    `#[proctor(N)]` label in order. A labeled statement may expand only into one
    or more consecutive sibling statements with the same label. Do not insert
@@ -89,8 +99,9 @@ Requirements:
     reference material only. Do not define or import the functions, and do not
     declare an `extern crate`. Call them through their fully qualified paths,
     such as `bytemuck::cast_ref(e)`.
-12. Do not introduce an explicit `unsafe` block or a statement or expression
-    attribute other than the required `#[proctor(N)]` labels.
+12. Outside opaque static and const initializers, do not introduce an explicit
+    `unsafe` block or a statement or expression attribute other than the required
+    `#[proctor(N)]` labels.
 13. Return exactly one Rust code block delimited by triple-backtick fences.
     Include all requested functions and no prose. Do not use tilde or
     longer-backtick fences.

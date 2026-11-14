@@ -2648,7 +2648,7 @@ def test_version_1_prompt_has_exact_hierarchy_and_safe_cast_guidance():
     assert rendered.content_hash == hashlib.sha256(expected.encode()).hexdigest()
     assert (
         rendered.content_hash
-        == "77601aa8050a42167f34e26c48a771e9e3f5628adaf5f2ef74abcdbc0309f0d4"
+        == "39b051882d1c127da43252579a3dcb554c3ad6dee1179a4fdbc7f840f17ca709"
     )
     assert rendered.version == 1
     assert XJ_SCANF_GUIDANCE_MARKER not in rendered.text
@@ -2680,7 +2680,7 @@ def test_version_1_prompt_has_exact_hierarchy_and_safe_cast_guidance():
     assert "slice casts require the total byte length" in rendered.text
     assert "Do not define or import the functions" in rendered.text
     assert "declare an `extern crate`" in rendered.text
-    assert "12. Do not introduce an explicit `unsafe` block" in rendered.text
+    assert "12. Outside opaque static and const initializers" in rendered.text
     assert "13. Return exactly one Rust code block" in rendered.text
     assert (
         f"## Dependency Context\n\n{dependency_entries}\n\n"
