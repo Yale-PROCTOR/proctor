@@ -2872,6 +2872,25 @@ def test_command_builders_use_exact_four_output_and_extract_argv():
         "/inputs/rules.json",
         "/work/current",
     ]
+    assert make_skeleton_command(
+        tool,
+        Path("/work/current"),
+        Path("/work/skeletons.json"),
+        Path("/inputs/rules.json"),
+        Path("/work/frozen.json"),
+        use_bo_analysis=True,
+    ) == [
+        "/tools/crat-tool",
+        "make-skeleton",
+        "--output",
+        "/work/skeletons.json",
+        "--frozen-output",
+        "/work/frozen.json",
+        "--rules",
+        "/inputs/rules.json",
+        "--use-bo-analysis",
+        "/work/current",
+    ]
     assert merge_observations_command(
         tool,
         Path("/work/merged.json"),
@@ -7127,6 +7146,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
     }
     assert manifest["produces"] == {"rust_project": True}
     assert set(manifest["config"]) == {
+        "use_bo_analysis",
         "workers",
         "max_group_chars",
         "max_repairs",
@@ -7141,6 +7161,7 @@ def test_stage_manifest_declares_exact_artifacts_and_warmup():
         "validation_repair_model",
         "validation_repair_timeout_s",
     }
+    assert manifest["config"]["use_bo_analysis"]["default"] is False
     assert manifest["config"]["workers"]["default"] == 4
     assert manifest["config"]["max_group_chars"]["default"] == 15_000
     assert manifest["config"]["max_repairs"]["default"] == 5
@@ -7214,6 +7235,7 @@ def test_successful_output_reports_llm_reproducibility(tmp_path, case):
         ("local_transformation", 1)
     ]
     assert output.config_used == {
+        "use_bo_analysis": False,
         "workers": 1,
         "max_group_chars": 15_000,
         "max_repairs": 5,
@@ -10015,6 +10037,62 @@ def test_default_workers_share_one_rate_limiter_across_clients(tmp_path, monkeyp
     assert output.config_used["workers"] == 4
     assert len(limiters) == 4
     assert all(limiter is limiters[0] for limiter in limiters)
+
+
+@pytest.mark.parametrize(
+    "config", [{}, {"use_bo_analysis": False}, {"use_bo_analysis": True}]
+)
+def test_pointer_analysis_configuration_reaches_skeleton_generation(tmp_path, config):
+    selected = []
+
+    class AnalysisTools(FakeTools):
+        def make_skeleton(self, current, output, rule_set=None, **kwargs):
+            selected.append(kwargs["use_bo_analysis"])
+            super().make_skeleton(current, output, rule_set, **kwargs)
+
+    _, output = run_fake(
+        tmp_path, AnalysisTools(), FakeClient([response()]), config=config
+    )
+    assert output.status == "success", output.error
+    expected = config.get("use_bo_analysis", False)
+    assert selected == [expected]
+    assert output.config_used["use_bo_analysis"] is expected
+
+
+@pytest.mark.parametrize("use_bo_analysis", [0, 1, "false", "true", None, []])
+def test_pointer_analysis_configuration_rejects_nonboolean_values(
+    tmp_path, use_bo_analysis
+):
+    tools = FakeTools()
+    value = stage_input(tmp_path, config={"use_bo_analysis": use_bo_analysis})
+    output = run_stage(value, stage_dir=STAGE_DIR, tools=tools)
+    assert output.status == "failure"
+    assert "config.use_bo_analysis must be a boolean" in output.error
+    assert not tools.events
+
+
+@pytest.mark.parametrize("use_bo_analysis", [False, True])
+def test_skeleton_tool_forwards_pointer_analysis_selection(tmp_path, use_bo_analysis):
+    commands = []
+    project = tmp_path / "project"
+    project.mkdir()
+
+    def runner(command, **kwargs):
+        commands.append(command)
+        Path(command[command.index("--output") + 1]).write_text("[]")
+        Path(command[command.index("--frozen-output") + 1]).write_text("{}")
+        return CommandResult(0)
+
+    tools = CratTools(tmp_path / "tool.log", run_command=runner)
+    tools.crat_tool = tmp_path / "crat-tool"
+    tools.make_skeleton(
+        project,
+        tmp_path / "skeletons.json",
+        frozen_output=tmp_path / "frozen.json",
+        use_bo_analysis=use_bo_analysis,
+    )
+    assert len(commands) == 1
+    assert ("--use-bo-analysis" in commands[0]) is use_bo_analysis
 
 
 @pytest.mark.parametrize("workers", [0, -1, True, False, 2.5, "4", None])

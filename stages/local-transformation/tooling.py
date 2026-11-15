@@ -309,6 +309,7 @@ class CratTools:
         rule_set: Path | None = None,
         *,
         frozen_output: Path | None = None,
+        use_bo_analysis: bool = False,
     ) -> None:
         assert self.crat_tool is not None
         paths = (output, *((frozen_output,) if frozen_output is not None else ()))
@@ -322,7 +323,12 @@ class CratTools:
         self._output_operation(
             "crat-tool make-skeleton",
             make_skeleton_command(
-                self.crat_tool, current_project, output, rule_set, frozen_output
+                self.crat_tool,
+                current_project,
+                output,
+                rule_set,
+                frozen_output,
+                use_bo_analysis=use_bo_analysis,
             ),
             output,
             redactions=((str(rule_set), "<rule-set>"),) if rule_set is not None else (),

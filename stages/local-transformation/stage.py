@@ -278,6 +278,7 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
     unknown = sorted(
         set(config)
         - {
+            "use_bo_analysis",
             "crat_dir",
             "dump_llm_exchanges",
             "workers",
@@ -295,6 +296,9 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
     )
     if unknown:
         raise StageFailure(f"unknown local-transformation config keys: {unknown}")
+    use_bo_analysis = config.get("use_bo_analysis", False)
+    if not isinstance(use_bo_analysis, bool):
+        raise StageFailure("config.use_bo_analysis must be a boolean")
     crat_dir = config.get("crat_dir", "../crat")
     if not isinstance(crat_dir, str) or not crat_dir:
         raise StageFailure("config.crat_dir must be a nonempty string")
@@ -357,6 +361,7 @@ def _effective_config(config: dict[str, Any], stage_dir: Path) -> dict[str, Any]
         if type(timeout) is not int or timeout <= 0:
             raise StageFailure(f"config.{name} must be a positive integer")
     return {
+        "use_bo_analysis": use_bo_analysis,
         "workers": workers,
         "max_group_chars": max_group_chars,
         "max_repairs": max_repairs,
@@ -3007,7 +3012,11 @@ def run_stage(
         skeleton_path = workdir / "skeletons.json"
         frozen = workdir / "frozen-project.json"
         active_tools.make_skeleton(
-            analysis, skeleton_path, rule_set, frozen_output=frozen
+            analysis,
+            skeleton_path,
+            rule_set,
+            frozen_output=frozen,
+            use_bo_analysis=config["use_bo_analysis"],
         )
         records = load_skeletons(skeleton_path.read_text(encoding="utf-8"))
         records_by_id = {record.id: record for record in records}

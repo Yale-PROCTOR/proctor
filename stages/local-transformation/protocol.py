@@ -243,6 +243,8 @@ def make_skeleton_command(
     output: Path,
     rule_set: Path | None = None,
     frozen_output: Path | None = None,
+    *,
+    use_bo_analysis: bool = False,
 ) -> list[str]:
     command = [
         str(crat_tool),
@@ -254,6 +256,8 @@ def make_skeleton_command(
         command.extend(("--frozen-output", str(frozen_output)))
     if rule_set is not None:
         command.extend(("--rules", str(rule_set)))
+    if use_bo_analysis:
+        command.append("--use-bo-analysis")
     command.append(str(current_project))
     return command
 

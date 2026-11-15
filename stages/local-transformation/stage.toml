@@ -14,6 +14,7 @@ rule_set = "optional"
 rust_project = true
 
 [config]
+use_bo_analysis = { type = "bool", default = false, doc = "use borrow/ownership pointer analysis instead of the original pointer analysis" }
 workers = { type = "integer", default = 4, doc = "positive number of workers, each owning a function group through generation, private compilation, repair, and observation extraction" }
 max_group_chars = { type = "integer", default = 15000, doc = "positive soft limit on grouped annotated source plus the larger baseline/applied skeleton; oversized functions run alone" }
 max_repairs = { type = "integer", default = 5, doc = "nonnegative maximum number of structured repair calls per group, shared across structural and compilation failures and baseline fallback" }
