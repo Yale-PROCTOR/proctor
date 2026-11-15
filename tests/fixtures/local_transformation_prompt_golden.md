@@ -16,15 +16,17 @@ redefine its functions, types, statics, or constants.
 
 Complete every generated `todo!()` hole. Preserve every complete labeled statement already present in the Target Skeleton exactly as provided.
 
-Closures, along with blocks, `if` expressions, and `match` expressions nested
-inside operands, are opaque regions belonging to their enclosing transformation
+Closures, along with blocks, `if`, `match`, `loop`, `while`, and `for` expressions
+nested inside operands, are opaque regions belonging to their enclosing transformation
 region. Their internal
 statements and bindings receive no independent labels or target local-variable
 types; closure parameters follow the same rule. Rewrite these internals as
 needed while preserving behavior and using the target types of referenced
 outer bindings. Direct control statements, initializers, return/break values,
-and match-arm results retain their existing labeled structure. A return,
-break, or continue must not escape an opaque value block, conditional, or match.
+and match-arm results retain their existing labeled structure. Opaque expressions
+may contain `return`, `?`, `break`, and `continue` targeting enclosing scopes.
+Preserve evaluation order and the original function, loop, or labeled block
+targeted by each transfer. Do not wrap expressions in closures that change those targets.
 
 Directly labeled local static and const declarations have a fixed declaration header.
 Their initializers are opaque: rewrite the initializer freely without adding inner

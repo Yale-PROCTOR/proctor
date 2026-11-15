@@ -2648,7 +2648,7 @@ def test_version_1_prompt_has_exact_hierarchy_and_safe_cast_guidance():
     assert rendered.content_hash == hashlib.sha256(expected.encode()).hexdigest()
     assert (
         rendered.content_hash
-        == "6a1ca22ceaa7305d5d4313c969fbf0161587cfc172ac898e2378620c1c869c54"
+        == "f6229988fa5c794fbbb98f4ce6cd79fdd30c2e77dd43151f72289a554f8716c4"
     )
     assert rendered.version == 1
     assert XJ_SCANF_GUIDANCE_MARKER not in rendered.text
