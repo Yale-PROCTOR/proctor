@@ -16,7 +16,6 @@ from typing import Any
 
 import pytest
 
-from proctor.config.load import load_config
 from proctor.contracts.stage_io import (
     FrameworkSettings,
     InputArtifacts,
@@ -71,6 +70,12 @@ class FakeTools:
         self.config_edit = False
         self.binary = True
         self.gated_binary = False
+        self.test_results: list[Any] = []
+        self.test_calls: list[Path] = []
+        self.test_repairs: list[tuple[str, Path]] = []
+        self.test_repair_action: Any = None
+        self.test_run_action: Any = None
+        self.harnesses = ("tests", "runner")
 
     def build_crat(self, _config: dict, _log: Path) -> tuple[Path, dict]:
         return Path("/fake/crat"), {}
@@ -86,6 +91,9 @@ class FakeTools:
             shutil.copytree(source, target)
             with (target / "lib.rs").open("a") as stream:
                 stream.write(f"// {name}\n")
+            if name == "expand":
+                for harness in self.harnesses:
+                    shutil.rmtree(target / harness, ignore_errors=True)
             if name == self.failed_pass:
                 (target / "field_spec_map.json").write_text("invalid partial sidecar")
                 return STAGE.CommandResult(1, stderr="Crat failed after partial writes")
@@ -125,19 +133,35 @@ class FakeTools:
                     }
                 ),
             )
+        if command[:2] == ["uv", "run"]:
+            self.test_calls.append(cwd)
+            assert tools_finished(cwd)
+            assert "--no-auto-complete" in command
+            assert "--coverage" not in command
+            if self.test_run_action:
+                self.test_run_action(command, cwd)
+            result = self.test_results.pop(0) if self.test_results else evaluation()
+            if isinstance(result, Exception):
+                raise result
+            return result
         raise AssertionError(command)
 
     def agent(
         self, config: dict, project: Path, prompt: str, directory: Path, env: dict
     ) -> dict:
-        self.repairs.append((prompt, project))
         assert (project / "lib.rs").is_file()
         assert config["model"] == "openrouter/openai/gpt-5.6-terra"
         assert env["CARGO_TARGET_DIR"] == env["CARGO_BUILD_BUILD_DIR"]
-        if len(self.repairs) >= self.repairs_needed:
-            (project / "broken").unlink()
-        if self.config_edit:
-            (project / "config.toml").write_text('passes = ["prepare"]\n')
+        if directory.name.startswith("test-repair-"):
+            self.test_repairs.append((prompt, project))
+            if self.test_repair_action:
+                self.test_repair_action(project, len(self.test_repairs))
+        else:
+            self.repairs.append((prompt, project))
+            if len(self.repairs) >= self.repairs_needed:
+                (project / "broken").unlink()
+            if self.config_edit:
+                (project / "config.toml").write_text('passes = ["prepare"]\n')
         return {
             "metrics": {
                 "input_tokens": 100,
@@ -163,6 +187,53 @@ def tools(monkeypatch: pytest.MonkeyPatch) -> FakeTools:
     monkeypatch.setattr(STAGE, "run_command", tools.run_command)
     monkeypatch.setattr(STAGE, "run_agent", tools.agent)
     return tools
+
+
+def tools_finished(project: Path) -> bool:
+    return "// bin\n" in (project / "lib.rs").read_text()
+
+
+def evaluation(*, successes=1, failures=0, errors=0, skipped=0, **extra):
+    status = (
+        "build_failed"
+        if extra.get("compiler_errors")
+        else "harness_error"
+        if extra.get("execution_error")
+        else "failed"
+        if failures
+        or errors
+        or any(v["result"]["status"] != "ok" for v in extra.get("verifications", []))
+        else "ok"
+        if successes + skipped
+        else "no_tests"
+    )
+    payload = {
+        "status": status,
+        "passed": status == "ok",
+        "tests_count": successes + failures + errors + skipped,
+        "successes_count": successes,
+        "failures_count": failures,
+        "errors_count": errors,
+        "skipped_count": skipped,
+        **extra,
+    }
+    return STAGE.CommandResult(int(status != "ok"), stdout=json.dumps(payload))
+
+
+@pytest.fixture
+def oracle(envelope):
+    source = envelope.inputs.rust_project
+    (source / "testinfra.toml").write_text('strategy = "cando2"\ntarget_kind = "lib"\n')
+    for name in (
+        "runner/src/main.rs",
+        "tests/check.rs",
+        "test_vectors/test.json",
+        ".scripts/run_tests.sh",
+    ):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"original {name}\n")
+    return envelope
 
 
 @pytest.mark.parametrize("interface", [False, True])
@@ -322,6 +393,12 @@ def test_feature_gated_binary_must_actually_build(envelope, tools):
         {"enable_interface": "true"},
         {"max_repair_attempts": True},
         {"max_repair_attempts": 0},
+        {"max_validation_repairs": True},
+        {"max_validation_repairs": -1},
+        {"max_validation_repairs": 1.5},
+        {"validation_timeout_s": 0},
+        {"validation_timeout_s": float("inf")},
+        {"testinfra_dir": ""},
         {"build_timeout_s": float("nan")},
         {"crat_timeout_s": 0},
         {"agent_timeout_s": True},
@@ -381,7 +458,8 @@ def test_quiet_build_preserves_flags_and_forces_private_cache(
     assert env["CARGO_TARGET_DIR"] == env["CARGO_BUILD_BUILD_DIR"] == str(tmp_path)
 
 
-def test_command_timeout_kills_agent_children(tmp_path):
+@pytest.mark.parametrize("detached", [False, True])
+def test_command_timeout_kills_agent_children(tmp_path, detached):
     marker = tmp_path / "child-survived"
     child = (
         "import time; from pathlib import Path; time.sleep(0.4); Path("
@@ -391,7 +469,7 @@ def test_command_timeout_kills_agent_children(tmp_path):
     parent = (
         "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', "
         + repr(child)
-        + "]); print('ready', flush=True); time.sleep(5)"
+        + f"], start_new_session={detached!r}); print('ready', flush=True); time.sleep(5)"
     )
     result = STAGE.run_command(
         [sys.executable, "-c", parent],
@@ -477,17 +555,18 @@ def test_agent_timeout_cleans_generated_files(
     )
 
 
-def test_openrouter_configuration_and_stage_contract():
-    config = load_config([ROOT / "configs/c2rust_crat_repair.toml"])
-    assert config["pipeline"]["order"] == ["c2rust", "crat_repair"]
-    stage = config["stages"]["crat_repair"]
-    assert stage["uses"] == "stages/crat-repair"
-    resolved = STAGE.resolve_config(stage["config"])
+def test_agent_configuration_and_stage_contract(envelope):
+    resolved = STAGE.resolve_config(envelope.config)
     assert resolved["agent"] == "opencode"
     assert resolved["model"] == "openrouter/openai/gpt-5.6-terra"
     assert resolved["enable_interface"] is False
     assert resolved["max_repair_attempts"] == 3
-    manifest = tomllib.loads((ROOT / stage["uses"] / "stage.toml").read_text())
+    assert resolved["max_validation_repairs"] == 3
+    assert resolved["validation_timeout_s"] == 600
+    assert resolved["testinfra_dir"] == str(
+        (ROOT / "stages/test-infrastructure").resolve()
+    )
+    manifest = tomllib.loads((ROOT / "stages/crat-repair/stage.toml").read_text())
     assert manifest["requires"] == {"rust_project": "required"}
     assert manifest["produces"] == {"rust_project": True}
     assert set(manifest["config"]) == set(STAGE.DEFAULTS)
@@ -498,3 +577,476 @@ def test_entrypoint_reports_invalid_envelope(tmp_path):
     source.write_text("{}")
     assert STAGE.main(["--input", str(source), "--output", str(destination)]) == 1
     assert StageOutput.read(destination).status == "failure"
+
+
+def test_missing_oracle_preserves_compilation_only_behavior(envelope, tools):
+    output = STAGE.run_stage(envelope)
+    assert output.status == "success", output.error
+    assert output.metadata["test_validation"]["status"] == "no_manifest"
+    assert not tools.test_calls and not tools.test_repairs
+    assert output.metrics["validation_repair_calls"] == 0
+
+
+def test_final_validation_preserves_original_harness_and_input(oracle, tools):
+    source = oracle.inputs.rust_project
+    before = {
+        p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()
+    }
+
+    def inspect(command, tested):
+        assert not oracle.outputs.rust_project.exists()
+        assert (tested / "proctor.toml").is_file()
+        assert (tested / "runner/src/main.rs").read_bytes() == before[
+            Path("runner/src/main.rs")
+        ]
+        assert (tested / "tests/check.rs").read_bytes() == before[
+            Path("tests/check.rs")
+        ]
+        assert tools.commands[-2][0] == ["cargo", "build", "--quiet", "--lib"]
+        assert command[command.index("--directory") + 1] == str(
+            (ROOT / "stages/test-infrastructure").resolve()
+        )
+
+    tools.test_run_action = inspect
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    report = output.metadata["test_validation"]
+    assert report["status"] == "validation_succeeded"
+    assert report["validation_runs"] == 1 and report["repair_attempts"] == 0
+    assert len(tools.test_calls) == 1
+    assert not tools.test_repairs
+    assert before == {
+        p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()
+    }
+    assert (
+        json.loads((oracle.outputs.artifacts_dir / "test-validation.json").read_text())
+        == report
+    )
+    assert "test-validation.json" in output.logs
+    StageOutput.from_dict(output.to_dict())
+
+
+@pytest.mark.parametrize("limit", [0, 1, 3])
+def test_exhausted_test_repairs_publish_last_buildable_output(oracle, tools, limit):
+    tools.test_results = [evaluation(failures=1)] * (limit + 1)
+
+    def edit(project, index):
+        with (project / "lib.rs").open("a") as stream:
+            stream.write(f"// test repair {index}\n")
+
+    tools.test_repair_action = edit
+    output = STAGE.run_stage(
+        replace(oracle, config={**oracle.config, "max_validation_repairs": limit})
+    )
+    assert output.status == "success" and output.error is None
+    assert len(tools.test_repairs) == limit
+    assert len(tools.test_calls) == limit + 1
+    report = output.metadata["test_validation"]
+    assert report["status"] == "validation_failed"
+    assert report["repair_attempts"] == limit
+    assert report["reason"] == "repair_limit_reached"
+    if limit:
+        assert (
+            f"// test repair {limit}"
+            in (output.outputs.rust_project / "lib.rs").read_text()
+        )
+    assert output.usage.calls == limit
+    assert output.usage.input_tokens == 100 * limit
+    assert output.usage.cached_input_tokens == 30 * limit
+    assert output.metrics["compilation_repair_calls"] == 0
+    assert output.metrics["validation_repair_calls"] == limit
+    assert [prompt.id for prompt in output.prompts] == (
+        ["crat_test_repair"] if limit else []
+    )
+
+
+def test_test_repairs_have_separate_budget_and_use_latest_diagnostics(oracle, tools):
+    tools.broken_pass = "extern"
+    tools.test_results = [
+        evaluation(failures=1, failing_testcases=[{"message": "first failure"}]),
+        evaluation(errors=1, failing_testcases=[{"message": "second failure"}]),
+        evaluation(),
+    ]
+    output = STAGE.run_stage(
+        replace(
+            oracle,
+            config={
+                **oracle.config,
+                "max_repair_attempts": 1,
+                "max_validation_repairs": 2,
+            },
+        )
+    )
+    assert output.status == "success", output.error
+    assert len(tools.repairs) == 1 and len(tools.test_repairs) == 2
+    assert "first failure" in tools.test_repairs[0][0]
+    assert "second failure" in tools.test_repairs[1][0]
+    assert "first failure" not in tools.test_repairs[1][0]
+    assert output.metadata["test_validation"]["status"] == "validation_succeeded"
+    assert output.usage.calls == output.metrics["repair_calls"] == 3
+    assert output.metrics["compilation_repair_calls"] == 1
+    assert output.metrics["validation_repair_calls"] == 2
+    assert {prompt.id for prompt in output.prompts} == {
+        "crat_compile_repair",
+        "crat_test_repair",
+    }
+    assert output.models[0].model == oracle.config["model"]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        evaluation(successes=0),
+        evaluation(successes=0, skipped=3),
+        evaluation(successes=0, compiler_errors=["test build failed"]),
+        evaluation(successes=0, execution_error="runner unavailable"),
+        STAGE.CommandResult(0, stdout="not JSON"),
+        STAGE.CommandResult(0, stdout="[]"),
+        STAGE.CommandResult(0, stdout="{}"),
+        evaluation(tests_count=True),
+        evaluation(tests_count=2),
+        evaluation(skipped_count=-1),
+        STAGE.CommandResult(1, stdout=evaluation().stdout),
+        STAGE.CommandResult(2, stdout=evaluation(failures=1).stdout),
+        STAGE.CommandResult(-9, stdout=evaluation(failures=1).stdout),
+        STAGE.CommandResult(-9, stdout=evaluation(failures=1).stdout, timed_out=True),
+        FileNotFoundError("uv is missing"),
+        subprocess.TimeoutExpired("testinfra", 1),
+    ],
+)
+def test_unusable_tests_never_repair_or_fail_translation(oracle, tools, result):
+    tools.test_results = [result]
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    report = output.metadata["test_validation"]
+    assert report["status"] == "no_executable_tests"
+    assert report["repair_attempts"] == 0
+    assert len(tools.test_calls) == 1 and not tools.test_repairs
+    assert output.usage.calls == 0
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_runner_setup_mutations_never_reach_published_project(
+    oracle, tools, unavailable
+):
+    def mutate(command, project):
+        (project / "lib.rs").write_text("runner setup changed implementation")
+        (project / "Cargo.toml").write_text("runner setup changed manifest")
+        (project / "test_vectors/test.json").write_text("changed expected output")
+
+    tools.test_run_action = mutate
+    tools.test_results = [evaluation(successes=0) if unavailable else evaluation()]
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    published = output.outputs.rust_project
+    assert tools_finished(published)
+    assert (published / "Cargo.toml").read_bytes() == (
+        oracle.inputs.rust_project / "Cargo.toml"
+    ).read_bytes()
+    assert (
+        published / "test_vectors/test.json"
+    ).read_text() == "original test_vectors/test.json\n"
+
+
+def test_unbuildable_repair_is_discarded_and_next_prompt_has_build_diagnostics(
+    oracle, tools
+):
+    (oracle.inputs.rust_project / "keep.rs").write_text("keep module\n")
+    tools.test_results = [evaluation(failures=1), evaluation(failures=1), evaluation()]
+
+    def edit(project, index):
+        if index == 1:
+            (project / "broken").touch()
+            (project / "keep.rs").unlink()
+            (project / "new.rs").write_text("invalid module")
+        else:
+            assert not (project / "broken").exists()
+            assert not (project / "new.rs").exists()
+            assert (project / "keep.rs").read_text() == "keep module\n"
+            (project / "lib.rs").write_text(
+                (project / "lib.rs").read_text() + "// repaired\n"
+            )
+
+    tools.test_repair_action = edit
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert len(tools.test_repairs) == 2
+    assert "error[E0308]" in tools.test_repairs[1][0]
+    report = output.metadata["test_validation"]
+    assert report["attempts"][1]["repair"]["rolled_back"]
+    assert not report["attempts"][2]["repair"]["rolled_back"]
+    assert not (output.outputs.rust_project / "broken").exists()
+
+
+@pytest.mark.parametrize("failure", ["exception", "build_timeout", "declared_target"])
+def test_test_repair_errors_preserve_buildable_output(oracle, tools, failure):
+    tools.test_results = [evaluation(failures=1), evaluation(failures=1)]
+    if failure == "declared_target":
+        (oracle.inputs.rust_project / "config.toml").write_text('[bin]\nname = "app"\n')
+        (oracle.inputs.rust_project / "main.rs").write_text("fn main() {}\n")
+
+    def edit(project, index):
+        (project / "broken").touch()
+        if failure == "exception":
+            raise STAGE.StageFailure("agent driver failed")
+        if failure == "build_timeout":
+            tools.build_timeout = True
+        if failure == "declared_target":
+            (project / "broken").unlink()
+            tools.gated_binary = True
+
+    tools.test_repair_action = edit
+    output = STAGE.run_stage(
+        replace(oracle, config={**oracle.config, "max_validation_repairs": 1})
+    )
+    assert output.status == "success", output.error
+    assert output.usage.calls == 1
+    assert output.metadata["test_validation"]["attempts"][1]["repair"]["rolled_back"]
+    assert not (output.outputs.rust_project / "broken").exists()
+
+
+def test_agent_failure_can_still_leave_a_passing_buildable_repair(oracle, tools):
+    tools.test_results = [evaluation(failures=1), evaluation()]
+
+    def edit(project, index):
+        with (project / "lib.rs").open("a") as stream:
+            stream.write("// fixed before agent timed out\n")
+        raise TimeoutError("agent timed out")
+
+    tools.test_repair_action = edit
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert (
+        "fixed before agent timed out"
+        in (output.outputs.rust_project / "lib.rs").read_text()
+    )
+    assert output.metadata["test_validation"]["status"] == "validation_succeeded"
+
+
+def test_repair_cannot_modify_original_oracle_or_protected_metadata(oracle, tools):
+    tools.test_results = [evaluation(failures=1), evaluation()]
+    source = oracle.inputs.rust_project
+    (source / ".config").mkdir()
+    (source / ".config/nextest.toml").write_text("original nextest config\n")
+
+    def edit(project, index):
+        for name in ("tests", "runner", "test_vectors", ".scripts", ".config"):
+            shutil.rmtree(project / name)
+        for name in ("config.toml", "proctor.toml", "testinfra.toml"):
+            (project / name).unlink()
+        (project / "tests").mkdir()
+        (project / "tests/bypassed.rs").write_text("disabled oracle")
+        (project / ".config").symlink_to(source / ".config", target_is_directory=True)
+
+    tools.test_repair_action = edit
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    project = output.outputs.rust_project
+    for name in (
+        "runner/src/main.rs",
+        "tests/check.rs",
+        "test_vectors/test.json",
+        ".scripts/run_tests.sh",
+        ".config/nextest.toml",
+        "testinfra.toml",
+        "config.toml",
+    ):
+        assert (project / name).read_bytes() == (source / name).read_bytes()
+    assert not (project / "tests/bypassed.rs").exists()
+    assert (
+        tomllib.loads((project / "proctor.toml").read_text())["target_name"]
+        == "fixture"
+    )
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_custom_runner_is_preserved_and_relocated(oracle, tools, absolute):
+    source = oracle.inputs.rust_project
+    runner = source / "harness/custom"
+    runner.mkdir(parents=True)
+    (runner / "Cargo.toml").write_text(
+        '[package]\nname = "runner"\nversion = "0.1.0"\n'
+    )
+    (runner / "main.rs").write_text("original custom runner\n")
+    (source / "testinfra.toml").write_text(
+        f'strategy = "cando2"\n[cando2]\nrunner = "{runner if absolute else "harness/custom"}"\n'
+    )
+    tools.harnesses = (*tools.harnesses, "harness/custom")
+
+    def inspect(command, tested):
+        assert command[command.index("--runner") + 1] == str(tested / "harness/custom")
+        assert (
+            tested / "harness/custom/main.rs"
+        ).read_text() == "original custom runner\n"
+
+    tools.test_run_action = inspect
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert output.metadata["test_validation"]["status"] == "validation_succeeded"
+    assert (
+        output.outputs.rust_project / "harness/custom/main.rs"
+    ).read_text() == "original custom runner\n"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        "invalid TOML [",
+        'strategy="cando2"\nrunner="../outside"\n',
+        'strategy="cando2"\nrunner="."\n',
+        'strategy="cando2"\nrunner="lib.rs"\n',
+        'strategy="cando2"\nrunner="Cargo.toml"\n',
+        'strategy="cando2"\nrunner="config.toml"\n',
+        'strategy="cando2"\nrunner="missing"\n',
+    ],
+)
+def test_invalid_oracle_metadata_is_nonfatal_and_not_repaired(oracle, tools, manifest):
+    (oracle.inputs.rust_project / "testinfra.toml").write_text(manifest)
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert tools_finished(output.outputs.rust_project)
+    assert output.metadata["test_validation"]["status"] == "no_executable_tests"
+    assert not tools.test_calls and not tools.test_repairs
+
+
+def test_failed_verification_triggers_test_repair(oracle, tools):
+    tools.test_results = [
+        evaluation(
+            verifications=[
+                {
+                    "kind": "relocation",
+                    "result": json.loads(evaluation(failures=1).stdout),
+                }
+            ]
+        ),
+        evaluation(),
+    ]
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert len(tools.test_repairs) == 1
+    assert output.metadata["test_validation"]["status"] == "validation_succeeded"
+
+
+def test_unusable_verification_does_not_trigger_repair(oracle, tools):
+    tools.test_results = [
+        evaluation(
+            verifications=[
+                {
+                    "kind": "relocation",
+                    "result": json.loads(
+                        evaluation(successes=0, execution_error="runner missing").stdout
+                    ),
+                }
+            ]
+        )
+    ]
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert not tools.test_repairs
+    assert output.metadata["test_validation"]["status"] == "no_executable_tests"
+
+
+def test_generated_project_self_alias_does_not_recurse(oracle, tools):
+    (oracle.inputs.rust_project / "translated_rust").symlink_to(
+        ".", target_is_directory=True
+    )
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert output.metadata["test_validation"]["status"] == "validation_succeeded"
+    assert (oracle.inputs.rust_project / "translated_rust").is_symlink()
+
+
+def test_stage_deadline_skips_further_test_repairs(oracle, tools, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(STAGE.time, "monotonic", lambda: now[0])
+    tools.test_results = [evaluation(failures=1)]
+    tools.test_run_action = lambda command, project: now.__setitem__(0, 30.0)
+    output = STAGE.run_stage(
+        replace(oracle, framework=replace(oracle.framework, timeout_s=20))
+    )
+    assert output.status == "success", output.error
+    assert not tools.test_repairs
+    assert output.metadata["test_validation"]["reason"] == "stage_time_budget_exhausted"
+    command = next(
+        record for record in tools.commands if record[0][:2] == ["uv", "run"]
+    )
+    assert command[3] == 18
+
+
+def test_nested_directories_named_target_are_preserved(oracle, tools):
+    source = oracle.inputs.rust_project
+    for name in ("src/target/mod.rs", "test_vectors/target/case.json"):
+        path = source / name
+        path.parent.mkdir(parents=True)
+        path.write_text("required project content\n")
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    for project in (*tools.test_calls, output.outputs.rust_project):
+        for name in ("src/target/mod.rs", "test_vectors/target/case.json"):
+            assert (project / name).read_text() == "required project content\n"
+    assert not (output.outputs.rust_project / "target").exists()
+
+
+def test_tests_becoming_unavailable_stop_further_repair(oracle, tools):
+    tools.test_results = [
+        evaluation(failures=1),
+        evaluation(successes=0, execution_error="runner unavailable"),
+    ]
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert len(tools.test_repairs) == 1
+    assert output.metadata["test_validation"]["status"] == "no_executable_tests"
+
+
+@pytest.mark.parametrize("workspace", ["validation-0", "repair-1"])
+def test_validation_workspace_error_keeps_compilation_only_output(
+    oracle, tools, monkeypatch, workspace
+):
+    copy = STAGE.copy_project
+
+    def unavailable(source, destination):
+        if destination.name == workspace:
+            raise OSError("validation workspace unavailable")
+        copy(source, destination)
+
+    monkeypatch.setattr(STAGE, "copy_project", unavailable)
+    tools.test_results = [evaluation(failures=1)]
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert not tools.test_repairs
+    assert tools_finished(output.outputs.rust_project)
+
+
+def test_unusable_validation_directory_never_modifies_input(oracle, tools, monkeypatch):
+    build = tools.build_crat
+
+    def preexisting(config, log):
+        (oracle.framework.workdir / "test-validation").symlink_to(
+            oracle.inputs.rust_project, target_is_directory=True
+        )
+        return build(config, log)
+
+    monkeypatch.setattr(STAGE, "build_crat", preexisting)
+    output = STAGE.run_stage(oracle)
+    assert output.status == "success", output.error
+    assert output.metadata["test_validation"]["status"] == "no_executable_tests"
+    assert not tools.test_calls and not tools.test_repairs
+    assert not (oracle.inputs.rust_project / "validation-0").exists()
+
+
+def test_exhausted_stage_budget_skips_validation_copying(oracle, tools, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(STAGE.time, "monotonic", lambda: now[0])
+
+    def build_crat(config, log):
+        now[0] = 30.0
+        return tools.build_crat(config, log)
+
+    monkeypatch.setattr(STAGE, "build_crat", build_crat)
+    output = STAGE.run_stage(
+        replace(oracle, framework=replace(oracle.framework, timeout_s=20))
+    )
+    assert output.status == "success", output.error
+    assert not tools.test_calls and not tools.test_repairs
+    assert not (oracle.framework.workdir / "test-validation/validation-0").exists()
+    assert output.metadata["test_validation"]["status"] == "no_executable_tests"

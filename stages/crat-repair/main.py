@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -12,7 +13,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import tomllib
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,10 +67,13 @@ DEFAULTS = {
     "agent": "opencode",
     "model": None,
     "max_repair_attempts": 3,
+    "max_validation_repairs": 3,
     "crat_timeout_s": 600,
     "build_timeout_s": 600,
     "agent_timeout_s": 900,
+    "validation_timeout_s": 600,
     "crat_dir": "../crat",
+    "testinfra_dir": "../test-infrastructure",
 }
 
 
@@ -86,10 +93,52 @@ class CommandResult:
         return f"stdout:\n{self.stdout}\nstderr:\n{self.stderr}"
 
 
+@contextmanager
+def reap_workers() -> Iterator[Callable[[], None]]:
+    # testinfra starts Cargo and vector workers in separate process groups.
+    libc = ctypes.CDLL(None) if sys.platform.startswith("linux") else None
+    previous = ctypes.c_int()
+    adopting = (
+        libc is not None
+        and libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+        and libc.prctl(36, 1, 0, 0, 0) == 0
+    )
+
+    def children() -> set[int]:
+        result: set[int] = set()
+        for task in Path("/proc/self/task").iterdir():
+            with suppress(FileNotFoundError):
+                result.update(
+                    int(pid) for pid in (task / "children").read_text().split()
+                )
+        return result
+
+    before = children() if adopting else set()
+
+    def reap() -> None:
+        if adopting:
+            while adopted := children() - before:
+                for pid in adopted:
+                    with suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
+                for pid in adopted:
+                    with suppress(ChildProcessError):
+                        os.waitpid(pid, 0)
+
+    try:
+        yield reap
+    finally:
+        if adopting:
+            try:
+                reap()
+            finally:
+                libc.prctl(36, previous.value, 0, 0, 0)
+
+
 def run_command(
     command: list[str], *, cwd: Path, env: dict[str, str], timeout_s: float, log: Path
 ) -> CommandResult:
-    with log.open("a", encoding="utf-8") as stream:
+    with reap_workers() as reap, log.open("a", encoding="utf-8") as stream:
         stream.write(f"$ {shlex.join(command)}\n")
         stream.flush()
         with subprocess.Popen(
@@ -107,6 +156,8 @@ def run_command(
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                process.wait()
+                reap()
 
             def cancel(signum: int, _frame: Any) -> None:
                 kill_group()
@@ -151,17 +202,26 @@ def resolve_config(raw: dict[str, Any]) -> dict[str, Any]:
     attempts = config["max_repair_attempts"]
     if type(attempts) is not int or attempts < 1:
         raise StageFailure("max_repair_attempts must be a positive integer")
-    for name in ("crat_timeout_s", "build_timeout_s", "agent_timeout_s"):
+    attempts = config["max_validation_repairs"]
+    if type(attempts) is not int or attempts < 0:
+        raise StageFailure("max_validation_repairs must be a nonnegative integer")
+    for name in (
+        "crat_timeout_s",
+        "build_timeout_s",
+        "agent_timeout_s",
+        "validation_timeout_s",
+    ):
         value = config[name]
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise StageFailure(f"{name} must be a finite positive number")
-    for name in ("agent", "crat_dir", "model"):
+    for name in ("agent", "crat_dir", "testinfra_dir", "model"):
         value = config[name]
         if name == "model" and value is None:
             continue
         if not isinstance(value, str) or not value.strip():
             raise StageFailure(f"{name} must be a nonempty string")
-    config["crat_dir"] = str((STAGE_DIR / config["crat_dir"]).resolve())
+    for name in ("crat_dir", "testinfra_dir"):
+        config[name] = str((STAGE_DIR / config[name]).resolve())
     return config
 
 
@@ -241,13 +301,291 @@ def build_crat(config: dict[str, Any], log: Path) -> tuple[Path, dict[str, str]]
 
 
 def copy_project(source: Path, destination: Path) -> None:
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        root = Path(directory)
+        return {
+            name
+            for name in names
+            if (
+                name == "target"
+                and root == source
+                and (source / "Cargo.toml").is_file()
+            )
+            or (
+                (root / name).is_symlink()
+                and (root / name).resolve() in (root, *root.parents)
+            )
+        }
+
     shutil.copytree(
         source,
         destination,
-        ignore=lambda path, names: (
-            {"target"} if Path(path) == source and "target" in names else set()
-        ),
+        ignore=ignore,
     )
+
+
+def oracle_paths(source: Path) -> tuple[list[Path], Path | None, str | None]:
+    if not (source / "testinfra.toml").is_file():
+        return [], None, None
+    paths = list(
+        map(
+            Path,
+            (
+                "testinfra.toml",
+                "tests",
+                "test_vectors",
+                "runner",
+                ".scripts",
+                ".config/nextest.toml",
+            ),
+        )
+    )
+    try:
+        manifest = tomllib.loads((source / "testinfra.toml").read_text())
+        runner = manifest.get("runner") or manifest.get("cando2", {}).get("runner")
+        if not runner:
+            return paths, None, None
+        declared = Path(os.path.abspath(source / runner))
+        relative = declared.relative_to(source)
+        declared.resolve().relative_to(source)
+        if not relative.parts:
+            raise ValueError("runner must be inside the project")
+        if not declared.is_dir() or not (declared / "Cargo.toml").is_file():
+            raise ValueError("runner must be an existing Cargo project directory")
+        if not any(relative == p or p in relative.parents for p in paths):
+            paths.append(relative)
+        return paths, relative, None
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        return paths, None, str(exc)
+
+
+def restore_paths(source: Path, project: Path, paths: list[Path]) -> None:
+    def remove(path: Path) -> None:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+    for relative in paths:
+        for parent in reversed(relative.parents):
+            target = project / parent
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                remove(target)
+                target.mkdir()
+        target, original = project / relative, source / relative
+        remove(target)
+        if original.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if original.is_dir():
+                copy_project(original, target)
+            else:
+                shutil.copy2(original, target)
+
+
+def evaluate_tests(payload: Any) -> tuple[str, str]:
+    if not isinstance(payload, dict):
+        return "no_executable_tests", "invalid_runner_output"
+    counts = ("successes_count", "failures_count", "errors_count", "skipped_count")
+    if (
+        any(
+            type(payload.get(name)) is not int or payload[name] < 0
+            for name in ("tests_count", *counts)
+        )
+        or sum(payload[name] for name in counts) != payload["tests_count"]
+    ):
+        return "no_executable_tests", "invalid_runner_output"
+    if payload.get("compiler_errors") or payload.get("status") == "build_failed":
+        return "no_executable_tests", "test_build_failed"
+    if payload.get("execution_error") or payload.get("status") == "harness_error":
+        return "no_executable_tests", "test_execution_failed"
+    if not sum(payload[name] for name in counts[:3]):
+        return "no_executable_tests", "no_tests_executed"
+    verifications = payload.get("verifications", [])
+    if not isinstance(verifications, list):
+        return "no_executable_tests", "invalid_runner_output"
+    verified = [
+        evaluate_tests(v.get("result") if isinstance(v, dict) else None)
+        for v in verifications
+    ]
+    for outcome in verified:
+        if outcome[0] == "no_executable_tests":
+            return outcome
+    if payload.get("status") == "failed" and payload.get("passed") is False:
+        return "validation_failed", "tests_failed"
+    if (
+        payload.get("status") == "ok"
+        and payload.get("passed") is True
+        and payload["failures_count"] == payload["errors_count"] == 0
+        and all(outcome[0] == "validation_succeeded" for outcome in verified)
+    ):
+        return "validation_succeeded", "all_tests_passed"
+    return "no_executable_tests", "invalid_runner_output"
+
+
+def validate_final_project(
+    project: Path,
+    *,
+    config: dict[str, Any],
+    work: Path,
+    artifacts: Path,
+    env: dict[str, str],
+    paths: list[Path],
+    runner: Path | None,
+    oracle_error: str | None,
+    target_args: tuple[str, ...],
+    repair: Callable[[Path, str, Path, float], dict[str, Any]],
+    deadline: float | None,
+) -> tuple[Path, dict[str, Any]]:
+    report: dict[str, Any] = {
+        "status": "no_manifest",
+        "reason": "testinfra_manifest_missing",
+        "validation_runs": 0,
+        "repair_attempts": 0,
+        "repair_limit": config["max_validation_repairs"],
+        "attempts": [],
+    }
+    if not paths:
+        return project, report
+    if oracle_error:
+        report.update(
+            status="no_executable_tests", reason="invalid_manifest", error=oracle_error
+        )
+        return project, report
+    scratch = work / "test-validation"
+    try:
+        scratch.mkdir()
+    except OSError as exc:
+        report.update(
+            status="no_executable_tests", reason="workspace_unavailable", error=str(exc)
+        )
+        return project, report
+    log = artifacts / "commands.log"
+
+    def timeout(limit: float) -> float:
+        remaining = (
+            limit if deadline is None else min(limit, deadline - time.monotonic())
+        )
+        if remaining <= 0:
+            raise TimeoutError("stage time budget exhausted during test validation")
+        return remaining
+
+    def test(repaired: dict[str, Any] | None = None) -> None:
+        index = report["validation_runs"]
+        attempt: dict[str, Any] = {"repair": repaired}
+        try:
+            timeout(config["validation_timeout_s"])
+            tested = scratch / f"validation-{index}"
+            copy_project(project, tested)
+            command = [
+                "uv",
+                "run",
+                "--directory",
+                config["testinfra_dir"],
+                "testinfra",
+                "run",
+                "--project-dir",
+                str(tested),
+                "--json",
+                "--no-auto-complete",
+                "--build-timeout",
+                str(config["build_timeout_s"]),
+            ]
+            if runner is not None:
+                command += ["--runner", str(tested / runner)]
+            result = run_command(
+                command,
+                cwd=tested,
+                env=env,
+                timeout_s=timeout(config["validation_timeout_s"]),
+                log=log,
+            )
+            attempt.update(returncode=result.returncode, timed_out=result.timed_out)
+            payload = json.loads(result.stdout)
+            status, reason = evaluate_tests(payload)
+            if (
+                result.timed_out
+                or result.returncode not in (0, 1)
+                or (result.returncode and status == "validation_succeeded")
+            ):
+                status, reason = "no_executable_tests", "runner_failed"
+            attempt.update(
+                status=status, reason=reason, results=payload, stderr=result.stderr
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            attempt.update(
+                status="no_executable_tests", reason="runner_error", error=str(exc)
+            )
+        report.update(status=attempt["status"], reason=attempt["reason"])
+        report["validation_runs"] += 1
+        report["attempts"].append(attempt)
+
+    test()
+    for index in range(1, config["max_validation_repairs"] + 1):
+        if report["status"] != "validation_failed":
+            break
+        try:
+            timeout(config["agent_timeout_s"])
+            candidate = scratch / f"repair-{index}"
+            copy_project(project, candidate)
+            agent_timeout = timeout(config["agent_timeout_s"])
+        except TimeoutError:
+            report["reason"] = "stage_time_budget_exhausted"
+            break
+        except OSError as exc:
+            report.update(reason="repair_workspace_unavailable", error=str(exc))
+            break
+        prompt = f"""Repair failing tests in this Rust project after all Crat passes.
+Preserve the transformations, existing interfaces, and observable behavior.
+Only edit implementation files and necessary Cargo build configuration.
+Do not edit tests, test vectors, expected outputs, runners, config.toml, testinfra.toml,
+proctor.toml, Crat, pipeline tools, or input projects. Do not weaken or bypass tests,
+replace implementations with stubs, disable code, or undo the passes.
+Verify with `cargo build --quiet`. The stage independently rebuilds the project and
+runs the original test suite after this invocation. Do not complete expected outputs.
+This is final test repair {index} of {config["max_validation_repairs"]}.
+
+Latest independent validation and build diagnostics:
+{json.dumps(report["attempts"][-1], indent=2)}
+"""
+        report["repair_attempts"] = index
+        repaired: dict[str, Any] = {}
+        try:
+            agent_result = repair(
+                candidate, prompt, artifacts / f"test-repair-{index}", agent_timeout
+            )
+            repaired["agent"] = agent_result
+        except Exception as exc:
+            repaired["agent_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            restore_paths(
+                project, candidate, [*paths, Path("config.toml"), Path("proctor.toml")]
+            )
+            for args in ((), target_args):
+                result = run_command(
+                    ["cargo", "build", "--quiet", *args],
+                    cwd=candidate,
+                    env=env,
+                    timeout_s=timeout(config["build_timeout_s"]),
+                    log=log,
+                )
+                repaired.update(
+                    build_returncode=result.returncode,
+                    build_diagnostics=result.diagnostics,
+                )
+                if result.returncode or result.timed_out:
+                    break
+            repaired["rolled_back"] = bool(result.returncode or result.timed_out)
+        except Exception as exc:
+            repaired.update(
+                rolled_back=True, build_error=f"{type(exc).__name__}: {exc}"
+            )
+        if not repaired["rolled_back"]:
+            project = candidate
+        test(repaired)
+    else:
+        if report["status"] == "validation_failed":
+            report["reason"] = "repair_limit_reached"
+    return project, report
 
 
 def repair_prompt(plugin: str, result: CommandResult) -> str:
@@ -366,8 +704,15 @@ def write_manifest(
 
 
 def run_stage(stage_input: StageInput) -> StageOutput:
+    stage_timeout = stage_input.framework.timeout_s
+    deadline = (
+        time.monotonic() + stage_timeout - min(5, stage_timeout / 10)
+        if stage_timeout
+        else None
+    )
     config: dict[str, Any] = {}
     records: list[dict[str, Any]] = []
+    validation: dict[str, Any] | None = None
     usage = {
         "calls": 0,
         "input_tokens": 0,
@@ -431,7 +776,7 @@ def run_stage(stage_input: StageInput) -> StageOutput:
         artifacts_path.mkdir(parents=True, exist_ok=True)
         if any(
             (artifacts_path / name).exists() or (artifacts_path / name).is_symlink()
-            for name in ("commands.log", "statistics.json")
+            for name in ("commands.log", "statistics.json", "test-validation.json")
         ):
             raise StageFailure("stage artifacts already exist")
         artifacts = artifacts_path
@@ -441,7 +786,9 @@ def run_stage(stage_input: StageInput) -> StageOutput:
         (work / "cargo-target").mkdir()
         env = cargo_environment(work / "cargo-target")
         current = work / "initial" / "project"
+        paths, runner, oracle_error = oracle_paths(source)
         copy_project(source, current)
+        original = current
 
         def build(project: Path, *target_args: str) -> CommandResult:
             result = run_command(
@@ -454,6 +801,28 @@ def run_stage(stage_input: StageInput) -> StageOutput:
             if result.timed_out:
                 raise StageFailure("Cargo build timed out")
             return result
+
+        def repair(
+            project: Path, prompt: str, directory: Path, timeout_s: float
+        ) -> dict[str, Any]:
+            usage["calls"] += 1
+            agent_result = run_agent(
+                {**config, "agent_timeout_s": timeout_s},
+                project,
+                prompt,
+                directory,
+                env,
+            )
+            metrics = agent_result.get("metrics", {})
+            for output_key, metric_key in (
+                ("input_tokens", "input_tokens"),
+                ("cached_input_tokens", "cached_read_tokens"),
+                ("output_tokens", "output_tokens"),
+                ("reasoning_tokens", "reasoning_tokens"),
+                ("cost_usd", "cost_usd"),
+            ):
+                usage[output_key] += metrics.get(metric_key, 0) or 0
+            return agent_result
 
         require_success(build(current), "initial Cargo build")
         binary, crat_env = build_crat(config, log)
@@ -493,31 +862,22 @@ def run_stage(stage_input: StageInput) -> StageOutput:
                 continue
             if not candidate.is_dir():
                 raise StageFailure(f"Crat pass {plugin} produced no project")
+            restore_paths(original, candidate, paths)
             result = build(candidate)
             original_config = (candidate / "config.toml").read_bytes()
             for attempt in range(1, config["max_repair_attempts"] + 1):
                 if result.returncode == 0:
                     break
                 record["repair_calls"] += 1
-                usage["calls"] += 1
-                agent_result = run_agent(
-                    config,
+                repair(
                     candidate,
                     repair_prompt(plugin, result),
                     artifacts / f"{plugin}-repair-{attempt}",
-                    env,
+                    config["agent_timeout_s"],
                 )
-                metrics = agent_result.get("metrics", {})
-                for output_key, metric_key in (
-                    ("input_tokens", "input_tokens"),
-                    ("cached_input_tokens", "cached_read_tokens"),
-                    ("output_tokens", "output_tokens"),
-                    ("reasoning_tokens", "reasoning_tokens"),
-                    ("cost_usd", "cost_usd"),
-                ):
-                    usage[output_key] += metrics.get(metric_key, 0) or 0
                 if (candidate / "config.toml").read_bytes() != original_config:
                     raise StageFailure("repair agent changed protected config.toml")
+                restore_paths(original, candidate, paths)
                 result = build(candidate)
             require_success(
                 result, f"Cargo build after {plugin} ({record['repair_calls']} repairs)"
@@ -537,6 +897,22 @@ def run_stage(stage_input: StageInput) -> StageOutput:
         binary_name = project_config.get("bin", {}).get("name")
         target_args = ("--bin", binary_name) if binary_name else ("--lib",)
         require_success(build(current, *target_args), "final declared target build")
+        current, validation = validate_final_project(
+            current,
+            config=config,
+            work=work,
+            artifacts=artifacts,
+            env=env,
+            paths=paths,
+            runner=runner,
+            oracle_error=oracle_error,
+            target_args=target_args,
+            repair=repair,
+            deadline=deadline,
+        )
+        (artifacts / "test-validation.json").write_text(
+            json.dumps(validation, indent=2) + "\n", encoding="utf-8"
+        )
         try:
             copy_project(current, destination)
         except Exception:
@@ -550,12 +926,20 @@ def run_stage(stage_input: StageInput) -> StageOutput:
         "passes": len(records),
         "skipped_passes": sum(r["status"] == "skipped" for r in records),
         "repair_calls": usage["calls"],
+        "compilation_repair_calls": sum(r["repair_calls"] for r in records),
+        "validation_repair_calls": validation["repair_attempts"] if validation else 0,
     }
     if artifacts is not None:
         try:
             (artifacts / "statistics.json").write_text(
                 json.dumps(
-                    {"passes": records, "usage": usage, "error": error}, indent=2
+                    {
+                        "passes": records,
+                        "test_validation": validation,
+                        "usage": usage,
+                        "error": error,
+                    },
+                    indent=2,
                 )
                 + "\n",
                 encoding="utf-8",
@@ -575,12 +959,23 @@ def run_stage(stage_input: StageInput) -> StageOutput:
         if usage["calls"] and config.get("model")
         else (),
         usage=UsageSummary(**usage),
-        prompts=(PromptUse(id="crat_compile_repair", version=1),)
-        if usage["calls"]
-        else (),
+        prompts=tuple(
+            PromptUse(id=name, version=1)
+            for name, calls in (
+                ("crat_compile_repair", metrics["compilation_repair_calls"]),
+                ("crat_test_repair", metrics["validation_repair_calls"]),
+            )
+            if calls
+        ),
         metrics=metrics,
-        logs=("commands.log", "statistics.json") if artifacts else (),
-        metadata={"passes": records},
+        logs=(
+            "commands.log",
+            "statistics.json",
+            *(("test-validation.json",) if validation else ()),
+        )
+        if artifacts
+        else (),
+        metadata={"passes": records, "test_validation": validation},
         error=error,
     )
 
