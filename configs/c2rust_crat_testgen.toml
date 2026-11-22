@@ -1,7 +1,7 @@
 # Pipeline: C source -> c2rust -> CRAT -> test generation.
 
 [run]
-provides = ["c_project"]
+provides = ["c_project", "rule_set"]
 
 [testing]
 after_each_stage = false
@@ -38,6 +38,6 @@ timeout_s = 3600
 command = "generate"
 strategy = "cando2"
 agent = "opencode"
-model = "opencode/beam-free"
+model = "openrouter/openai/gpt-6.1-sol"
 attempts = 3
 min_coverage = 80.0

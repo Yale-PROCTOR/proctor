@@ -1,0 +1,21 @@
+[run]
+provides = ["c_project", "rule_set"]
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = ["crat_repair"]
+
+[stages.crat_repair]
+uses = "stages/crat-repair"
+timeout_s = 14400
+
+[stages.crat_repair.config]
+enable_interface = true
+agent = "opencode"
+model = "openrouter/openai/gpt-6.1-sol"
+max_repair_attempts = 3
+crat_timeout_s = 3600
+build_timeout_s = 600
+agent_timeout_s = 3600

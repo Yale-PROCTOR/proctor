@@ -1,0 +1,17 @@
+[run]
+provides = ["c_project", "rule_set"]
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = ["discipline_repair"]
+
+[stages.discipline_repair]
+uses = "stages/discipline-repair"
+timeout_s = 3600
+
+[stages.discipline_repair.config]
+agent = "opencode"
+model = "openrouter/openai/gpt-6.1-sol"
+max_attempts_per_target = 3
