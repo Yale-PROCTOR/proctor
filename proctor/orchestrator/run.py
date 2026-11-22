@@ -246,7 +246,12 @@ def execute_run(
         stage_run_dir = run_dir / "stages" / f"{index:02d}-{stage_id}"
 
         fingerprint = stage_fingerprint(validated.resolved.stage_dir)
-        cfg_hash = config_hash(entry.config, validated.resolved.llm, entry.timeout_s)
+        cfg_hash = config_hash(
+            entry.config,
+            validated.resolved.llm,
+            entry.timeout_s,
+            no_fail=config.run.no_fail,
+        )
         key = chain_key(stage_id, fingerprint, cfg_hash, upstream_key)
         upstream_key = key
 
@@ -307,6 +312,7 @@ def execute_run(
                 prompt_library=prompts_dir if prompts_dir.is_dir() else None,
                 workdir=stage_run_dir / "work",
                 timeout_s=entry.timeout_s,
+                no_fail=config.run.no_fail,
             ),
         )
         input_file = stage_run_dir / "stage_input.json"

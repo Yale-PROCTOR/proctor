@@ -42,7 +42,8 @@
             "max_tokens": { "type": ["integer", "null"] }
           }
         },
-        "timeout_s": { "type": ["integer", "null"] }
+        "timeout_s": { "type": ["integer", "null"] },
+        "no_fail": { "type": "boolean", "default": false }
       }
     }
   }

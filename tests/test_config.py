@@ -77,6 +77,25 @@ def test_pipeline_config_parses() -> None:
     assert config.stages["b"].llm == {"model": "override"}
 
 
+def test_no_fail_defaults_to_false() -> None:
+    assert PipelineConfig.from_dict(_pipeline_dict()).run.no_fail is False
+
+
+@pytest.mark.parametrize("no_fail", [False, True])
+def test_global_no_fail(no_fail: bool) -> None:
+    data = _pipeline_dict()
+    apply_override(data, f"run.no_fail={str(no_fail).lower()}")
+    assert PipelineConfig.from_dict(data).run.no_fail is no_fail
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, None, [], {}])
+def test_no_fail_requires_a_boolean(value: object) -> None:
+    data = _pipeline_dict()
+    data["run"] = {"no_fail": value}
+    with pytest.raises(ConfigError, match="no_fail must be a boolean"):
+        PipelineConfig.from_dict(data)
+
+
 def test_order_referencing_undefined_stage_refused() -> None:
     data = _pipeline_dict()
     assert isinstance(data["pipeline"], dict)

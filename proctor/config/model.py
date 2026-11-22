@@ -28,6 +28,7 @@ class RunSettings:
     on_stage_failure: OnStageFailure = "stop"
     keep_intermediates: bool = True
     provides: tuple[str, ...] = DEFAULT_PROVIDES
+    no_fail: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunSettings:
@@ -43,6 +44,9 @@ class RunSettings:
         keep_intermediates = data.get("keep_intermediates", True)
         if not isinstance(keep_intermediates, bool):
             raise ConfigError("[run] keep_intermediates must be a boolean")
+        no_fail = data.get("no_fail", False)
+        if not isinstance(no_fail, bool):
+            raise ConfigError("[run] no_fail must be a boolean")
         provides_raw = data.get("provides", list(DEFAULT_PROVIDES))
         if not isinstance(provides_raw, list) or not all(
             isinstance(kind, str) for kind in provides_raw
@@ -59,6 +63,7 @@ class RunSettings:
             on_stage_failure=on_stage_failure,
             keep_intermediates=keep_intermediates,
             provides=tuple(provides_raw),
+            no_fail=no_fail,
         )
 
 

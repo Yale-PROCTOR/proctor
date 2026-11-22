@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from proctor.config.model import PipelineConfig
 from proctor.contracts.stage_io import StageInput
 from proctor.orchestrator.events import read_events
@@ -17,10 +19,15 @@ def _config(
     stage_configs: dict[str, dict[str, Any]],
     *,
     on_failure: str = "stop",
+    no_fail: bool = False,
 ) -> PipelineConfig:
     return PipelineConfig.from_dict(
         {
-            "run": {"provides": ["rust_project"], "on_stage_failure": on_failure},
+            "run": {
+                "provides": ["rust_project"],
+                "on_stage_failure": on_failure,
+                "no_fail": no_fail,
+            },
             "pipeline": {"order": list(stage_configs)},
             "stages": {
                 sid: {"uses": str(FAKE), "config": cfg}
@@ -108,8 +115,9 @@ def test_two_stage_chain(tmp_path: Path) -> None:
     assert events[0] == "run_started" and events[-1] == "run_finished"
 
 
-def test_failure_stops_pipeline(tmp_path: Path) -> None:
-    config = _config({"a": {"behavior": "fail"}, "b": {}})
+@pytest.mark.parametrize("no_fail", [False, True])
+def test_failure_stops_pipeline(tmp_path: Path, no_fail: bool) -> None:
+    config = _config({"a": {"behavior": "fail"}, "b": {}}, no_fail=no_fail)
     result = _start(config, tmp_path, _source_project(tmp_path))
     assert not result.ok
     assert [s.status for s in result.stages] == ["failure"]
@@ -117,9 +125,12 @@ def test_failure_stops_pipeline(tmp_path: Path) -> None:
     assert not (result.run_dir / "stages" / "01-b").exists()
 
 
-def test_failure_continue_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("no_fail", [False, True])
+def test_failure_continue_policy(tmp_path: Path, no_fail: bool) -> None:
     config = _config(
-        {"a": {"behavior": "fail"}, "b": {"marker": "B"}}, on_failure="continue"
+        {"a": {"behavior": "fail"}, "b": {"marker": "B"}},
+        on_failure="continue",
+        no_fail=no_fail,
     )
     result = _start(config, tmp_path, _source_project(tmp_path))
     assert [s.status for s in result.stages] == ["failure", "success"]
@@ -137,10 +148,11 @@ def test_skipped_forwards_input(tmp_path: Path) -> None:
     assert envelope.inputs.rust_project == result.run_dir / "inputs" / "rust"
 
 
-def test_timeout_kills_stage(tmp_path: Path) -> None:
+@pytest.mark.parametrize("no_fail", [False, True])
+def test_timeout_kills_stage(tmp_path: Path, no_fail: bool) -> None:
     config = PipelineConfig.from_dict(
         {
-            "run": {"provides": ["rust_project"]},
+            "run": {"provides": ["rust_project"], "no_fail": no_fail},
             "pipeline": {"order": ["slow"]},
             "stages": {
                 "slow": {
@@ -157,11 +169,51 @@ def test_timeout_kills_stage(tmp_path: Path) -> None:
     assert result.stages[0].duration_s < 15
 
 
-def test_missing_output_is_contract_violation(tmp_path: Path) -> None:
-    config = _config({"a": {"behavior": "bad_output"}})
+@pytest.mark.parametrize("no_fail", [False, True])
+def test_missing_output_is_contract_violation(tmp_path: Path, no_fail: bool) -> None:
+    config = _config({"a": {"behavior": "bad_output"}}, no_fail=no_fail)
     result = _start(config, tmp_path, _source_project(tmp_path))
     assert not result.ok
     assert "no valid stage_output.json" in (result.stages[0].error or "")
+
+
+@pytest.mark.parametrize("no_fail", [False, True])
+def test_global_no_fail_reaches_every_stage(tmp_path: Path, no_fail: bool) -> None:
+    config = _config({"a": {}, "b": {}}, no_fail=no_fail)
+    result = _start(config, tmp_path, _source_project(tmp_path))
+    assert result.ok
+    for directory in sorted((result.run_dir / "stages").iterdir()):
+        stage_input = StageInput.read(directory / "stage_input.json")
+        assert stage_input.framework.no_fail is no_fail
+        assert "no_fail" not in stage_input.config
+
+
+@pytest.mark.parametrize("initial", [False, True])
+def test_resume_reruns_skipped_stages_when_no_fail_changes(
+    tmp_path: Path, initial: bool
+) -> None:
+    config = _config({"a": {"behavior": "skip"}, "b": {}}, no_fail=initial)
+    first = _start(config, tmp_path, _source_project(tmp_path))
+    assert first.ok
+    assert [stage.status for stage in first.stages] == ["skipped", "success"]
+
+    unchanged = resume_run(first.run_dir, tmp_path)
+    assert [stage.status for stage in unchanged.stages] == ["reused", "reused"]
+
+    run_toml = first.run_dir / "run.toml"
+    run_toml.write_text(
+        run_toml.read_text().replace(
+            f"no_fail = {str(initial).lower()}",
+            f"no_fail = {str(not initial).lower()}",
+        )
+    )
+    changed = resume_run(first.run_dir, tmp_path)
+    assert changed.ok
+    assert [stage.status for stage in changed.stages] == ["skipped", "success"]
+    stage_input = StageInput.read(
+        first.run_dir / "stages" / "00-a" / "stage_input.json"
+    )
+    assert stage_input.framework.no_fail is not initial
 
 
 def _markers(run_dir: Path) -> dict[str, str]:

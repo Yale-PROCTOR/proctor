@@ -65,6 +65,30 @@ def test_stage_input_round_trip(tmp_path: Path) -> None:
     assert loaded == original
 
 
+def test_old_stage_input_defaults_no_fail_to_false() -> None:
+    payload = sample_input().to_dict()
+    del payload["framework"]["no_fail"]
+    assert StageInput.from_dict(payload).framework.no_fail is False
+
+
+@pytest.mark.parametrize("no_fail", [False, True])
+def test_stage_input_preserves_no_fail(tmp_path: Path, no_fail: bool) -> None:
+    payload = sample_input().to_dict()
+    payload["framework"]["no_fail"] = no_fail
+    original = StageInput.from_dict(payload)
+    path = tmp_path / "stage_input.json"
+    original.write(path)
+    assert StageInput.read(path).framework.no_fail is no_fail
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, None, [], {}])
+def test_stage_input_rejects_non_boolean_no_fail(value: object) -> None:
+    payload = sample_input().to_dict()
+    payload["framework"]["no_fail"] = value
+    with pytest.raises(ContractError, match="no_fail.*boolean"):
+        StageInput.from_dict(payload)
+
+
 def test_stage_output_round_trip(tmp_path: Path) -> None:
     original = sample_output()
     original.write(tmp_path / "stage_output.json")

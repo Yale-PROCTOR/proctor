@@ -80,10 +80,14 @@ def stage_fingerprint(stage_dir: Path) -> str:
 
 
 def config_hash(
-    config: dict[str, Any], llm: dict[str, Any], timeout_s: int | None
+    config: dict[str, Any],
+    llm: dict[str, Any],
+    timeout_s: int | None,
+    *,
+    no_fail: bool = False,
 ) -> str:
     canonical = json.dumps(
-        {"config": config, "llm": llm, "timeout_s": timeout_s},
+        {"config": config, "llm": llm, "timeout_s": timeout_s, "no_fail": no_fail},
         sort_keys=True,
         separators=(",", ":"),
     )

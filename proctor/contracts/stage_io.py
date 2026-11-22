@@ -182,9 +182,13 @@ class FrameworkSettings:
     workdir: Path | None = None
     budget: Budget = field(default_factory=Budget)
     timeout_s: int | None = None
+    no_fail: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FrameworkSettings:
+        no_fail = data.get("no_fail", False)
+        if not isinstance(no_fail, bool):
+            raise ContractError("'no_fail' must be a boolean")
         return cls(
             llm=_obj(data, "llm"),
             usage_log=_opt_path(data, "usage_log"),
@@ -192,6 +196,7 @@ class FrameworkSettings:
             workdir=_opt_path(data, "workdir"),
             budget=Budget.from_dict(_obj(data, "budget")),
             timeout_s=_opt_int(data, "timeout_s"),
+            no_fail=no_fail,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -202,6 +207,7 @@ class FrameworkSettings:
             "workdir": _path_str(self.workdir),
             "budget": self.budget.to_dict(),
             "timeout_s": self.timeout_s,
+            "no_fail": self.no_fail,
         }
 
 

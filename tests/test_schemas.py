@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 from jsonschema import Draft202012Validator
 
 from tests.test_stage_io import sample_input, sample_output
@@ -23,6 +24,20 @@ def _errors(validator: Draft202012Validator, payload: dict[str, Any]) -> list[st
 
 def test_sample_input_conforms() -> None:
     assert _errors(_validator("stage_input.v1.json"), sample_input().to_dict()) == []
+
+
+@pytest.mark.parametrize("no_fail", [False, True])
+def test_input_schema_accepts_no_fail(no_fail: bool) -> None:
+    payload = sample_input().to_dict()
+    payload["framework"]["no_fail"] = no_fail
+    assert _errors(_validator("stage_input.v1.json"), payload) == []
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_input_schema_rejects_non_boolean_no_fail(value: object) -> None:
+    payload = sample_input().to_dict()
+    payload["framework"]["no_fail"] = value
+    assert _errors(_validator("stage_input.v1.json"), payload)
 
 
 def test_sample_output_conforms() -> None:
