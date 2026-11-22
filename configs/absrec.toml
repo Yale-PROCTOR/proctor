@@ -1,5 +1,6 @@
 [run]
 provides = ["c_project", "rule_set"]
+no_fail = true
 
 [testing]
 after_each_stage = false
