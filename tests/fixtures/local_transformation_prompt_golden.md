@@ -1,4 +1,5 @@
-You are transforming unsafe Rust functions generated from C.
+You are transforming Rust functions in a project translated from C. Preserve
+each target skeleton's function safety.
 
 The source code is the original implementation. The target skeleton defines
 the transformation goal. A dependency's source signature is its signature

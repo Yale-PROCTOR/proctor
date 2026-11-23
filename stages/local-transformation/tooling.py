@@ -497,11 +497,15 @@ class CratTools:
             output,
         )
 
-    def normalize(self, library_source: Path, output: Path) -> None:
+    def normalize(
+        self, library_source: Path, output: Path, *, frozen: Path | None = None
+    ) -> None:
         assert self.crat_tool is not None
         self._output_operation(
             "crat-tool normalize-safety",
-            normalize_safety_command(self.crat_tool, library_source, output),
+            normalize_safety_command(
+                self.crat_tool, library_source, output, frozen=frozen
+            ),
             output,
         )
 

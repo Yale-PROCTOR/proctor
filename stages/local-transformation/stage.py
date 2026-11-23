@@ -3022,7 +3022,7 @@ def run_stage(
         records_by_id = {record.id: record for record in records}
 
         normalized = workdir / "normalized.rs"
-        active_tools.normalize(library_source, normalized)
+        active_tools.normalize(library_source, normalized, frozen=frozen)
         os.replace(normalized, library_source)
         rate = stage_input.framework.llm.get("rate_limit", {})
         rpm = rate.get("requests_per_minute") if isinstance(rate, dict) else None

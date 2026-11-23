@@ -275,15 +275,17 @@ def merge_observations_command(
 
 
 def normalize_safety_command(
-    crat_tool: Path, library_source: Path, output: Path
+    crat_tool: Path, library_source: Path, output: Path, *, frozen: Path | None = None
 ) -> list[str]:
-    return [
+    command = [
         str(crat_tool),
         "normalize-safety",
         "--output",
         str(output),
-        str(library_source),
     ]
+    if frozen is not None:
+        command.extend(("--frozen", str(frozen)))
+    return [*command, str(library_source)]
 
 
 def validate_command(crat_tool: Path, request: Path, response: Path) -> list[str]:

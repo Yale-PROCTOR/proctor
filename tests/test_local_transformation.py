@@ -2648,7 +2648,7 @@ def test_version_1_prompt_has_exact_hierarchy_and_safe_cast_guidance():
     assert rendered.content_hash == hashlib.sha256(expected.encode()).hexdigest()
     assert (
         rendered.content_hash
-        == "f6229988fa5c794fbbb98f4ce6cd79fdd30c2e77dd43151f72289a554f8716c4"
+        == "a64b80f82b7a46744ac26cd5d8b72766d9b97d115a2fcc6a5b2f72fad01a3494"
     )
     assert rendered.version == 1
     assert XJ_SCANF_GUIDANCE_MARKER not in rendered.text
@@ -2904,12 +2904,17 @@ def test_command_builders_use_exact_four_output_and_extract_argv():
         "/work/001.json",
     ]
     assert normalize_safety_command(
-        tool, Path("/work/current/lib.rs"), Path("/work/normalized.rs")
+        tool,
+        Path("/work/current/lib.rs"),
+        Path("/work/normalized.rs"),
+        frozen=Path("/work/frozen.json"),
     ) == [
         "/tools/crat-tool",
         "normalize-safety",
         "--output",
         "/work/normalized.rs",
+        "--frozen",
+        "/work/frozen.json",
         "/work/current/lib.rs",
     ]
     assert validate_command(
@@ -3691,7 +3696,8 @@ class FakeTools:
             encoding="utf-8",
         )
 
-    def normalize(self, library, output):
+    def normalize(self, library, output, *, frozen):
+        assert frozen.is_file()
         self.events.append(("normalize", library, output))
         output.write_text(self.normalized, encoding="utf-8")
 
