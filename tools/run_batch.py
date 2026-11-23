@@ -29,7 +29,7 @@ def _source_arguments(run: Path, stage: str) -> list[str]:
         rust = run / (
             output["outputs"].get("rust_project") or stage_directory / "out" / "rust"
         )
-    elif output["status"] == "skipped":
+    elif output["status"] in ("skipped", "failure"):
         stage_input = json.loads(
             (stage_directory / "stage_input.json").read_text(encoding="utf-8")
         )
