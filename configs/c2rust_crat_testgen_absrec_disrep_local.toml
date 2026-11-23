@@ -90,7 +90,7 @@ on_give_up = "skip"
 
 [stages.discipline_repair]
 uses = "stages/discipline-repair"
-timeout_s = 1800
+timeout_s = 3600
 
 [stages.discipline_repair.config]
 agent = "opencode"
