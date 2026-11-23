@@ -1,0 +1,43 @@
+# Pipeline: C source -> c2rust -> CRAT -> test generation.
+
+[run]
+provides = ["c_project"]
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = ["c2rust", "crat", "test_generation"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 900
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.test_generation]
+uses = "stages/test-infrastructure"
+timeout_s = 3600
+
+[stages.test_generation.config]
+command = "generate"
+strategy = "cando2"
+agent = "opencode"
+model = "opencode/beam-free"
+attempts = 3
+min_coverage = 80.0
