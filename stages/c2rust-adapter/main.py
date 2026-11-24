@@ -545,6 +545,46 @@ def exposed_functions(
     return sorted(names)
 
 
+def restore_c2rust_module_sources(rust_dir: Path) -> None:
+    lib_rs = rust_dir / "lib.rs"
+    if not lib_rs.is_file():
+        return
+
+    lines = lib_rs.read_text(encoding="utf-8").splitlines(keepends=True)
+    existing_lines = {line.strip() for line in lines}
+    output: list[str] = []
+    module_path = Path()
+    for line in lines:
+        output.append(line)
+        entry = line.strip()
+        if entry.startswith("} // mod "):
+            module_path = module_path.parent
+            continue
+        # C2Rust emits inline modules for directories, even when a same-name file exists.
+        module = re.fullmatch(r"pub mod (?:r#)?(\w+) \{", entry)
+        if module is None:
+            continue
+        module_path /= module[1]
+        directory = rust_dir / module_path
+        source = directory.with_suffix(".rs")
+        if not directory.is_dir() or not source.is_file():
+            continue
+        if f'include!("{source.relative_to(rust_dir).as_posix()}");' in existing_lines:
+            continue
+
+        renamed = source.with_stem(f"{source.stem}_c2rust")
+        suffix = 2
+        while renamed.exists() or renamed.with_suffix("").exists():
+            renamed = source.with_stem(f"{source.stem}_c2rust_{suffix}")
+            suffix += 1
+        source.rename(renamed)
+        # Declare the renamed file beside the inline module so they have separate namespaces.
+        output.insert(len(output) - 1, f"pub mod {renamed.stem};\n")
+
+    if output != lines:
+        lib_rs.write_text("".join(output), encoding="utf-8")
+
+
 def add_link_args_to_build_rs(build_rs: Path, link_args: list[str]) -> None:
     if not link_args or not build_rs.is_file():
         return
@@ -665,7 +705,8 @@ def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
     )
     timings["transpile_s"] = round(time.monotonic() - started, 2)
 
-    # 5. project fix-ups (legacy translate.py behavior)
+    # 5. project fix-ups
+    restore_c2rust_module_sources(rust_dir)
     link_args = sorted({arg for target in targets for arg in target.link_args})
     add_link_args_to_build_rs(rust_dir / "build.rs", link_args)
     add_cdylib_crate_type(rust_dir / "Cargo.toml")
