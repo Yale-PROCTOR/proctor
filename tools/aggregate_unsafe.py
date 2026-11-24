@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -53,6 +54,24 @@ def find_unsafe(directory: Path) -> list[str]:
     return result.stdout.splitlines()
 
 
+def read_record(path: Path) -> dict[str, object]:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def recorded_rust_directory(run: Path, artifacts: object) -> Path | None:
+    if not isinstance(artifacts, dict):
+        return None
+    path = artifacts.get("rust_project")
+    if not isinstance(path, str) or not path:
+        return None
+    directory = run / path
+    return directory if directory.is_dir() else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Aggregate unsafe operations across PROCTOR run directories."
@@ -81,10 +100,26 @@ def main() -> None:
             key=lambda path: int(path.name.partition("-")[0]),
             default=None,
         )
-        if stage is not None:
-            directory = stage / "out" / "rust"
-            if directory.is_dir():
-                directories.append(directory)
+        if stage is None:
+            continue
+
+        output = read_record(stage / "stage_output.json")
+        # The checkpoint includes failures detected after the stage exits.
+        status = read_record(stage / ".checkpoint").get("status")
+        if status not in ("success", "skipped", "failure"):
+            status = output.get("status")
+
+        directory = None
+        if status not in ("skipped", "failure"):
+            directory = recorded_rust_directory(run, output.get("outputs"))
+            default_output = stage / "out" / "rust"
+            if directory is None and default_output.is_dir():
+                directory = default_output
+        if directory is None:
+            stage_input = read_record(stage / "stage_input.json")
+            directory = recorded_rust_directory(run, stage_input.get("inputs"))
+        if directory is not None:
+            directories.append(directory)
 
     counts: Counter[str] = Counter()
     if directories:
