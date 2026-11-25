@@ -2,6 +2,8 @@
 artifact wiring, failure policy, timeout, checkpoint/resume."""
 
 import json
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,7 @@ import pytest
 from proctor.config.model import PipelineConfig
 from proctor.contracts.stage_io import StageInput
 from proctor.orchestrator.events import read_events
+from proctor.orchestrator.invoke import invoke_stage
 from proctor.orchestrator.run import record_inputs, resume_run, start_run
 
 FAKE = Path(__file__).parent / "fake_stages" / "fake"
@@ -167,6 +170,28 @@ def test_timeout_kills_stage(tmp_path: Path, no_fail: bool) -> None:
     assert not result.ok
     assert "timed out" in (result.stages[0].error or "")
     assert result.stages[0].duration_s < 15
+
+
+def test_stage_receives_the_launcher_deadline(tmp_path: Path) -> None:
+    timeout_s = 10
+    before = time.monotonic()
+    stdout = tmp_path / "stdout.log"
+    invocation = invoke_stage(
+        tmp_path,
+        (
+            sys.executable,
+            "-c",
+            'import os; print(os.environ["PROCTOR_STAGE_DEADLINE_MONOTONIC"])',
+        ),
+        tmp_path / "stage_input.json",
+        tmp_path / "stage_output.json",
+        stdout_log=stdout,
+        stderr_log=tmp_path / "stderr.log",
+        timeout_s=timeout_s,
+    )
+    assert invocation.returncode == 0
+    deadline = float(stdout.read_text())
+    assert before <= deadline - timeout_s <= time.monotonic()
 
 
 @pytest.mark.parametrize("no_fail", [False, True])

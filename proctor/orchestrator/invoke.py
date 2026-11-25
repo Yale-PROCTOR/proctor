@@ -51,6 +51,10 @@ def invoke_stage(
     command = build_command(stage_dir, exec_argv, input_file, output_file)
     started = time.monotonic()
     timed_out = False
+    env = os.environ.copy()
+    if timeout_s is not None:
+        # The child can budget its work against the same clock, including launcher time.
+        env["PROCTOR_STAGE_DEADLINE_MONOTONIC"] = str(started + timeout_s)
 
     with stdout_log.open("ab") as out, stderr_log.open("ab") as err:
         process = subprocess.Popen(
@@ -58,7 +62,7 @@ def invoke_stage(
             cwd=stage_dir,
             stdout=out,
             stderr=err,
-            env=os.environ.copy(),
+            env=env,
             start_new_session=True,  # own process group, so timeout kills children
         )
         try:
