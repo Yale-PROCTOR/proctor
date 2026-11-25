@@ -22,18 +22,22 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import tomllib
 from dataclasses import dataclass
+from hashlib import file_digest
 from pathlib import Path
 from typing import Any, NoReturn
 
 STAGE_ID = "c2rust"
 STAGE_VERSION = "0.2.0"
 SCHEMA_VERSION = 1
+REPAIR_TIMEOUT_S = 900
 
 
 class StageFailure(Exception):
@@ -50,16 +54,25 @@ def run_logged(
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    input_data: bytes | None = None,
 ) -> None:
     with log_file.open("ab") as log:
         log.write(f"$ {' '.join(command)}\n".encode())
         log.flush()
-        result = subprocess.run(command, cwd=cwd, env=env, stdout=log, stderr=log)
-    if result.returncode != 0:
-        tail = log_file.read_text(encoding="utf-8", errors="replace")[-3000:]
-        raise StageFailure(
-            f"command failed ({result.returncode}): {' '.join(command)}\n...{tail}"
+        result = subprocess.run(
+            command, cwd=cwd, env=env, input=input_data, stdout=log, stderr=log
         )
+    if result.returncode != 0:
+        raise command_failure(command, result.returncode, log_file)
+
+
+def command_failure(
+    command: list[str], returncode: int, log_file: Path
+) -> StageFailure:
+    tail = log_file.read_text(encoding="utf-8", errors="replace")[-3000:]
+    return StageFailure(
+        f"command failed ({returncode}): {' '.join(command)}\n...{tail}"
+    )
 
 
 def resolve_transpiler(log_file: Path) -> tuple[Path, dict[str, str]]:
@@ -620,8 +633,156 @@ def add_cdylib_crate_type(cargo_toml: Path) -> None:
     raise StageFailure(f"could not add cdylib crate-type to {cargo_toml}")
 
 
+def translated_rust_source(relative: Path) -> bool:
+    return relative.suffix == ".rs" and relative != Path("build.rs")
+
+
+def cargo_build_errors(project: Path, log_file: Path, env: dict[str, str]) -> list[str]:
+    command = ["cargo", "build", "--message-format=json"]
+    errors: list[str] = []
+    with log_file.open("a", encoding="utf-8") as log:
+        log.write(f"$ {shlex.join(command)}\n")
+        log.flush()
+        result = subprocess.run(
+            command,
+            cwd=project,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=log,
+            encoding="utf-8",
+            errors="replace",
+        )
+        for line in result.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                log.write(line + "\n")
+                continue
+            if not isinstance(event, dict) or event.get("reason") != "compiler-message":
+                continue
+            diagnostic = event["message"]
+            rendered = diagnostic.get("rendered") or diagnostic["message"] + "\n"
+            log.write(rendered)
+            if diagnostic["level"] != "error":
+                continue
+            target = event["target"]
+            if "custom-build" in target["kind"] or not Path(
+                target["src_path"]
+            ).resolve().is_relative_to(project):
+                continue
+            primary_sources = (
+                (project / span["file_name"]).resolve()
+                for span in diagnostic["spans"]
+                if span["is_primary"]
+            )
+            if any(
+                path.is_relative_to(project)
+                and translated_rust_source(path.relative_to(project))
+                and path.is_file()
+                for path in primary_sources
+            ):
+                errors.append(rendered)
+    if result.returncode == 0:
+        return []
+    if result.returncode < 0 or not errors:
+        raise command_failure(command, result.returncode, log_file)
+    return errors
+
+
+def repair_workspace_state(project: Path) -> dict[Path, tuple[int, bytes | None]]:
+    if project.is_symlink() or not project.is_dir():
+        raise StageFailure("compilation repair workspace must be a directory")
+    state: dict[Path, tuple[int, bytes | None]] = {
+        Path(): (project.stat().st_mode, None),
+    }
+    for path in project.rglob("*"):
+        relative = path.relative_to(project)
+        info = path.lstat()
+        contents = None
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            if not translated_rust_source(relative):
+                with path.open("rb") as stream:
+                    contents = file_digest(stream, "sha256").digest()
+        elif not stat.S_ISDIR(info.st_mode):
+            raise StageFailure(
+                f"unsupported compilation repair workspace entry: {path}"
+            )
+        state[relative] = (info.st_mode, contents)
+    return state
+
+
+def build_with_repair(
+    project: Path, log_file: Path, env: dict[str, str], model: str
+) -> int:
+    project = project.resolve()
+    errors = cargo_build_errors(project, log_file, env)
+    if not errors:
+        return 0
+
+    timeout_s = float(REPAIR_TIMEOUT_S)
+    if (deadline := os.environ.get("PROCTOR_STAGE_DEADLINE_MONOTONIC")) is not None:
+        timeout_s = min(timeout_s, float(deadline) - time.monotonic() - 5)
+    if timeout_s <= 0:
+        raise StageFailure(f"stage deadline leaves no time for repair. See {log_file}")
+
+    before = repair_workspace_state(project)
+    agent_project = Path(__file__).resolve().parent.parent / "crat-repair"
+    request = {
+        "agent": "opencode",
+        "model": model,
+        "workspace": str(project),
+        "timeout_s": timeout_s,
+        "prompt": (
+            "Make the smallest edits to the existing generated Rust source needed "
+            "to resolve the reported compiler errors. Preserve program behavior, "
+            "the C-facing ABI, and all build and Crat configuration. Keep "
+            "all translated implementations and compilation checks enabled.\n\n"
+            + "\n".join(errors)
+        ),
+    }
+    with tempfile.TemporaryDirectory(
+        prefix="repair-target-", dir=Path(env["CARGO_TARGET_DIR"]).parent
+    ) as agent_target:
+        run_logged(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(agent_project),
+                "python3",
+                str(agent_project / "repair_agent.py"),
+            ],
+            log_file,
+            cwd=project,
+            env={
+                **env,
+                "CARGO_TARGET_DIR": agent_target,
+                "CARGO_BUILD_BUILD_DIR": agent_target,
+            },
+            input_data=json.dumps(request).encode("utf-8"),
+        )
+    after = repair_workspace_state(project)
+    changed = sorted(
+        path
+        for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    )
+    if changed:
+        paths = ", ".join(map(str, changed))
+        raise StageFailure(
+            f"compilation repair changed protected project paths: {paths}"
+        )
+    run_logged(["cargo", "build"], log_file, cwd=project, env=env)
+    return 1
+
+
 def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
     config = envelope.get("config", {})
+    repair_model = config.get("repair_model")
+    if repair_model is not None and (
+        not isinstance(repair_model, str) or not repair_model.strip()
+    ):
+        raise StageFailure("repair_model must be a nonempty string")
     c_project = envelope["inputs"]["c_project"]
     dst = envelope["outputs"]["rust_project"]
     workdir = envelope.get("framework", {}).get("workdir")
@@ -720,15 +881,21 @@ def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
     (rust_dir / "libs.json").write_text(json.dumps(extra_libs) + "\n", encoding="utf-8")
 
     # 6. optional build verification
+    repair_calls = 0
     if config.get("check_build", True):
         started = time.monotonic()
-        run_logged(
-            ["cargo", "build"],
-            log_file,
-            cwd=rust_dir,
-            env={**os.environ, "RUSTFLAGS": "-Awarnings"},
-        )
-        shutil.rmtree(rust_dir / "target", ignore_errors=True)
+        build_env = {**os.environ, "RUSTFLAGS": "-Awarnings"}
+        target_dir = rust_dir / "target"
+        if repair_model is None:
+            run_logged(["cargo", "build"], log_file, cwd=rust_dir, env=build_env)
+        else:
+            target_dir = work / "cargo-target"
+            build_env["CARGO_TARGET_DIR"] = str(target_dir.resolve())
+            build_env["CARGO_BUILD_BUILD_DIR"] = build_env["CARGO_TARGET_DIR"]
+            repair_calls = build_with_repair(
+                rust_dir, log_file, build_env, repair_model
+            )
+        shutil.rmtree(target_dir, ignore_errors=True)
         timings["check_build_s"] = round(time.monotonic() - started, 2)
 
     shutil.copytree(rust_dir, dst)
@@ -742,6 +909,7 @@ def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
         "config_used": {
             "check_build": bool(config.get("check_build", True)),
             "preset": preset_name if preset_flag else None,
+            **({"repair_model": repair_model} if repair_model is not None else {}),
         },
         "metrics": {
             "transpiler": str(transpiler),
@@ -750,6 +918,7 @@ def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
             "target_kind": selection.target_kind,
             "c_sources": len(filtered),
             "exposed_fns": len(exposed),
+            "compilation_repair_calls": repair_calls,
             **timings,
         },
         "logs": ["c2rust.log"],

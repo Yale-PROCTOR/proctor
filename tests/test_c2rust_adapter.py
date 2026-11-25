@@ -1,13 +1,16 @@
-"""Focused tests for c2rust-adapter input preparation."""
+"""Focused tests for the C2Rust adapter."""
 
 from __future__ import annotations
 
 import importlib.util
 import io
+import json
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
 from types import ModuleType
+from typing import Any, BinaryIO
 
 import pytest
 
@@ -135,3 +138,245 @@ def test_keep_c2rust_module_source_already_in_tree(
 
     assert source.is_file()
     assert lib.read_text(encoding="utf-8") == declaration
+
+
+BROKEN_SOURCE = "pub static BYTE: i8 = 0xe2 as i8;\n"
+REPAIRED_SOURCE = "pub static BYTE: i8 = 0xe2u8 as i8;\n"
+REPAIR_MODEL = "openrouter/openai/gpt-6.1-sol"
+
+
+class FakeTranslation:
+    def __init__(self, root: Path) -> None:
+        source = root / "c"
+        _write_project(source)
+        self.work = root / "work"
+        self.output = root / "out" / "rust"
+        self.artifacts = root / "out" / "artifacts"
+        self.initial_source = BROKEN_SOURCE
+        self.error_origin = "rust"
+        self.agent_edits: dict[str, str | None] = {"lib.rs": REPAIRED_SOURCE}
+        self.agent_exit = 0
+        self.agent_target: Path | None = None
+        self.commands: list[list[str]] = []
+        self.request: dict[str, Any] | None = None
+        self.envelope = {
+            "inputs": {"c_project": str(source)},
+            "outputs": {
+                "rust_project": str(self.output),
+                "artifacts_dir": str(self.artifacts),
+            },
+            "framework": {"workdir": str(self.work)},
+            "config": {"repair_model": REPAIR_MODEL},
+        }
+
+    def run(
+        self,
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        input: bytes | None = None,
+        stderr: BinaryIO,
+        **_: Any,
+    ) -> subprocess.CompletedProcess:
+        self.commands.append(command)
+        match command[0]:
+            case "cmake":
+                (self.work / "cmake-build/compile_commands.json").write_text("[]")
+            case "c2rust-transpile":
+                project = Path(command[command.index("-o") + 1])
+                (project / "lib.rs").write_text(self.initial_source)
+                (project / "Cargo.toml").write_text(
+                    '[lib]\npath = "lib.rs"\ncrate-type = ["rlib"]\n'
+                )
+                (project / "build.rs").write_text("fn main() {}\n")
+            case "cargo":
+                assert cwd is not None and env is not None
+                if "repair_model" in self.envelope["config"]:
+                    assert Path(env["CARGO_TARGET_DIR"]).parent == self.work
+                    assert env["CARGO_BUILD_BUILD_DIR"] == env["CARGO_TARGET_DIR"]
+                if (cwd / "lib.rs").read_text() == BROKEN_SOURCE:
+                    if "--message-format=json" not in command:
+                        stderr.write(b"error: literal out of range for `i8`\n")
+                        return subprocess.CompletedProcess(command, 101)
+                    file_name = "build.rs" if self.error_origin == "build" else "lib.rs"
+                    target_dir = (
+                        cwd.parent if self.error_origin == "dependency" else cwd
+                    )
+                    event = {
+                        "reason": "compiler-message",
+                        "target": {
+                            "src_path": str(target_dir / file_name),
+                            "kind": [
+                                "custom-build" if file_name == "build.rs" else "lib"
+                            ],
+                        },
+                        "message": {
+                            "level": "error",
+                            "rendered": "error: literal out of range for `i8`\n",
+                            "spans": []
+                            if self.error_origin == "linker"
+                            else [{"file_name": file_name, "is_primary": True}],
+                        },
+                    }
+                    return subprocess.CompletedProcess(command, 101, json.dumps(event))
+                return subprocess.CompletedProcess(command, 0, "")
+            case "uv":
+                assert cwd is not None and input is not None and env is not None
+                self.agent_target = Path(env["CARGO_TARGET_DIR"])
+                assert self.agent_target != self.work / "cargo-target"
+                assert env["CARGO_BUILD_BUILD_DIR"] == str(self.agent_target)
+                self.request = json.loads(input)
+                for path, contents in self.agent_edits.items():
+                    entry = cwd / path
+                    if entry.is_dir():
+                        entry.chmod(entry.stat().st_mode ^ 0o010)
+                    elif contents is None:
+                        entry.unlink()
+                    else:
+                        entry.write_text(contents)
+                return subprocess.CompletedProcess(command, self.agent_exit)
+            case _:
+                raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0)
+
+
+@pytest.fixture
+def translation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeTranslation:
+    case = FakeTranslation(tmp_path)
+    monkeypatch.delenv("PROCTOR_STAGE_DEADLINE_MONOTONIC", raising=False)
+    monkeypatch.setattr(ADAPTER.subprocess, "run", case.run)
+    monkeypatch.setattr(ADAPTER, "pick_generator", lambda: "Ninja")
+    monkeypatch.setattr(
+        ADAPTER, "resolve_transpiler", lambda log: (Path("c2rust-transpile"), {})
+    )
+    monkeypatch.setattr(
+        ADAPTER,
+        "read_targets",
+        lambda directory: [ADAPTER.Artifact("example", "EXECUTABLE", [], [])],
+    )
+    return case
+
+
+@pytest.mark.parametrize("stage_time_remaining", [None, 60])
+def test_repairs_once_then_builds_before_publishing(
+    translation: FakeTranslation,
+    monkeypatch: pytest.MonkeyPatch,
+    stage_time_remaining: float | None,
+) -> None:
+    if stage_time_remaining is not None:
+        monkeypatch.setenv(
+            "PROCTOR_STAGE_DEADLINE_MONOTONIC",
+            str(ADAPTER.time.monotonic() + stage_time_remaining),
+        )
+
+    output = ADAPTER.run_stage(translation.envelope)
+
+    assert [command[0] for command in translation.commands] == [
+        "cmake",
+        "c2rust-transpile",
+        "cargo",
+        "uv",
+        "cargo",
+    ]
+    assert translation.commands[-1] == ["cargo", "build"]
+    assert translation.request is not None
+    assert translation.request["agent"] == "opencode"
+    assert translation.request["model"] == REPAIR_MODEL
+    if stage_time_remaining is None:
+        assert translation.request["timeout_s"] == ADAPTER.REPAIR_TIMEOUT_S
+    else:
+        assert 0 < translation.request["timeout_s"] < stage_time_remaining
+    for expected in (
+        "smallest edits",
+        "program behavior",
+        "C-facing ABI",
+        "out of range",
+    ):
+        assert expected in translation.request["prompt"]
+    assert output["metrics"]["compilation_repair_calls"] == 1
+    assert (translation.output / "lib.rs").read_text() == REPAIRED_SOURCE
+    assert (
+        translation.agent_target is not None and not translation.agent_target.exists()
+    )
+    assert sorted(path.name for path in translation.artifacts.iterdir()) == [
+        "c2rust.log"
+    ]
+
+
+@pytest.mark.parametrize("error_origin", ["linker", "build", "dependency"])
+def test_repairs_only_generated_rust_diagnostics(
+    translation: FakeTranslation, error_origin: str
+) -> None:
+    translation.error_origin = error_origin
+
+    with pytest.raises(ADAPTER.StageFailure, match="cargo build"):
+        ADAPTER.run_stage(translation.envelope)
+
+    assert translation.request is None
+    assert not translation.output.exists()
+
+
+@pytest.mark.parametrize(
+    ("path", "contents"),
+    [
+        ("build.rs", "changed\n"),
+        ("Cargo.toml", "changed\n"),
+        ("config.toml", "changed\n"),
+        ("other.rs", "added\n"),
+        ("lib.rs", None),
+        (".", None),
+    ],
+)
+def test_rejects_changes_outside_existing_generated_sources(
+    translation: FakeTranslation, path: str, contents: str | None
+) -> None:
+    translation.agent_edits[path] = contents
+
+    with pytest.raises(ADAPTER.StageFailure, match="changed protected project paths"):
+        ADAPTER.run_stage(translation.envelope)
+
+    assert translation.commands[-1][0] == "uv"
+    assert not translation.output.exists()
+
+
+@pytest.mark.parametrize("agent_exit", [0, 124])
+def test_failed_repair_never_publishes(
+    translation: FakeTranslation, agent_exit: int
+) -> None:
+    translation.agent_edits = {}
+    translation.agent_exit = agent_exit
+
+    with pytest.raises(ADAPTER.StageFailure):
+        ADAPTER.run_stage(translation.envelope)
+
+    assert sum(command[0] == "uv" for command in translation.commands) == 1
+    assert not translation.output.exists()
+
+
+@pytest.mark.parametrize(
+    ("config", "initial_source", "success"),
+    [
+        ({}, BROKEN_SOURCE, False),
+        ({"repair_model": REPAIR_MODEL}, REPAIRED_SOURCE, True),
+        ({"repair_model": REPAIR_MODEL, "check_build": False}, BROKEN_SOURCE, True),
+    ],
+)
+def test_agent_runs_only_on_enabled_failing_build(
+    translation: FakeTranslation, config: dict, initial_source: str, success: bool
+) -> None:
+    translation.envelope["config"] = config
+    translation.initial_source = initial_source
+
+    if success:
+        output = ADAPTER.run_stage(translation.envelope)
+        assert output["metrics"]["compilation_repair_calls"] == 0
+        assert translation.output.is_dir()
+    else:
+        with pytest.raises(ADAPTER.StageFailure, match="cargo build"):
+            ADAPTER.run_stage(translation.envelope)
+        assert not translation.output.exists()
+
+    assert translation.request is None
+    if not config.get("check_build", True):
+        assert all(command[0] != "cargo" for command in translation.commands)
