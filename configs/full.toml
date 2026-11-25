@@ -1,0 +1,98 @@
+[run]
+provides = ["c_project", "rule_set"]
+no_fail = true
+
+[testing]
+after_each_stage = false
+
+[llm]
+provider = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-6-luna"
+
+[llm.extra]
+reasoning_effort = "medium"
+
+[pipeline]
+order = [
+  "c2rust",
+  "crat",
+  "test_generation",
+  "abstraction_recovery",
+  "discipline_repair",
+  "local_transformation",
+]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 86400
+
+[stages.c2rust.config]
+repair_model = "openrouter/openai/gpt-6.1-sol"
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 86400
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.test_generation]
+uses = "stages/test-infrastructure"
+timeout_s = 10800
+
+[stages.test_generation.config]
+command = "generate"
+strategy = "cando2"
+agent = "opencode"
+model = "openrouter/openai/gpt-6.1-sol"
+attempts = 5
+min_coverage = 80.0
+
+[stages.abstraction_recovery]
+uses = "stages/abstraction-recovery"
+timeout_s = 10800
+
+[stages.abstraction_recovery.config]
+abstractions = ["containers", "enums", "result", "generics"]
+backend = "opencode"
+model = "openrouter/openai/gpt-6.1-sol"
+identify_timeout_s = 1800
+max_candidates = 1
+max_repair_iterations = 3
+on_give_up = "skip"
+
+[stages.discipline_repair]
+uses = "stages/discipline-repair"
+timeout_s = 10800
+
+[stages.discipline_repair.config]
+agent = "opencode"
+model = "openrouter/openai/gpt-6.1-sol"
+max_attempts_per_target = 3
+axm_vector_timeout_s = 300.0
+
+[stages.local_transformation]
+uses = "stages/local-transformation"
+timeout_s = 864000
+
+[stages.local_transformation.config]
+workers = 32
+dump_llm_exchanges = false
+testinfra_dir = "../test-infrastructure"
+max_validation_repairs = 8
+validation_timeout_s = 3600
+validation_repair_agent = "opencode"
+validation_repair_model = "openrouter/openai/gpt-6.1-sol"
+validation_repair_timeout_s = 86400
