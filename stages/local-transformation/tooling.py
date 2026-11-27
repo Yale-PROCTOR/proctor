@@ -310,6 +310,7 @@ class CratTools:
         *,
         frozen_output: Path | None = None,
         use_bo_analysis: bool = False,
+        skip_andersen: bool = False,
     ) -> None:
         assert self.crat_tool is not None
         paths = (output, *((frozen_output,) if frozen_output is not None else ()))
@@ -329,6 +330,7 @@ class CratTools:
                 rule_set,
                 frozen_output,
                 use_bo_analysis=use_bo_analysis,
+                skip_andersen=skip_andersen,
             ),
             output,
             redactions=((str(rule_set), "<rule-set>"),) if rule_set is not None else (),

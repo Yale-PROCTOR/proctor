@@ -10077,8 +10077,41 @@ def test_pointer_analysis_configuration_rejects_nonboolean_values(
     assert not tools.events
 
 
-@pytest.mark.parametrize("use_bo_analysis", [False, True])
-def test_skeleton_tool_forwards_pointer_analysis_selection(tmp_path, use_bo_analysis):
+@pytest.mark.parametrize(
+    ("size_offset", "use_bo_analysis", "skip_andersen"),
+    [(-1, False, False), (0, False, False), (1, False, True), (1, True, False)],
+)
+def test_stage_skips_andersen_for_large_prepared_libraries(
+    tmp_path, size_offset, use_bo_analysis, skip_andersen
+):
+    selected = []
+
+    class LargePreparedTools(FakeTools):
+        def prepare(self, current, passes, use_print):
+            super().prepare(current, passes, use_print)
+            with (current / "lib.rs").open("r+b") as prepared:
+                prepared.truncate(stage_module.MAX_ANDERSEN_SOURCE_BYTES + size_offset)
+
+        def make_skeleton(self, current, output, rule_set=None, **kwargs):
+            selected.append(kwargs["skip_andersen"])
+            super().make_skeleton(current, output, rule_set, **kwargs)
+
+    _, output = run_fake(
+        tmp_path,
+        LargePreparedTools(),
+        FakeClient([response()]),
+        config={"use_bo_analysis": use_bo_analysis},
+    )
+    assert output.status == "success", output.error
+    assert selected == [skip_andersen]
+
+
+@pytest.mark.parametrize(
+    ("use_bo_analysis", "skip_andersen"), [(False, False), (True, False), (False, True)]
+)
+def test_skeleton_tool_forwards_pointer_analysis_selection(
+    tmp_path, use_bo_analysis, skip_andersen
+):
     commands = []
     project = tmp_path / "project"
     project.mkdir()
@@ -10096,9 +10129,11 @@ def test_skeleton_tool_forwards_pointer_analysis_selection(tmp_path, use_bo_anal
         tmp_path / "skeletons.json",
         frozen_output=tmp_path / "frozen.json",
         use_bo_analysis=use_bo_analysis,
+        skip_andersen=skip_andersen,
     )
     assert len(commands) == 1
     assert ("--use-bo-analysis" in commands[0]) is use_bo_analysis
+    assert ("--skip-andersen" in commands[0]) is skip_andersen
 
 
 @pytest.mark.parametrize("workers", [0, -1, True, False, 2.5, "4", None])

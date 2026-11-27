@@ -245,6 +245,7 @@ def make_skeleton_command(
     frozen_output: Path | None = None,
     *,
     use_bo_analysis: bool = False,
+    skip_andersen: bool = False,
 ) -> list[str]:
     command = [
         str(crat_tool),
@@ -258,6 +259,8 @@ def make_skeleton_command(
         command.extend(("--rules", str(rule_set)))
     if use_bo_analysis:
         command.append("--use-bo-analysis")
+    if skip_andersen:
+        command.append("--skip-andersen")
     command.append(str(current_project))
     return command
 

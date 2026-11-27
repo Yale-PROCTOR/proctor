@@ -36,6 +36,7 @@ from model import (
     ObservationError,
     dependency_context,
     function_graph,
+    function_target_size,
     group_functions,
     strongly_connected_components,
     load_skeletons,
@@ -82,6 +83,8 @@ from proctor.usage.tracker import UsageTracker, read_usage
 STAGE_ID = "local_transformation"
 STAGE_VERSION = "0.1.0"
 CONTEXT_LIMIT = 100_000
+MAX_ANDERSEN_SOURCE_BYTES = 14 * 1024 * 1024
+MAX_FUNCTION_TARGET_CHARS = 1_000_000
 CARGO_VERSION_COMPONENT_MAX = (1 << 64) - 1
 REQUIRED_CRATES_IO_DEPENDENCIES = (
     ("bytemuck", "1.25.2", (1, 25, 2, 1)),
@@ -1851,37 +1854,15 @@ def _retain_group(
     state.metrics.retained_functions += len(members)
 
 
-def _process_unstructured_group(
+def _prepare_unstructured(
     members: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
-    *,
     transformations: list[str],
-    stage_input: StageInput,
-    current: Path,
-    analysis: Path,
+    *,
     frozen: Path,
-    library_source: Path,
     workdir: Path,
     tools: Any,
-    client: Any,
-    tracker: UsageTracker,
-    exchange_root: Path | None,
-    max_repairs: int,
-    state: RunState,
-    initial_diagnostics: str | None = None,
-    direct: bool = False,
-) -> None:
-    if initial_diagnostics is not None and max_repairs == 0:
-        _retain_group(
-            members,
-            transformations,
-            initial_diagnostics,
-            workdir=workdir,
-            frozen=frozen,
-            tools=tools,
-            state=state,
-        )
-        return
+) -> tuple[list[dict[str, Any]], str | None]:
     preparation_request = workdir / "unstructured-preparation-request.json"
     preparation_output = workdir / "unstructured-preparation.json"
     write_json(
@@ -1919,7 +1900,48 @@ def _process_unstructured_group(
         raise StageFailure(
             "unstructured preparation candidate must be a string or null"
         )
-    transformation = transformation or None
+    return targets, transformation or None
+
+
+def _process_unstructured_group(
+    members: tuple[int, ...],
+    records_by_id: dict[int, ItemRecord],
+    *,
+    transformations: list[str],
+    stage_input: StageInput,
+    current: Path,
+    analysis: Path,
+    frozen: Path,
+    library_source: Path,
+    workdir: Path,
+    tools: Any,
+    client: Any,
+    tracker: UsageTracker,
+    exchange_root: Path | None,
+    max_repairs: int,
+    state: RunState,
+    initial_diagnostics: str | None = None,
+    direct: bool = False,
+) -> None:
+    if initial_diagnostics is not None and max_repairs == 0:
+        _retain_group(
+            members,
+            transformations,
+            initial_diagnostics,
+            workdir=workdir,
+            frozen=frozen,
+            tools=tools,
+            state=state,
+        )
+        return
+    targets, transformation = _prepare_unstructured(
+        members,
+        records_by_id,
+        transformations,
+        frozen=frozen,
+        workdir=workdir,
+        tools=tools,
+    )
     target_text = "\n\n".join(
         f"### Function `{target['name']}`\n\nSource:\n```rust\n{target['source']}\n```\n"
         f"Target signature:\n```rust\n{target['signature']}\n```"
@@ -2739,9 +2761,17 @@ def _run_group_workers(
     ordered = tuple(item_id for members in components for item_id in members)
     positions = {item_id: index for index, item_id in enumerate(ordered)}
     limit = state.config_used["max_group_chars"]
+    oversized: dict[int, int] = {}
+    eligible: list[int] = []
+    for item_id in ordered:
+        size = function_target_size(records_by_id[item_id])
+        if size > MAX_FUNCTION_TARGET_CHARS:
+            oversized[item_id] = size
+        else:
+            eligible.append(item_id)
     transforming = tuple(
         item_id
-        for item_id in ordered
+        for item_id in eligible
         if not records_by_id[item_id].unstructured
         and cast(SkeletonView, records_by_id[item_id].applied).needs_transformation
     )
@@ -2753,7 +2783,7 @@ def _run_group_workers(
         TransformationGroup(members)
         for members in group_functions(
             tuple(
-                item_id for item_id in ordered if records_by_id[item_id].unstructured
+                item_id for item_id in eligible if records_by_id[item_id].unstructured
             ),
             records_by_id,
             limit,
@@ -2761,10 +2791,11 @@ def _run_group_workers(
     )
     schedule.extend(
         TransformationGroup((item_id,))
-        for item_id in ordered
+        for item_id in eligible
         if not records_by_id[item_id].unstructured
         and not cast(SkeletonView, records_by_id[item_id].applied).needs_transformation
     )
+    schedule.extend(TransformationGroup((item_id,)) for item_id in oversized)
     schedule.sort(
         key=lambda group: min(positions[item_id] for item_id in group.members)
     )
@@ -2831,11 +2862,32 @@ def _run_group_workers(
                 if jobdir.exists():
                     shutil.rmtree(jobdir)
                 jobdir.mkdir(parents=True)
+                job = RunState(skip_compilation=state.skip_compilation)
+                jobs[job_index] = job
+                if (size := oversized.get(members[0])) is not None:
+                    (target,), _ = _prepare_unstructured(
+                        members,
+                        records_by_id,
+                        [],
+                        frozen=frozen,
+                        workdir=jobdir,
+                        tools=worker_tools,
+                    )
+                    _retain_group(
+                        members,
+                        [target["source"]],
+                        f"Function target is {size:,} characters, exceeding the "
+                        f"{MAX_FUNCTION_TARGET_CHARS:,}-character limit. Retained the original body.\n",
+                        workdir=jobdir,
+                        frozen=frozen,
+                        tools=worker_tools,
+                        state=job,
+                    )
+                    accepted[job_index] = (members, jobdir / "accepted.rs")
+                    continue
                 # Only the private project's source is reset; Cargo's private
                 # dependency and incremental cache survives successive jobs.
                 shutil.copyfile(template / library_relative, current / library_relative)
-                job = RunState(skip_compilation=state.skip_compilation)
-                jobs[job_index] = job
                 compilation_failure = _process_group(
                     members,
                     records_by_id,
@@ -3017,6 +3069,10 @@ def run_stage(
             rule_set,
             frozen_output=frozen,
             use_bo_analysis=config["use_bo_analysis"],
+            skip_andersen=(
+                not config["use_bo_analysis"]
+                and library_source.stat().st_size > MAX_ANDERSEN_SOURCE_BYTES
+            ),
         )
         records = load_skeletons(skeleton_path.read_text(encoding="utf-8"))
         records_by_id = {record.id: record for record in records}

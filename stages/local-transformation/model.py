@@ -1231,6 +1231,16 @@ def render_dependency_entry(record: ItemRecord) -> str:
     return f"### {record.kind} `{name}`\n\n```rust\n{text}\n```"
 
 
+def function_target_size(record: ItemRecord) -> int:
+    assert record.annotated_source is not None
+    assert record.baseline is not None and record.applied is not None
+    return len(record.annotated_source) + (
+        len(record.target_signature or "")
+        if record.unstructured
+        else max(len(record.baseline.skeleton), len(record.applied.skeleton))
+    )
+
+
 def group_functions(
     functions: tuple[int, ...],
     records_by_id: dict[int, ItemRecord],
@@ -1242,13 +1252,7 @@ def group_functions(
     size = 0
     for item_id in functions:
         record = records_by_id[item_id]
-        assert record.annotated_source is not None
-        assert record.baseline is not None and record.applied is not None
-        weight = len(record.annotated_source) + (
-            len(record.target_signature or "")
-            if record.unstructured
-            else max(len(record.baseline.skeleton), len(record.applied.skeleton))
-        )
+        weight = function_target_size(record)
         if members and (size + weight > limit or record.name in names):
             groups.append(tuple(sorted(members)))
             members = []

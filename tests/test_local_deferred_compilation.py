@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import stage as stage_module
+from model import function_target_size
 from tests.test_local_final_validation import suite_result
 from tests.test_local_transformation import (
     FakeClient,
@@ -14,6 +16,7 @@ from tests.test_local_transformation import (
     STAGE_DIR,
     VALID,
     fn_record,
+    loaded,
     patch_response,
     response,
     stage_input,
@@ -107,6 +110,77 @@ def test_exhausted_groups_all_reach_compilation_agent_before_postprocess(tmp_pat
     )
     assert (value.outputs.rust_project / "tests/agent_change.rs").exists()
     assert (value.inputs.rust_project / "lib.rs").read_text() == "old\n"
+
+
+def test_oversized_target_retains_original_body_for_compilation_repair(
+    tmp_path, monkeypatch
+):
+    original = "unsafe fn large() { missing_value(); }"
+    transformed = "unsafe fn small() { let transformed = true; }"
+    small = fn_record(0, "small", "small", [1])
+    large = fn_record(1, "large", "large", [0])
+    large["annotated_source"] = original.replace(
+        "missing_value", "#[proctor(0)] missing_value"
+    )
+    small_record, large_record = loaded([small, large])
+    limit = function_target_size(small_record)
+    assert function_target_size(large_record) > limit
+    monkeypatch.setattr(stage_module, "MAX_FUNCTION_TARGET_CHARS", limit)
+
+    class OversizedTools(DeferredTools):
+        def prepare_unstructured(self, frozen, request, output):
+            assert json.loads(request.read_text()) == {
+                "members": [1],
+                "transformations": [],
+            }
+            output.write_text(
+                json.dumps(
+                    {
+                        "targets": [
+                            {
+                                "id": 1,
+                                "path": "large",
+                                "name": "large",
+                                "source": original,
+                                "signature": large["target_signature"],
+                            }
+                        ],
+                        "candidate": None,
+                    }
+                )
+            )
+
+    tools = OversizedTools(
+        skeletons=[small, large], validators=[VALID], candidates=[transformed]
+    )
+    client = FakeClient([response("small")])
+    value = stage_input(
+        tmp_path,
+        config={"max_group_chars": 10_000, "validation_repair_model": MODEL},
+    )
+
+    def repair(command, **kwargs):
+        assert command[0] == "opencode"
+        library = kwargs["cwd"] / "lib.rs"
+        assembled = library.read_text()
+        assert original in assembled and transformed in assembled
+        library.write_text(assembled.replace("missing_value();", ""))
+        return CommandResult(0)
+
+    output = run(value, tools, client, repair)
+    assert output.status == "success", output.error
+    assert [request.metadata.item for request in client.requests] == ["0"]
+    assert output.metrics["retained_functions"] == 1
+    assert output.metrics["compilation_repair_calls"] == 1
+    report = json.loads(
+        (value.outputs.artifacts_dir / "compilation-repair.json").read_text()
+    )
+    assert report["retained_functions"] == [
+        {"id": 1, "path": "large", "stubbed": False}
+    ]
+    published = (value.outputs.rust_project / "lib.rs").read_text()
+    assert transformed in published
+    assert "missing_value" not in published
 
 
 def test_history_and_explicit_stub_identity_survive_a_malformed_last_response(tmp_path):
