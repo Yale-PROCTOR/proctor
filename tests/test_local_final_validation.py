@@ -218,11 +218,17 @@ def test_default_budget_runs_three_agents_and_four_independent_validations(tmp_p
 
     def runner(command, **kwargs):
         calls.append(command)
-        if command[0] == "opencode":
-            number = sum(call[0] == "opencode" for call in calls)
+        if command[0] == "npm":
+            number = sum(call[0] == "npm" for call in calls)
             (rust / "lib.rs").write_text(f"buildable repair {number}\n")
+            assert "@opencode/cli@2.4.2" in command
+            assert "--standalone" in command
+            assert "--auto" not in command
+            assert "--dir" not in command
+            assert kwargs["cwd"] == rust
             assert command[command.index("--model") + 1] == MODEL
             return CommandResult(0, "agent claims success without running tests")
+        assert "env" not in kwargs
         return suite_result(
             failures=1,
             failing_testcases=[{"name": "wrong value", "message": "expected 3"}],
@@ -243,11 +249,11 @@ def test_default_budget_runs_three_agents_and_four_independent_validations(tmp_p
     assert (rust / "lib.rs").read_text() == "buildable repair 3\n"
     assert [command[0] for command in calls] == [
         "uv",
-        "opencode",
+        "npm",
         "uv",
-        "opencode",
+        "npm",
         "uv",
-        "opencode",
+        "npm",
         "uv",
     ]
 
@@ -260,7 +266,7 @@ def test_stage_owned_validation_accepts_success_even_after_agent_failure(
     tests = []
 
     def runner(command, **kwargs):
-        if command[0] == "opencode":
+        if command[0] == "npm":
             (rust / "lib.rs").write_text("fixed translation\n")
             if agent_exit == "timeout":
                 raise subprocess.TimeoutExpired(command, 1)
@@ -288,7 +294,7 @@ def test_uncompilable_split_edits_are_rolled_back_and_feedback_includes_build_er
 
     def runner(command, **kwargs):
         nonlocal count
-        if command[0] == "opencode":
+        if command[0] == "npm":
             count += 1
             if count == 1:
                 (rust / "keep.rs").unlink()
@@ -338,7 +344,7 @@ def test_c_reference_prompt_permissions_and_existing_config_are_preserved(
 
     def runner(command, **kwargs):
         nonlocal repaired
-        if command[0] == "opencode":
+        if command[0] == "npm":
             repaired = True
             reference = tmp_path / "work/test-validation/c-reference"
             assert (reference / "main.c").read_text().startswith("int value")
@@ -412,7 +418,7 @@ def test_stage_preserves_generated_harnesses_and_publishes_validation_with_self_
     def runner(command, **kwargs):
         called.append(command[0])
         current = kwargs["cwd"]
-        if command[0] == "opencode":
+        if command[0] == "npm":
             (current / "lib.rs").write_text("repaired translation\n")
             return CommandResult(0)
         for name in harnesses:
@@ -422,7 +428,7 @@ def test_stage_preserves_generated_harnesses_and_publishes_validation_with_self_
             alias.symlink_to(".", target_is_directory=True)
         return (
             suite_result(failures=1)
-            if repair and "opencode" not in called
+            if repair and "npm" not in called
             else suite_result()
         )
 
@@ -463,7 +469,7 @@ def test_stage_reports_every_validation_outcome_without_failing_translation(
         (value.inputs.rust_project / "testinfra.toml").write_text('strategy="cando2"\n')
 
     def runner(command, **kwargs):
-        if command[0] == "opencode":
+        if command[0] == "npm":
             return CommandResult(7, "agent could not fix the bug")
         return suite_result(
             successes=0 if outcome == "no_executable_tests" else 1,

@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from final_validation import _copy_project, _run, _subprocess_run
+from final_validation import _copy_project, _run_repair_agent, _subprocess_run
 from tooling import CommandResult
 
 
@@ -136,26 +136,15 @@ Latest independent compilation result:
             prompt_path = self.logs / f"repair-{index:03d}.prompt.md"
             prompt_path.write_text(prompt, encoding="utf-8")
             self.report["repair_attempts"] = index
-            _, execution = _run(
-                [
-                    "opencode",
-                    "run",
-                    "Follow the attached compilation repair instructions.",
-                    "--auto",
-                    "-f",
-                    str(prompt_path.resolve()),
-                    "--format",
-                    "json",
-                    "--dir",
-                    str(project.resolve()),
-                    "--model",
-                    self.config["validation_repair_model"],
-                ],
+            _, execution = _run_repair_agent(
                 project,
+                prompt_path,
                 self.logs,
                 f"repair-{index:03d}",
-                self.config["validation_repair_timeout_s"],
-                self.runner,
+                workdir=self.workdir,
+                config=self.config,
+                runner=self.runner,
+                auto=True,
             )
             execution["prompt"] = str(prompt_path.relative_to(self.artifacts))
             result = self._compile(project, repair=execution)

@@ -17,11 +17,17 @@ from tooling import CommandResult
 
 
 def _subprocess_run(
-    command: list[str], *, cwd: Path, timeout: float, **kwargs: Any
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    env: dict[str, str] | None = None,
+    **kwargs: Any,
 ) -> CommandResult:
     with subprocess.Popen(
         command,
         cwd=cwd,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -57,9 +63,12 @@ def _run(
     name: str,
     timeout_s: float,
     runner: Callable[..., Any],
+    *,
+    env: dict[str, str] | None = None,
 ) -> tuple[CommandResult, dict[str, Any]]:
     started = time.monotonic()
     error = None
+    environment = {"env": env} if env is not None else {}
     try:
         process = runner(
             command,
@@ -68,6 +77,7 @@ def _run(
             text=True,
             check=False,
             timeout=timeout_s,
+            **environment,
         )
         result = CommandResult(process.returncode, process.stdout, process.stderr)
     except subprocess.TimeoutExpired as exc:
@@ -95,6 +105,60 @@ def _run(
         "stdout_log": str(stdout_path.relative_to(logs.parent)),
         "stderr_log": str(stderr_path.relative_to(logs.parent)),
     }
+
+
+def _run_repair_agent(
+    project: Path,
+    prompt: Path,
+    logs: Path,
+    name: str,
+    *,
+    workdir: Path,
+    config: dict[str, Any],
+    runner: Callable[..., Any],
+    auto: bool = False,
+) -> tuple[CommandResult, dict[str, Any]]:
+    # Keep v2 database migrations away from the state used by other stages.
+    state = workdir.resolve() / "opencode-repair"
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime = state / "runtime"
+    runtime.mkdir(mode=0o700, exist_ok=True)
+    env = os.environ.copy()
+    for area in ("CONFIG", "DATA", "CACHE", "STATE"):
+        env[f"XDG_{area}_HOME"] = str(state / area.lower())
+    env["XDG_RUNTIME_DIR"] = str(runtime)
+    env["OPENCODE_DISABLE_AUTOUPDATE"] = "true"
+    env.pop("OPENCODE_DB", None)
+    env.pop("OPENCODE_CONFIG_DIR", None)
+
+    command = [
+        "npm",
+        "exec",
+        "--yes",
+        "--prefer-offline",
+        "--",
+        "@opencode/cli@2.4.2",
+        "run",
+        "--standalone",
+        "-f",
+        str(prompt.resolve()),
+        "--format",
+        "json",
+        "--model",
+        config["validation_repair_model"],
+    ]
+    if auto:
+        command.append("--auto")
+    command.append("Follow the attached repair instructions.")
+    return _run(
+        command,
+        project,
+        logs,
+        name,
+        config["validation_repair_timeout_s"],
+        runner,
+        env=env,
+    )
 
 
 def _evaluate(result: CommandResult, execution: dict[str, Any]) -> dict[str, Any]:
@@ -311,25 +375,14 @@ Latest independent validation result:
         }
         try:
             with _agent_files(project, prompt, testinfra, reference) as prompt_path:
-                _, execution = _run(
-                    [
-                        "opencode",
-                        "run",
-                        "Follow the attached repair instructions.",
-                        "-f",
-                        str(prompt_path.resolve()),
-                        "--format",
-                        "json",
-                        "--dir",
-                        str(project.resolve()),
-                        "--model",
-                        config["validation_repair_model"],
-                    ],
+                _, execution = _run_repair_agent(
                     project,
+                    prompt_path,
                     logs,
                     f"repair-{index:03d}",
-                    config["validation_repair_timeout_s"],
-                    runner,
+                    workdir=workdir,
+                    config=config,
+                    runner=runner,
                 )
                 repair.update(execution)
         except (OSError, ValueError, TypeError, AttributeError) as exc:

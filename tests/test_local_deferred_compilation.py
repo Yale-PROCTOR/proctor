@@ -81,7 +81,7 @@ def test_exhausted_groups_all_reach_compilation_agent_before_postprocess(tmp_pat
 
     def repair(command, **kwargs):
         calls.append(command)
-        assert command[0] == "opencode"
+        assert "@opencode/cli@2.4.2" in command
         assert len(client.requests) == 2
         assert not any(event[0] == "postprocess" for event in tools.events)
         project = kwargs["cwd"]
@@ -160,7 +160,7 @@ def test_oversized_target_retains_original_body_for_compilation_repair(
     )
 
     def repair(command, **kwargs):
-        assert command[0] == "opencode"
+        assert "@opencode/cli@2.4.2" in command
         library = kwargs["cwd"] / "lib.rs"
         assembled = library.read_text()
         assert original in assembled and transformed in assembled
@@ -299,7 +299,12 @@ def test_compilation_and_test_repair_have_independent_budgets(tmp_path):
     validations = []
 
     def runner(command, **kwargs):
-        if command[0] == "opencode":
+        if command[0] == "npm":
+            assert "@opencode/cli@2.4.2" in command
+            assert "--standalone" in command
+            assert kwargs["env"]["XDG_DATA_HOME"] == str(
+                value.framework.workdir / "opencode-repair/data"
+            )
             prompt = Path(command[command.index("-f") + 1]).read_text()
             phase = (
                 "compile"

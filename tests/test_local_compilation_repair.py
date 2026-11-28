@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -58,17 +59,39 @@ def test_buildable_project_does_not_need_an_agent_or_test_manifest(tmp_path):
     assert saved == loop.report
 
 
-def test_agent_changes_are_not_policed_and_cargo_alone_accepts_them(tmp_path):
+def test_agent_changes_are_not_policed_and_cargo_alone_accepts_them(
+    tmp_path, monkeypatch
+):
     rust = project(tmp_path)
     (rust / "tests").mkdir()
     (rust / "tests/example.rs").write_text("original test\n")
+    old_state = tmp_path / "global-opencode"
+    monkeypatch.setenv("XDG_DATA_HOME", str(old_state))
+    monkeypatch.setenv("OPENCODE_DB", str(old_state / "opencode.db"))
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(old_state / "config"))
     calls = []
 
     def runner(command, **kwargs):
         calls.append((command, kwargs))
-        assert command[0:2] == ["opencode", "run"]
+        assert command[:8] == [
+            "npm",
+            "exec",
+            "--yes",
+            "--prefer-offline",
+            "--",
+            "@opencode/cli@2.4.2",
+            "run",
+            "--standalone",
+        ]
         assert "--auto" in command
-        assert command[command.index("--dir") + 1] == str(rust)
+        assert "--dir" not in command
+        assert kwargs["cwd"] == rust
+        assert kwargs["env"]["XDG_DATA_HOME"] == str(
+            tmp_path / "work/opencode-repair/data"
+        )
+        assert "OPENCODE_DB" not in kwargs["env"]
+        assert "OPENCODE_CONFIG_DIR" not in kwargs["env"]
+        assert os.environ["XDG_DATA_HOME"] == str(old_state)
         assert command[command.index("--model") + 1] == MODEL
         assert not (rust / "opencode.json").exists()
         assert not (rust / ".validation-repair-prompt.md").exists()
@@ -156,7 +179,7 @@ def test_compilation_budget_is_shared_between_projects_and_separate_from_tests(
     calls = []
 
     def runner(command, **kwargs):
-        calls.append(command)
+        calls.append(kwargs["cwd"])
         return CommandResult(0)
 
     loop = repair(
@@ -170,10 +193,7 @@ def test_compilation_budget_is_shared_between_projects_and_separate_from_tests(
     assert loop.ensure(after)
     assert not loop.ensure(last, CommandResult(101))
     assert len(calls) == 2
-    assert [command[command.index("--dir") + 1] for command in calls] == [
-        str(before),
-        str(after),
-    ]
+    assert calls == [before, after]
     assert loop.report["repair_attempts"] == 2
     assert loop.report["compilation_runs"] == 5
     assert loop.report["reason"] == "repair_limit_reached"
