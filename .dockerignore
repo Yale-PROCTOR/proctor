@@ -1,6 +1,6 @@
 runs/
 spike/
-.venv/
+**/.venv/
 **/target/
 **/__pycache__/
 *.pyc

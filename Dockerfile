@@ -6,21 +6,6 @@
 #
 # Build:
 #   docker build -t proctor-framework:dev .
-#
-# Run the c2rust -> crat translation on the whole B01_synthetic corpus,
-# mounting the corpus read-only and an output dir for the run results:
-#   mkdir -p out && chmod 777 out
-#   docker run --rm \
-#     -v "$PWD/tractor-test-corpus/Test-Corpus/Public-Tests/B01_synthetic:/corpus:ro" \
-#     -v "$PWD/out:/out" \
-#     proctor-framework:dev \
-#     bench -c configs/bench.toml --corpus /corpus \
-#     --set run.output_dir=/out --jobs 16
-#
-# Single translation:
-#   docker run --rm -v "$PWD/case:/case:ro" -v "$PWD/out:/out" \
-#     proctor-framework:dev run -c configs/c2rust_crat.toml \
-#     --input-c /case --set run.output_dir=/out
 
 FROM ubuntu:24.04
 
@@ -33,12 +18,14 @@ RUN apt-get update \
     curl \
     git \
     libclang-dev \
+    libedit-dev \
     libssl-dev \
     libz3-dev \
     llvm-dev \
     ninja-build \
     pkg-config \
     python3 \
+    tcl-dev \
     zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 
@@ -83,8 +70,8 @@ RUN uv sync
 # Warm everything: c2rust-transpile (built from the submodule against
 # the image's LLVM), crat (pulls its pinned nightly via
 # rust-toolchain.toml), stage venvs, and the index crate.
-RUN uv run proctor warmup -c tests/e2e/translation_smoke.toml
-RUN uv run proctor warmup -c configs/c2rust_crat_testgen_absrec_disrep_idm.toml
+RUN uv run proctor warmup -c configs/full.toml
+RUN cd stages/crat && cargo build --release --bin crat-merge
 
 # Put the built tools on PATH (reference tractor-crat-dockerfile parity):
 # c2rust-transpile is a plain binary; `crat` is a wrapper script that
@@ -99,5 +86,5 @@ RUN ln -sf /home/proctor/proctor/stages/c2rust/target/release/c2rust-transpile \
 ARG PROCTOR_IMAGE=proctor-framework:dev
 ENV PROCTOR_IMAGE=${PROCTOR_IMAGE}
 
-ENTRYPOINT ["uv", "run", "proctor"]
+ENTRYPOINT ["/home/proctor/proctor/scripts/translate.sh"]
 CMD ["--help"]
