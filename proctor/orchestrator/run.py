@@ -61,6 +61,7 @@ class StageResult:
     status: str  # success | failure | skipped | reused
     duration_s: float = 0.0
     error: str | None = None
+    rust_project: Path | None = None
 
 
 @dataclass
@@ -244,6 +245,7 @@ def execute_run(
         entry = validated.resolved.entry
         index = validated.resolved.index
         stage_run_dir = run_dir / "stages" / f"{index:02d}-{stage_id}"
+        rust_project = None
 
         fingerprint = stage_fingerprint(validated.resolved.stage_dir)
         cfg_hash = config_hash(
@@ -275,9 +277,12 @@ def execute_run(
                     if missing:
                         raise RunError(f"cannot resume '{stage_id}': {missing}")
                     state.update(produced)
+                    rust_project = produced.get("rust_project")
                 events.emit("stage_reused", stage_id=stage_id, checkpoint=key[:12])
                 result_summary.stages.append(
-                    StageResult(stage_id=stage_id, status="reused")
+                    StageResult(
+                        stage_id=stage_id, status="reused", rust_project=rust_project
+                    )
                 )
                 continue
             reuse_active = False
@@ -380,6 +385,7 @@ def execute_run(
                                     ok=row is not None and "metrics_error" not in row,
                                 )
                             state.update(produced)
+                            rust_project = produced.get("rust_project")
                             status = "success"
                 else:  # skipped: forward inputs unchanged
                     status = "skipped"
@@ -391,6 +397,7 @@ def execute_run(
                 status=status,
                 duration_s=invocation.duration_s,
                 error=error,
+                rust_project=rust_project,
             )
         )
         events.emit(

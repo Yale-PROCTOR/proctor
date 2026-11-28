@@ -258,6 +258,44 @@ def translation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeTranslat
     return case
 
 
+def test_cache_variables_override_preset(
+    translation: FakeTranslation, tmp_path: Path
+) -> None:
+    (tmp_path / "c" / "CMakePresets.json").touch()
+    variables = {"DEBUG": False, "ASSERTIONS": True, "SIZE": 64, "MODE": "fast"}
+    translation.envelope["config"].update(
+        check_build=False, preset="test", cmake_cache_variables=variables
+    )
+
+    output = ADAPTER.run_stage(translation.envelope)
+
+    assert translation.commands[0][-6:] == [
+        "--preset",
+        "test",
+        "-DDEBUG=OFF",
+        "-DASSERTIONS=ON",
+        "-DSIZE=64",
+        "-DMODE=fast",
+    ]
+    assert output["config_used"]["cmake_cache_variables"] == variables
+
+
+@pytest.mark.parametrize(
+    "variables",
+    [["DEBUG"], {"DEBUG": 1.5}, {"DEBUG=ON": False}],
+)
+def test_rejects_invalid_cache_variables(
+    translation: FakeTranslation, variables: object
+) -> None:
+    translation.envelope["config"]["cmake_cache_variables"] = variables
+
+    with pytest.raises(
+        ADAPTER.StageFailure, match="cache variable|cmake_cache_variables"
+    ):
+        ADAPTER.run_stage(translation.envelope)
+    assert translation.commands == []
+
+
 @pytest.mark.parametrize("stage_time_remaining", [None, 60])
 def test_repairs_once_then_builds_before_publishing(
     translation: FakeTranslation,

@@ -14,4 +14,5 @@ rust_project = true
 [config]
 check_build = { type = "bool", default = true, doc = "cargo build the transpiled project before reporting success" }
 preset = { type = "string", default = "test", doc = "CMake preset to use when CMakePresets.json exists" }
+cmake_cache_variables = { type = "table", doc = "CMake cache variable overrides for this translation" }
 repair_model = { type = "string", doc = "OpenCode model for one repair invocation on a generated Rust compilation error" }

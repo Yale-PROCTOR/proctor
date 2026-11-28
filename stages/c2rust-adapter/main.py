@@ -5,8 +5,7 @@ component spec's Translation component (the crat stage is the second).
 Ports the single-configuration path of the legacy scripts/translate.py:
 cmake file-api configure → API-function discovery (libclang over the
 project headers) → c2rust-transpile → Cargo project fix-ups →
-crat's config.toml. Parameter sets / CMakePresets matrices / crat-merge
-are deliberately out of scope (spec assumes one target, one config).
+crat's config.toml. The adapter handles one configuration per invocation.
 
 Transpiler resolution order:
   1. `c2rust-transpile` on PATH
@@ -778,6 +777,20 @@ def build_with_repair(
 
 def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
     config = envelope.get("config", {})
+    cache_variables = config.get("cmake_cache_variables", {})
+    if not isinstance(cache_variables, dict):
+        raise StageFailure("cmake_cache_variables must be a table")
+    cache_flags = []
+    for name, value in cache_variables.items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise StageFailure(f"invalid CMake cache variable name: {name!r}")
+        if not isinstance(value, (str, int, bool)):
+            raise StageFailure(
+                f"CMake cache variable {name} must be a string, integer, or boolean"
+            )
+        if isinstance(value, bool):
+            value = "ON" if value else "OFF"
+        cache_flags.append(f"-D{name}={value}")
     repair_model = config.get("repair_model")
     if repair_model is not None and (
         not isinstance(repair_model, str) or not repair_model.strip()
@@ -819,6 +832,7 @@ def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
             "-G",
             pick_generator(),
             *preset_flag,
+            *cache_flags,
         ],
         log_file,
     )
@@ -909,6 +923,7 @@ def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
         "config_used": {
             "check_build": bool(config.get("check_build", True)),
             "preset": preset_name if preset_flag else None,
+            **({"cmake_cache_variables": cache_variables} if cache_variables else {}),
             **({"repair_model": repair_model} if repair_model is not None else {}),
         },
         "metrics": {

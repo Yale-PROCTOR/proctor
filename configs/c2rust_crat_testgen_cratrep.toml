@@ -1,0 +1,58 @@
+# Pipeline: C source -> c2rust -> CRAT -> test generation.
+
+[run]
+provides = ["c_project", "rule_set"]
+no_fail = true
+on_stage_failure = "continue"
+
+[testing]
+after_each_stage = false
+
+[pipeline]
+order = ["c2rust", "crat", "test_generation", "crat_repair"]
+
+[stages.c2rust]
+uses = "stages/c2rust-adapter"
+timeout_s = 600
+
+[stages.crat]
+uses = "stages/crat-adapter"
+timeout_s = 900
+
+[stages.crat.config]
+passes = [
+  "expand",
+  "extern",
+  "preprocess",
+  "enum",
+  "simpl",
+  "unsafe",
+  "unexpand",
+  "split",
+  "bin",
+]
+
+[stages.test_generation]
+uses = "stages/test-infrastructure"
+timeout_s = 3600
+
+[stages.test_generation.config]
+command = "generate"
+strategy = "cando2"
+agent = "opencode"
+model = "openrouter/openai/gpt-6.1-sol"
+attempts = 3
+min_coverage = 80.0
+
+[stages.crat_repair]
+uses = "stages/crat-repair"
+timeout_s = 14400
+
+[stages.crat_repair.config]
+enable_interface = false
+agent = "opencode"
+model = "openrouter/openai/gpt-6.1-sol"
+max_repair_attempts = 3
+crat_timeout_s = 600
+build_timeout_s = 600
+agent_timeout_s = 900

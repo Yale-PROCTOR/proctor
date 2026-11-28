@@ -107,6 +107,8 @@ def test_two_stage_chain(tmp_path: Path) -> None:
     assert envelope.inputs.rust_project == (
         result.run_dir / "stages" / "00-a" / "out" / "rust"
     )
+    assert result.stages[0].rust_project == envelope.inputs.rust_project
+    assert result.stages[1].rust_project == result.final["rust_project"]
     # the final project went through both stages
     final_marker = (result.final["rust_project"] / "MARKER.txt").read_text()
     assert final_marker.startswith("B:")
@@ -137,6 +139,8 @@ def test_failure_continue_policy(tmp_path: Path, no_fail: bool) -> None:
     )
     result = _start(config, tmp_path, _source_project(tmp_path))
     assert [s.status for s in result.stages] == ["failure", "success"]
+    assert result.stages[0].rust_project is None
+    assert result.stages[1].rust_project == result.final["rust_project"]
     # b ran on the original input since a produced nothing
     envelope = StageInput.read(result.run_dir / "stages" / "01-b" / "stage_input.json")
     assert envelope.inputs.rust_project == result.run_dir / "inputs" / "rust"
@@ -259,6 +263,9 @@ def test_resume_reuses_everything(tmp_path: Path) -> None:
     second = resume_run(first.run_dir, tmp_path)
     assert second.ok
     assert [s.status for s in second.stages] == ["reused", "reused"]
+    assert [s.rust_project for s in second.stages] == [
+        s.rust_project for s in first.stages
+    ]
     assert _markers(first.run_dir) == before  # nothing re-ran
 
 
