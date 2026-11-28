@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -112,15 +113,17 @@ def project(tmp_path, source=SOURCE):
     return path
 
 
-def infer(tmp_path, path, complete, build=None, tools=None, dump=False):
+def infer(tmp_path, path, complete, build=None, tools=None, dump=False, *, workers=1):
+    builder = build or (lambda _: CommandResult(0))
     return infer_wrapper_bounds(
         path,
         workdir=tmp_path / "work",
         stage_dir=STAGE_DIR,
         tools=tools or SyntaxTools(),
-        complete=complete,
-        build=build or (lambda _: CommandResult(0)),
+        make_complete=lambda: complete,
+        build=lambda project, _: builder(project),
         run_id="bound-run",
+        workers=workers,
         dump_exchanges=dump,
     )
 
@@ -195,6 +198,41 @@ def test_later_compilation_failure_restores_only_that_wrapper(tmp_path):
     assert report["wrappers"][1]["build_diagnostics"] == "bad bound"
 
 
+def test_failed_merge_rolls_back_and_replays_saved_bounds_in_file_order(tmp_path):
+    source = f"{INTERNALS['first']}\n{WRAPPERS['first']}\n"
+    path = project(tmp_path, source)
+    names = ["lib.rs", "module.rs"]
+    (path / names[1]).write_text(source)
+    requests = []
+    private_builds = []
+    final_builds = []
+
+    def complete(request):
+        requests.append(request.metadata.item)
+        return response('["n"]')
+
+    def build(current):
+        changed = [name for name in names if (current / name).read_text() != source]
+        if current != path:
+            private_builds.append(changed)
+            return CommandResult(0)
+        final_builds.append(changed)
+        if changed == names:
+            return CommandResult(1, stderr="incompatible together")
+        return CommandResult(0)
+
+    report = infer(tmp_path, path, complete, build=build, workers=2)
+
+    assert sorted(requests) == [f"{name}:first" for name in names]
+    assert sorted(private_builds) == [[name] for name in names]
+    assert final_builds == [names, ["lib.rs"], names]
+    assert report["merged_build"]["reason"] == "build_failed"
+    assert [entry["status"] for entry in report["wrappers"]] == ["applied", "reverted"]
+    assert report["wrappers"][1]["build_diagnostics"] == "incompatible together"
+    assert (path / names[0]).read_text() == source.replace("1_000_000", "(n\n)")
+    assert (path / names[1]).read_text() == source
+
+
 @pytest.mark.parametrize(
     "answer",
     [
@@ -241,17 +279,27 @@ def test_incomplete_response_is_rejected_even_if_json_parses(tmp_path, finish):
     assert (path / "lib.rs").read_text() == SOURCE
 
 
-def test_unchanged_bounds_skip_replacement_and_build(tmp_path):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_unchanged_bounds_skip_replacement_and_build(tmp_path, monkeypatch, workers):
     path = project(tmp_path)
+    if workers == 2:
+        (path / "module.rs").write_text(SOURCE)
     tools = SyntaxTools()
-    answers = iter(['["1_000_000"]', '["1_000_000", "1_000_000"]'])
+    answers = {"first": '["1_000_000"]', "second": '["1_000_000", "1_000_000"]'}
+
+    def unexpected_write(*args):
+        pytest.fail("unchanged bounds need no source writes")
+
+    monkeypatch.setattr(Path, "write_bytes", unexpected_write)
     report = infer(
         tmp_path,
         path,
-        lambda _: response(next(answers)),
+        lambda request: response(answers[request.metadata.item.split(":")[1]]),
         tools=tools,
+        workers=workers,
         build=lambda _: pytest.fail("unchanged bounds need no build"),
     )
+    assert len(report["wrappers"]) == 2 * workers
     assert all(
         item["reason"] == "original_bounds_returned" for item in report["wrappers"]
     )
@@ -395,6 +443,144 @@ def test_stage_uses_default_llm_and_shared_usage_before_final_validation(
     )
     assert (value.inputs.rust_project / "lib.rs").read_text() == "old\n"
     assert not (value.framework.workdir / "test-validation/c-reference").exists()
+
+
+def test_stage_parallel_wrapper_bounds_isolates_files_and_tests_the_merge(tmp_path):
+    value = stage_input(tmp_path, config={"workers": 2})
+    source_project = value.inputs.rust_project
+    (source_project / "testinfra.toml").write_text('strategy="cando2"\n')
+    sources = {
+        "lib.rs": "mod module_a;\nmod module_b;\n" + SOURCE,
+        "module_a.rs": SOURCE,
+        "module_b.rs": SOURCE,
+    }
+    for name in ("module_a.rs", "module_b.rs"):
+        (source_project / name).write_text(sources[name])
+    final_project = value.framework.workdir / "final-project"
+    private_builds = []
+    merged_builds = []
+    clients = []
+    trackers = []
+    first_requests = Barrier(2, timeout=10)
+    first_builds = Barrier(2, timeout=10)
+    tested = []
+
+    def snapshot(current):
+        return {name: (current / name).read_text() for name in sources}
+
+    class Tools(SyntaxTools):
+        def cargo_build(self, current, *, library_only=False):
+            files = snapshot(current)
+            changed = [name for name in sources if files[name] != sources[name]]
+            if hasattr(self, "target_dir"):
+                assert self.target_dir == current / "target"
+                assert not (current / "target/cache").exists()
+                assert not library_only
+                assert snapshot(final_project) == sources
+                assert len(changed) == 1
+                name = changed[0]
+                assert "(n\n)" in files[name]
+                first_build = all(worker != current for worker, _ in private_builds)
+                private_builds.append((current, name))
+                if first_build:
+                    first_builds.wait()
+                if "(unresolved\n)" in files[name]:
+                    return CommandResult(1, stderr="bad bound")
+            elif current == final_project and changed:
+                merged_builds.append(files)
+            return CommandResult(0)
+
+    class Client:
+        def __init__(self):
+            self.requests = []
+
+        def complete(self, request):
+            if not self.requests:
+                first_requests.wait()
+            self.requests.append(request.metadata.item)
+            name, wrapper = request.metadata.item.split(":")
+            if wrapper == "first":
+                return response('["n"]')
+            if name == "module_a.rs":
+                return response('["unresolved", "n"]')
+            return response('["n", "n + 1"]')
+
+    def factory(settings, tracker):
+        client = Client()
+        clients.append(client)
+        trackers.append(tracker)
+        return client
+
+    def runner(command, **kwargs):
+        assert merged_builds
+        tested.append(snapshot(kwargs["cwd"]))
+        return CommandResult(
+            0,
+            json.dumps(
+                {
+                    "passed": True,
+                    "tests_count": 1,
+                    "successes_count": 1,
+                    "failures_count": 0,
+                    "errors_count": 0,
+                }
+            ),
+        )
+
+    tools = Tools()
+    tools.normalized = sources["lib.rs"]
+    output = run_stage(
+        value,
+        stage_dir=STAGE_DIR,
+        tools=tools,
+        llm_client_factory=factory,
+        validation_runner=runner,
+    )
+
+    assert output.status == "success", output.error
+    assert len(clients) == 2
+    assert trackers[0] is not trackers[1]
+    assert sorted(len(client.requests) for client in clients) == [2, 4]
+    assert output.usage.calls == 6
+    records = read_usage(value.framework.workdir / "usage.jsonl")
+    assert sorted(record["item"] for record in records) == [
+        f"{name}:{wrapper}" for name in sources for wrapper in ("first", "second")
+    ]
+    assert len({current for current, _ in private_builds}) == 2
+    assert all(not current.exists() for current, _ in private_builds)
+    assert sorted(name for _, name in private_builds) == sorted(list(sources) * 2)
+    assert output.metrics["cargo_builds"] == 10
+    assert output.metrics["compilation_failures"] == 1
+    expected = {
+        name: source.replace("1_000_000", "(n\n)", 1)
+        for name, source in sources.items()
+    }
+    for name in ("lib.rs", "module_b.rs"):
+        expected[name] = (
+            expected[name]
+            .replace("1_000_000", "(n\n)", 1)
+            .replace("1_000_000", "(n + 1\n)", 1)
+        )
+    assert merged_builds == tested == [expected]
+    assert snapshot(value.outputs.rust_project) == expected
+    report = json.loads(
+        (value.outputs.artifacts_dir / "test-validation.json").read_text()
+    )
+    assert report["status"] == "validation_succeeded"
+    bounds = report["wrapper_bounds"]
+    assert bounds["merged_build"]["status"] == "applied"
+    assert [
+        (entry["file"], entry["wrapper"], entry["status"])
+        for entry in bounds["wrappers"]
+    ] == [
+        (
+            name,
+            wrapper,
+            "reverted" if (name, wrapper) == ("module_a.rs", "second") else "applied",
+        )
+        for name in sources
+        for wrapper in ("first", "second")
+    ]
 
 
 def test_stage_does_not_initialize_llm_client_without_eligible_wrapper(tmp_path):

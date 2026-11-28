@@ -3187,11 +3187,15 @@ def run_stage(
             active_tools.assemble_project(frozen, accepted, assembled)
         os.replace(assembled, library_source)
 
-        def build_repair(project: Path) -> CommandResult:
-            state.metrics.cargo_builds += 1
-            result = active_tools.cargo_build(project)
+        state_lock = Lock()
+
+        def build_repair(project: Path, tools: Any = active_tools) -> CommandResult:
+            with state_lock:
+                state.metrics.cargo_builds += 1
+            result = tools.cargo_build(project)
             if result.returncode != 0:
-                state.metrics.compilation_failures += 1
+                with state_lock:
+                    state.metrics.compilation_failures += 1
             return result
 
         compilation = CompilationRepair(
@@ -3306,50 +3310,57 @@ def run_stage(
             tuple(state.accepted_observation_documents), merged_observations
         )
 
-        bound_client = None
-        bound_tracker = UsageTracker(
-            usage_path,
-            run_id=stage_input.run_id,
-            stage=STAGE_ID,
-            item=stage_input.item,
-            pricing=PricingTable.from_config(stage_input.framework.llm),
+        bound_settings = {**stage_input.framework.llm, "context_overflow": "error"}
+        bound_pricing = PricingTable.from_config(bound_settings)
+        bound_factory = llm_client_factory or (
+            lambda config, tracker: LlmClient(config, tracker=tracker, limiter=limiter)
         )
 
-        def complete_bounds(request: Request) -> Response:
-            nonlocal bound_client
-            state.prompts_used.add("wrapper_bound_inference")
-            before = bound_tracker.record_count
-            settings = {**stage_input.framework.llm, "context_overflow": "error"}
-            try:
-                if bound_client is None:
-                    factory = llm_client_factory or (
-                        lambda config, tracker: LlmClient(config, tracker=tracker)
-                    )
-                    bound_client = factory(settings, bound_tracker)
-                response = bound_client.complete(request)
-            except Exception as exc:
-                if bound_tracker.record_count == before:
-                    bound_tracker.record(
-                        metadata=request.metadata,
-                        provider=str(settings.get("provider", "unknown")),
-                        model=str(settings.get("model", "")),
-                        usage=None,
-                        latency_s=0,
-                        finish_reason="error",
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                raise
-            _record_untracked_response(bound_tracker, before, request, response)
-            return response
+        def make_complete_bounds() -> Callable[[Request], Response]:
+            client = None
+            tracker = UsageTracker(
+                usage_path,
+                run_id=stage_input.run_id,
+                stage=STAGE_ID,
+                item=stage_input.item,
+                pricing=bound_pricing,
+            )
+
+            def complete_bounds(request: Request) -> Response:
+                nonlocal client
+                with state_lock:
+                    state.prompts_used.add("wrapper_bound_inference")
+                before = tracker.record_count
+                try:
+                    if client is None:
+                        client = bound_factory(dict(bound_settings), tracker)
+                    response = client.complete(request)
+                except Exception as exc:
+                    if tracker.record_count == before:
+                        tracker.record(
+                            metadata=request.metadata,
+                            provider=str(bound_settings.get("provider", "unknown")),
+                            model=str(bound_settings.get("model", "")),
+                            usage=None,
+                            latency_s=0,
+                            finish_reason="error",
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    raise
+                _record_untracked_response(tracker, before, request, response)
+                return response
+
+            return complete_bounds
 
         bound_report = infer_wrapper_bounds(
             final_project,
             workdir=workdir,
             stage_dir=stage_dir,
             tools=active_tools,
-            complete=complete_bounds,
+            make_complete=make_complete_bounds,
             build=build_repair,
             run_id=stage_input.run_id,
+            workers=config["workers"],
             dump_exchanges=config["dump_llm_exchanges"],
         )
         validation = validate_project(

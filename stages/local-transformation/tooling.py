@@ -706,12 +706,11 @@ class CratTools:
     def cargo_build(
         self, current_project: Path, *, library_only: bool = False
     ) -> CommandResult:
-        command = [
-            "cargo",
-            "build",
-            "--quiet",
-            *(["--lib", "-j", "1"] if library_only else []),
-        ]
+        command = ["cargo", "build", "--quiet"]
+        if library_only:
+            command.append("--lib")
+        if library_only or self.target_dir is not None:
+            command.extend(["-j", "1"])
         environment = _cargo_build_env(self.target_dir or current_project / "target")
         encoded_rustflags = environment.get("CARGO_ENCODED_RUSTFLAGS")
         if encoded_rustflags is not None:

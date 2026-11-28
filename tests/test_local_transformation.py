@@ -10160,8 +10160,9 @@ def test_max_repairs_configuration_rejects_negative_or_noninteger_values(
     assert not tools.events
 
 
+@pytest.mark.parametrize("library_only", [False, True])
 def test_private_cargo_directories_override_environment_and_project_config(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, library_only
 ):
     monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "shared-target"))
     commands = []
@@ -10179,12 +10180,14 @@ def test_private_cargo_directories_override_environment_and_project_config(
             '[build]\ntarget-dir = "/shared-from-config"\nbuild-dir = "/shared-build-config"\n'
         )
         worker = tools.fork(project.parent / "worker.log", project / "target")
-        worker.cargo_build(project, library_only=True)
+        worker.cargo_build(project, library_only=library_only)
         assert worker.environment["CARGO_TARGET_DIR"] == str(project / "target")
         assert worker.environment["CARGO_BUILD_BUILD_DIR"] == str(project / "target")
-    assert [command for command, _, _ in commands] == [
-        ["cargo", "build", "--quiet", "--lib", "-j", "1"]
-    ] * 2
+    expected = ["cargo", "build", "--quiet"]
+    if library_only:
+        expected.append("--lib")
+    expected.extend(["-j", "1"])
+    assert [command for command, _, _ in commands] == [expected] * 2
     assert [target for _, _, target in commands] == [
         str(project / "target") for project in projects
     ]
