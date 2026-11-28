@@ -483,16 +483,15 @@ def read_targets(build_dir: Path) -> list[Artifact]:
         return cache[target_id]
 
     def resolve_link_args(target_id: str) -> list[str]:
-        return _unique(
-            [
-                fragment["fragment"]
-                for fragment in targets[target_id]
-                .get("link", {})
-                .get("commandFragments", [])
-                if fragment.get("role") == "libraries"
-                and fragment["fragment"].startswith("-l")
-            ]
-        )
+        fragments = targets[target_id].get("link", {}).get("commandFragments", [])
+        # shlex leaves these CMake shell escapes intact inside double quotes.
+        return [
+            arg.replace(r"\$$", "$").replace(r"\`", "`")
+            for fragment in fragments
+            if fragment.get("role") == "libraries"
+            for arg in shlex.split(fragment["fragment"])
+            if arg.startswith("-l") or Path(arg).is_absolute()
+        ]
 
     artifacts: list[Artifact] = []
     for target in targets.values():
@@ -608,7 +607,20 @@ def add_link_args_to_build_rs(build_rs: Path, link_args: list[str]) -> None:
     if insert_at is None:
         return
     for link_arg in reversed(link_args):
-        lines.insert(insert_at, f'    println!("cargo:rustc-link-arg={link_arg}");\n')
+        if "\n" in link_arg or "\r" in link_arg:
+            raise StageFailure(
+                "native link arguments must fit on one Cargo output line"
+            )
+        escaped = (
+            re.sub(
+                r'[\x00-\x1f"\\]',
+                lambda match: f"\\x{ord(match[0]):02x}",
+                link_arg,
+            )
+            .replace("{", "{{")
+            .replace("}", "}}")
+        )
+        lines.insert(insert_at, f'    println!("cargo:rustc-link-arg={escaped}");\n')
     build_rs.write_text("".join(lines), encoding="utf-8")
 
 
@@ -882,7 +894,8 @@ def run_stage(envelope: dict[str, Any]) -> dict[str, Any]:
 
     # 5. project fix-ups
     restore_c2rust_module_sources(rust_dir)
-    link_args = sorted({arg for target in targets for arg in target.link_args})
+    link_groups = _unique([tuple(target.link_args) for target in targets])
+    link_args = [arg for group in link_groups for arg in group]
     add_link_args_to_build_rs(rust_dir / "build.rs", link_args)
     add_cdylib_crate_type(rust_dir / "Cargo.toml")
 

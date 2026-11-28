@@ -88,6 +88,48 @@ def test_prepare_c_root_rejects_unsafe_tar_input(tmp_path: Path) -> None:
     assert not (tmp_path / "outside").exists()
 
 
+def test_read_targets_decodes_absolute_library_arguments(tmp_path: Path) -> None:
+    reply = tmp_path / ".cmake" / "api" / "v1" / "reply"
+    reply.mkdir(parents=True)
+    fragments = [
+        {"role": "libraries", "fragment": '"/opt/native libs/libtcl.so.8.6"'},
+        {"role": "libraries", "fragment": r"/opt/native\ libs/libprobe.a"},
+        {"role": "libraries", "fragment": r'"/opt/native\$$/lib\`probe\`.a"'},
+        {"role": "libraries", "fragment": "-ldl -lm"},
+        {"role": "libraries", "fragment": "libgenerated.a"},
+        {"role": "flags", "fragment": "-lignored"},
+        {"role": "libraries", "fragment": '"/opt/native libs/libtcl.so.8.6"'},
+    ]
+    documents = {
+        "index-local.json": {"reply": {"codemodel-v2": {"jsonFile": "codemodel.json"}}},
+        "codemodel.json": {
+            "paths": {"source": str(tmp_path)},
+            "configurations": [
+                {"targets": [{"id": "driver", "jsonFile": "target.json"}]}
+            ],
+        },
+        "target.json": {
+            "id": "driver",
+            "name": "driver",
+            "type": "EXECUTABLE",
+            "link": {"commandFragments": fragments},
+        },
+    }
+    for name, document in documents.items():
+        (reply / name).write_text(json.dumps(document))
+
+    (target,) = ADAPTER.read_targets(tmp_path)
+
+    assert target.link_args == [
+        "/opt/native libs/libtcl.so.8.6",
+        "/opt/native libs/libprobe.a",
+        "/opt/native$/lib`probe`.a",
+        "-ldl",
+        "-lm",
+        "/opt/native libs/libtcl.so.8.6",
+    ]
+
+
 def test_restore_c2rust_module_source_with_children(tmp_path: Path) -> None:
     src = tmp_path / "src"
     (src / "type").mkdir(parents=True)
@@ -189,7 +231,7 @@ class FakeTranslation:
                 (project / "Cargo.toml").write_text(
                     '[lib]\npath = "lib.rs"\ncrate-type = ["rlib"]\n'
                 )
-                (project / "build.rs").write_text("fn main() {}\n")
+                (project / "build.rs").write_text("fn main() {\n}\n")
             case "cargo":
                 assert cwd is not None and env is not None
                 if "repair_model" in self.envelope["config"]:
@@ -256,6 +298,36 @@ def translation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeTranslat
         lambda directory: [ADAPTER.Artifact("example", "EXECUTABLE", [], [])],
     )
     return case
+
+
+def test_stage_preserves_order_and_escapes_native_link_arguments(
+    translation: FakeTranslation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = '/opt/native libs/lib"probe"{v}\x08.a'
+    monkeypatch.setattr(
+        ADAPTER,
+        "read_targets",
+        lambda directory: [
+            ADAPTER.Artifact("example", "EXECUTABLE", [], [archive, "-lm", archive]),
+            ADAPTER.Artifact("shared", "SHARED_LIBRARY", [], ["-lm", "-ldl"]),
+            ADAPTER.Artifact("shared_copy", "SHARED_LIBRARY", [], ["-lm", "-ldl"]),
+        ],
+    )
+    translation.envelope["config"]["check_build"] = False
+
+    output = ADAPTER.run_stage(translation.envelope)
+
+    archive_directive = r'    println!("cargo:rustc-link-arg=/opt/native libs/lib\x22probe\x22{{v}}\x08.a");'
+    assert output["status"] == "success"
+    assert (translation.output / "build.rs").read_text().splitlines() == [
+        "fn main() {",
+        archive_directive,
+        '    println!("cargo:rustc-link-arg=-lm");',
+        archive_directive,
+        '    println!("cargo:rustc-link-arg=-lm");',
+        '    println!("cargo:rustc-link-arg=-ldl");',
+        "}",
+    ]
 
 
 def test_cache_variables_override_preset(
